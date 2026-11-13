@@ -355,7 +355,9 @@ impl Machine {
             "rawResponseItem/completed" => {
                 let item = params.and_then(|p| p.get("item"));
                 let consumption = item.is_some_and(|i| i["type"] == "agent_message");
-                if !item.is_some_and(explained_raw_item)
+                if item.is_some_and(raw_other_input) {
+                    self.coverage_other_input(thread, turn);
+                } else if !item.is_some_and(explained_raw_item)
                     || (consumption && (thread.is_none() || turn.is_none()))
                 {
                     self.observation_gap(thread, "raw消费或记录类型无法解释");
@@ -363,7 +365,9 @@ impl Machine {
             }
             "item/started" | "item/completed" => {
                 let item = params.and_then(|p| p.get("item"));
-                if !item.is_some_and(explained_thread_item) {
+                if item.is_some_and(thread_other_input) {
+                    self.coverage_other_input(thread, turn);
+                } else if !item.is_some_and(explained_thread_item) {
                     self.observation_gap(thread, "条目可能包含未观察的输入");
                 }
             }
@@ -389,14 +393,8 @@ impl Machine {
                     _ => self.observation_gap(thread, "线程状态无法解释"),
                 }
             }
-            "thread/closed"
-            | "thread/deleted"
-            | "thread/archived"
-            | "thread/unarchived"
-            | "thread/reverted"
-            | "thread/settings/updated"
-            | "thread/environment/connected"
-            | "thread/environment/disconnected" => {
+            "thread/closed" | "thread/deleted" | "thread/archived" | "thread/unarchived"
+            | "thread/reverted" => {
                 if let Some(thread) = thread {
                     self.observation_continuity_lost(thread, "线程生命周期变化");
                 } else {
@@ -406,14 +404,38 @@ impl Machine {
             _ => self.observation_gap(thread, "未知通知或不受支持的实时模式"),
         }
     }
+
+    /// 用户、开发者、系统或钩子输入是正常的非协作消费：所属轮不能按纯协作免报，
+    /// 但它不是观察断档，不影响这个线程之后的轮。定位不到所属轮时才按断档处理。
+    fn coverage_other_input(&mut self, thread: Option<&str>, turn: Option<&str>) {
+        match (thread, turn) {
+            (Some(thread), Some(turn)) => {
+                self.coverage_veto(Some(thread), Some(turn), "本轮含非协作输入", true);
+            }
+            _ => self.observation_gap(thread, "非协作输入缺少轮身份"),
+        }
+    }
+}
+
+/// raw 的 message 只有模型输出（assistant）与输入两类；角色不认识的也按输入算。
+fn raw_other_input(item: &Value) -> bool {
+    item.get("type").and_then(Value::as_str) == Some("message")
+        && item.get("role").and_then(Value::as_str) != Some("assistant")
+}
+
+fn thread_other_input(item: &Value) -> bool {
+    matches!(
+        item.get("type").and_then(Value::as_str),
+        Some("userMessage" | "hookPrompt")
+    )
 }
 
 /// 只判断是否可能漏掉消费；已确认的输出类型不检查正文、展示字段或内部枚举。
 fn explained_raw_item(item: &Value) -> bool {
     match item.get("type").and_then(Value::as_str) {
         Some("agent_message") => v2_pairing::parse_delivery(item).is_some(),
-        // 输入仍是非协作反证；输出内容的格式不影响代理间消息的覆盖。
-        Some("message") => item.get("role").and_then(Value::as_str) == Some("assistant"),
+        // 调用方已先把输入角色分给 `raw_other_input`，到这里的只有模型输出。
+        Some("message") => true,
         Some(
             "reasoning"
             | "function_call"
@@ -511,11 +533,16 @@ fn irrelevant_notification(method: &str) -> bool {
             | "skills/changed"
             | "thread/attachment/updated"
             | "thread/compacted"
+            // 执行环境的连接状态，与本连接对线程的订阅无关。
+            | "thread/environment/connected"
+            | "thread/environment/disconnected"
             | "thread/goal/cleared"
             | "thread/goal/updated"
             | "thread/name/updated"
             | "thread/project/updated"
             | "thread/queue/changed"
+            // 设置快照变化（模型、推理等级等），不表示退订或漏记消费。
+            | "thread/settings/updated"
             | "thread/tokenUsage/updated"
             | "turn/diff/updated"
             | "turn/moderationMetadata"

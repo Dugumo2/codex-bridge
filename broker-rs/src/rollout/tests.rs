@@ -497,7 +497,7 @@ fn gap_b_red_确认无关记录与尚未补齐的半行不制造坏行() {
 }
 
 #[test]
-fn 无关输出字段不清轮锚但配置推理等级拒绝空串() {
+fn 无关输出与配置记录的内部取值不清轮锚() {
     for (payload, bad) in [
         (json!({"type":"reasoning","summary":[7]}), false),
         (
@@ -506,12 +506,15 @@ fn 无关输出字段不清轮锚但配置推理等级拒绝空串() {
         ),
         (
             json!({"type":"configuration_update","reasoning":{"effort":""}}),
-            true,
+            false,
         ),
+        (json!({"type":"configuration_update"}), false),
         (
             json!({"type":"configuration_update","reasoning":{"effort":"future_effort"}}),
             false,
         ),
+        // 对照：类型未知的记录可能是新的消费，仍按坏行处理并清掉轮锚。
+        (json!({"type":"future_consumed_input"}), true),
     ] {
         let path = temp_file("coverage-fields");
         let mut text = task_started("2026-11-05T01:00:00.000Z", "原轮");

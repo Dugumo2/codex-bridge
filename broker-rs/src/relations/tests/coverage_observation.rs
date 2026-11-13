@@ -487,7 +487,7 @@ fn gap_b_observation_合法活动标记保留覆盖而未知或坏状态撤销()
 
 #[test]
 fn gap_b_review1_raw系统和开发者输入不是无关输出() {
-    for role in ["system", "developer"] {
+    for role in ["system", "developer", "user", "未来角色"] {
         let mut m = seeded();
         open(&mut m);
         raw(
@@ -499,13 +499,35 @@ fn gap_b_review1_raw系统和开发者输入不是无关输出() {
             m.coverage_open_proof(C, FIRST).is_none(),
             "输入角色{role}必须否决纯协作结论"
         );
-        assert_eq!(m.coverage_observation_gen(C), None, "保守缺口封锁未来授信");
+        assert_eq!(
+            m.coverage_observation_gen(C),
+            Some(0),
+            "{role}：正常输入只影响所属轮，不是观察断档"
+        );
         complete(&mut m, FIRST);
         assert_eq!(
             m.coverage_disposition(C, FIRST),
             CoverageDisposition::OrdinaryGap
         );
+        start(&mut m, SECOND);
+        raw(&mut m, SECOND, delivery("下一轮协作", "内容"));
+        complete(&mut m, SECOND);
+        assert_eq!(
+            m.coverage_disposition(C, SECOND),
+            CoverageDisposition::AllowCollaborationExclusion,
+            "{role}：下一轮纯协作不受牵连"
+        );
     }
+    // 定位不到所属轮的输入无法只否决一轮，仍按断档保守处理。
+    let mut m = seeded();
+    open(&mut m);
+    notify(
+        &mut m,
+        "rawResponseItem/completed",
+        json!({"threadId":C,"item":{"type":"message","role":"user","content":[]}}),
+    );
+    assert!(m.coverage_open_proof(C, FIRST).is_none());
+    assert_eq!(m.coverage_observation_gen(C), None, "缺轮号的输入封锁线程");
     let mut m = seeded();
     open(&mut m);
     raw(

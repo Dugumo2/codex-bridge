@@ -299,17 +299,9 @@ fn parse_line(
                     }
                     false
                 }
-                "configuration_update" => {
-                    // 本轮明确要求修复的 P3：这是配置记录唯一保留的值校验。
-                    payload
-                        .get("reasoning")
-                        .and_then(|v| v.get("effort"))
-                        .and_then(Value::as_str)
-                        .filter(|s| !s.is_empty())
-                        .ok_or(())?;
-                    return Ok(None);
-                }
-                "reasoning"
+                // 配置记录不是消费也不是轮边界，内部取值不参与覆盖判断。
+                "configuration_update"
+                | "reasoning"
                 | "function_call_output"
                 | "custom_tool_call_output"
                 | "custom_tool_call"

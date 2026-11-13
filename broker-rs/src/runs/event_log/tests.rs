@@ -2330,3 +2330,268 @@ fn gap_b_review1_真实完成自动退订与同一步读取反证均经过嵌套
         assert_eq!(gap_b_has_gap(&actions, &turn), counterevidence);
     }
 }
+
+// 以下入口测试覆盖正常路径：非协作输入只影响所属轮，无关通知不断档，文件没读完不放行。
+
+fn gap_fix_raw_message(m: &mut Machine, turn: &str, role: &str) -> Vec<Action> {
+    gap_b_notify(
+        m,
+        "rawResponseItem/completed",
+        json!({"threadId":"乙","turnId":turn,
+            "item":{"type":"message","role":role,"content":[{"type":"input_text","text":"上下文或用户输入"}]}}),
+    )
+}
+
+/// 真实新线程的首轮：开始后先收到初始化上下文（开发者、用户输入）和上级派来的任务，然后才有模型输出。
+/// `gap_b_seeded` 的种子轮只有一条兄弟消息，上游不会这样开始一个线程。
+fn gap_fix_realistic_seed() -> Machine {
+    let mut m = setup();
+    let seed = turn_at(4000);
+    gap_b_started(&mut m, &seed);
+    for role in ["developer", "user"] {
+        gap_fix_raw_message(&mut m, &seed, role);
+    }
+    gap_b_notify(
+        &mut m,
+        "item/started",
+        json!({"threadId":"乙","turnId":seed,"item":{"type":"userMessage","id":"首轮输入","content":[]}}),
+    );
+    gap_b_delivery(&mut m, &seed, "上级任务", "/root");
+    gap_b_notify(
+        &mut m,
+        "rawResponseItem/completed",
+        json!({"threadId":"乙","turnId":seed,"item":{"type":"reasoning","summary":[]}}),
+    );
+    gap_b_completed(&mut m, &seed);
+    assert!(
+        m.runs.event_log.pending.is_empty(),
+        "前置：种子不产生候选摘要"
+    );
+    assert!(
+        m.relations.attachments.get("乙").is_some_and(|a| a.valid),
+        "前置：种子结束没有退订"
+    );
+    candidate(&mut m, "乙", "root");
+    m
+}
+
+/// 一轮只被兄弟消息唤醒、正常结束、暂存到期；返回这一轮的全部动作。
+fn gap_fix_sibling_turn(m: &mut Machine, turn: &str, id: &str) -> Vec<Action> {
+    let mut all = gap_b_started(m, turn);
+    all.extend(gap_b_delivery(m, turn, id, "/root/甲"));
+    gap_b_summary(m, turn);
+    assert!(
+        m.coverage_open_proof("乙", turn).is_some(),
+        "此前的正常输入和通知不应让这一轮失去覆盖证明"
+    );
+    all.extend(gap_b_completed(m, turn));
+    all.extend(gap_b_sweep(m));
+    all
+}
+
+fn gap_fix_gaps(actions: &[Action], turn: &str) -> usize {
+    logs(actions)
+        .iter()
+        .filter(|l| l.2 == "记录缺口" && l.3["turnId"] == turn)
+        .count()
+}
+
+#[test]
+fn gap_fix_真实初始化输入之后连续两轮兄弟唤醒零缺口() {
+    let mut m = gap_fix_realistic_seed();
+    for (ms, id) in [(5000, "兄弟一"), (6000, "兄弟二")] {
+        let turn = turn_at(ms);
+        let all = gap_fix_sibling_turn(&mut m, &turn, id);
+        assert!(
+            logs(&all).iter().all(|l| l.2 != "记录缺口"),
+            "纯兄弟唤醒轮不写任何缺口"
+        );
+        assert_eq!(m.event_log_pending_stats("乙", &turn), (0, 0, 0));
+    }
+}
+
+#[test]
+fn gap_fix_非协作输入只让所属轮写缺口不影响下一轮() {
+    for input in [
+        "raw-user",
+        "raw-developer",
+        "raw-system",
+        "raw-未来角色",
+        "userMessage",
+        "hookPrompt",
+    ] {
+        let mut m = gap_b_seeded();
+        let mixed = turn_at(5000);
+        let mut all = gap_b_started(&mut m, &mixed);
+        all.extend(gap_b_delivery(&mut m, &mixed, "兄弟消费", "/root/甲"));
+        gap_b_summary(&mut m, &mixed);
+        assert!(
+            m.coverage_open_proof("乙", &mixed).is_some(),
+            "前置：输入到达前是开放的纯协作轮"
+        );
+        let count = m.event_log_pending_stats("乙", &mixed).0;
+        assert!(count > 0, "前置：原摘要已暂存");
+        all.extend(match input.strip_prefix("raw-") {
+            Some(role) => gap_fix_raw_message(&mut m, &mixed, role),
+            None => gap_b_notify(
+                &mut m,
+                "item/started",
+                json!({"threadId":"乙","turnId":mixed,"item":{"type":input,"id":"输入","content":[]}}),
+            ),
+        });
+        assert!(
+            m.coverage_open_proof("乙", &mixed).is_none(),
+            "{input}：所属轮不能再按纯协作免报"
+        );
+        assert!(
+            m.coverage_observation_gen("乙").is_some(),
+            "{input}：正常输入不是观察断档"
+        );
+        all.extend(gap_b_completed(&mut m, &mixed));
+        all.extend(gap_b_sweep(&mut m));
+        assert!(
+            gap_fix_gaps(&all, &mixed) >= count,
+            "{input}：混合轮的原摘要全部写成缺口"
+        );
+        assert_eq!(m.event_log_pending_stats("乙", &mixed), (0, 0, 0));
+        let next = turn_at(6000);
+        let all = gap_fix_sibling_turn(&mut m, &next, "下一轮兄弟");
+        assert_eq!(
+            gap_fix_gaps(&all, &next),
+            0,
+            "{input}：下一轮纯兄弟唤醒不受牵连"
+        );
+    }
+}
+
+#[test]
+fn gap_fix_设置更新与执行环境通知不断档() {
+    for (method, params) in [
+        (
+            "thread/settings/updated",
+            json!({"threadId":"乙","threadSettings":{"model":"模型","effort":"high"}}),
+        ),
+        (
+            "thread/environment/connected",
+            json!({"threadId":"乙","environmentId":"环境"}),
+        ),
+        (
+            "thread/environment/disconnected",
+            json!({"threadId":"乙","environmentId":"环境"}),
+        ),
+    ] {
+        let mut m = gap_b_seeded();
+        // 两轮之间收到一次。
+        gap_b_notify(&mut m, method, params.clone());
+        let turn = turn_at(5000);
+        let mut all = gap_b_started(&mut m, &turn);
+        all.extend(gap_b_delivery(&mut m, &turn, "兄弟消费", "/root/甲"));
+        gap_b_summary(&mut m, &turn);
+        // 轮进行中再收到一次。
+        all.extend(gap_b_notify(&mut m, method, params));
+        assert!(
+            m.coverage_open_proof("乙", &turn).is_some(),
+            "{method}：开放轮的覆盖证明保留"
+        );
+        all.extend(gap_b_completed(&mut m, &turn));
+        all.extend(gap_b_sweep(&mut m));
+        assert_eq!(gap_fix_gaps(&all, &turn), 0, "{method}：不写缺口");
+        assert!(
+            m.coverage_observation_gen("乙").is_some(),
+            "{method}：线程之后仍可免报"
+        );
+    }
+}
+
+#[test]
+fn gap_fix_文件未读完即停止跟随不能放行完成轮() {
+    use crate::relations::rollout_pairing::{
+        ReadTicket, ReadTicketState, RolloutFile, RolloutPathState,
+    };
+    for (more, file_kept) in [(true, true), (true, false), (false, true)] {
+        let mut m = gap_b_seeded();
+        let turn = turn_at(5000);
+        let mut all = gap_b_started(&mut m, &turn);
+        all.extend(gap_b_delivery(&mut m, &turn, "兄弟", "/root/甲"));
+        gap_b_summary(&mut m, &turn);
+        all.extend(gap_b_completed(&mut m, &turn));
+        // 读取在线程还没有 raw 时派出，结果现在才回来；线程已改用 raw，不会再续读。
+        assert!(
+            m.relations.aux.v2_raw_threads.contains_key("乙"),
+            "前置：线程已有 raw，文件不再跟随"
+        );
+        let ticket = ReadTicket {
+            id: 777,
+            thread: "乙".into(),
+            conn_epoch: m.relations.conn_epoch,
+            observation_gen: m.coverage_read_observation_gen("乙"),
+            issued_seq: m.coverage_next_seq().unwrap(),
+            deadline: m.clock.mono_ms + 30_000,
+            state: ReadTicketState::Active,
+        };
+        m.relations
+            .aux
+            .rollout
+            .coverage_reads
+            .insert(ticket.id, ticket.clone());
+        if file_kept {
+            m.relations.aux.rollout.files.insert(
+                "乙".into(),
+                RolloutFile {
+                    epoch: m.relations.conn_epoch,
+                    path: RolloutPathState::Ready("D:\\unused-乙.jsonl".into()),
+                    cursor: Some(crate::rollout::RolloutCursor {
+                        offset: 128,
+                        ..Default::default()
+                    }),
+                    reading: Some(ticket.id),
+                    reads: 1,
+                    next_at: 0,
+                },
+            );
+        }
+        assert_eq!(
+            m.coverage_disposition("乙", &turn),
+            CoverageDisposition::Wait,
+            "前置：读取未回时完成轮等待"
+        );
+        let count = m.event_log_pending_stats("乙", &turn).0;
+        assert!(count > 0, "前置：原摘要仍在暂存");
+        all.extend(gap_b_apply(
+            &mut m,
+            crate::claim::Event::RolloutRead {
+                id: ticket.id,
+                thread: ticket.thread.clone(),
+                conn_epoch: ticket.conn_epoch,
+                observation_gen: ticket.observation_gen,
+                issued_seq: ticket.issued_seq,
+                result: Ok(crate::rollout::RolloutChunk {
+                    cursor: crate::rollout::RolloutCursor {
+                        offset: 4096,
+                        ..Default::default()
+                    },
+                    more,
+                    ..Default::default()
+                }),
+            },
+        ));
+        assert!(
+            m.relations.aux.rollout.coverage_reads.is_empty(),
+            "回包释放票据"
+        );
+        if m.runs.event_log.timer.is_some() {
+            all.extend(gap_b_sweep(&mut m));
+        }
+        assert_eq!(m.event_log_pending_stats("乙", &turn), (0, 0, 0));
+        let expected = if more { count } else { 0 };
+        assert_eq!(
+            gap_fix_gaps(&all, &turn),
+            expected,
+            "还有内容没读（{more}）、文件登记保留（{file_kept}）：没读完的轮必须写缺口，读完的对照零缺口"
+        );
+        assert!(
+            m.coverage_observation_gen("乙").is_some(),
+            "只否决已有的轮，不封锁线程"
+        );
+    }
+}
