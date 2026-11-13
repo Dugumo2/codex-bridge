@@ -417,35 +417,41 @@ fn 窗口里只有工具输出没有消息时也向前找到当前轮() {
 }
 
 /// 合法 JSON 仍可能无法解释；真实读取器必须把这一点带到覆盖判定入口。
+/// 结构坏了的行可能正是轮边界，之后不能沿用原来的轮；结构完好、只是类型不认识的行计入坏行，
+/// 但轮的定位照旧（v0.4.0 的配对行为），上游新增记录类型不会让文件配对降级。
 #[test]
-fn gap_b_red_合法json但无法解释的记录必须报告坏行并失去轮锚点() {
-    for (tag, kind, payload) in [
-        ("缺类型", "response_item", json!({"id":"未知"})),
-        ("数字类型", "response_item", json!({"type":7,"id":"未知"})),
+fn gap_b_red_合法json但无法解释的记录必须报告坏行() {
+    for (tag, kind, payload, anchor_kept) in [
+        ("缺类型", "response_item", json!({"id":"未知"}), false),
+        (
+            "数字类型",
+            "response_item",
+            json!({"type":7,"id":"未知"}),
+            false,
+        ),
         (
             "未知条目",
             "response_item",
             json!({"type":"future_consumed_input","id":"未知"}),
-        ),
-        (
-            "坏角色",
-            "response_item",
-            json!({"type":"message","role":7,"content":[]}),
+            true,
         ),
         (
             "未知外层",
             "future_rollout_record",
             json!({"type":"agent_message"}),
+            true,
         ),
         (
             "坏边界",
             "event_msg",
             json!({"type":"task_started","turn_id":7}),
+            false,
         ),
         (
             "未知事件",
             "event_msg",
             json!({"type":"future_runtime_unloaded"}),
+            true,
         ),
     ] {
         let path = temp_file(tag);
@@ -461,14 +467,124 @@ fn gap_b_red_合法json但无法解释的记录必须报告坏行并失去轮锚
         );
         assert_eq!(chunk.entries.len(), 1, "{tag}：读到后续消费，不是空文件");
         assert!(chunk.bad_lines > 0, "{tag}：不能静默当作无关记录");
-        assert!(
-            matches!(
-                &chunk.entries[0].record,
-                RolloutRecord::Message { turn: None, .. }
-            ),
-            "{tag}：无法解释记录之后不能继续沿用旧轮锚点"
+        let RolloutRecord::Message { turn, .. } = &chunk.entries[0].record else {
+            panic!("{tag}：后续消费应是消息记录");
+        };
+        assert_eq!(
+            turn.as_deref(),
+            anchor_kept.then_some("原轮"),
+            "{tag}：结构坏了的行之后不能沿用旧轮；类型不认识的行不改变轮的定位"
+        );
+        assert_eq!(
+            chunk.entries[0].turn_lost, !anchor_kept,
+            "{tag}：只有失去定位的消费才标为轮次丢失"
         );
     }
+}
+
+/// 上游 0.160.0 会写进会话文件的记录（rollout/src/policy.rs、history 的 RolloutItem）都不是坏行，
+/// 也不改变之后消费记录所在的轮。此前这些行被判成坏行：线程被永久封锁，同一轮后面的消费对不上轮。
+#[test]
+fn gap_fix_上游正常持久化的记录不算坏行也不丢轮定位() {
+    let events = [
+        json!({"type":"item_completed","turn_id":"原轮","item":{"type":"AgentMessage","id":"条目"}}),
+        json!({"type":"item_completed","turn_id":"原轮","item":{"type":"FutureTurnItem"}}),
+        json!({"type":"user_message","message":"用户输入"}),
+        json!({"type":"sub_agent_activity","kind":"started"}),
+        json!({"type":"thread_goal_updated","goal":{"objective":"目标"}}),
+        json!({"type":"thread_settings_applied","settings":{"model":"模型"}}),
+        json!({"type":"entered_review_mode"}),
+        json!({"type":"exited_review_mode"}),
+        json!({"type":"image_generation_end"}),
+        json!({"type":"token_count"}),
+    ];
+    let tops = ["retained_context", "realtime_item", "world_state"];
+    let cases = events
+        .into_iter()
+        .map(|payload| ("event_msg", payload))
+        .chain(tops.into_iter().map(|kind| (kind, json!({"任意":"内容"}))));
+    for (kind, payload) in cases {
+        let tag = format!("{kind}/{}", payload["type"].as_str().unwrap_or("-"));
+        let path = temp_file("persisted");
+        let mut text = task_started("2026-11-05T01:00:00.000Z", "原轮");
+        text += &line("2026-11-05T01:00:01.000Z", kind, payload);
+        text += &message("2026-11-05T01:00:02.000Z", "后续消费", "消息");
+        append(&path, &text);
+        let chunk = read_chunk(&path_str(&path), None).unwrap();
+        assert_eq!(chunk.bad_lines, 0, "{tag}：上游正常写入的记录不是坏行");
+        assert!(
+            matches!(
+                &chunk.entries[..],
+                [RolloutEntry { record: RolloutRecord::Message { turn: Some(t), .. }, turn_lost: false, .. }] if t == "原轮"
+            ),
+            "{tag}：之后的消费仍在原来的轮"
+        );
+    }
+}
+
+/// 文件里的输入消息与 raw 一样按角色分：模型输出无关，其余角色（含不认识的）都是所在轮的输入。
+#[test]
+fn gap_fix_文件里的消息按角色区分输入与输出() {
+    for (role, input) in [
+        (json!("assistant"), false),
+        (json!("user"), true),
+        (json!("developer"), true),
+        (json!("system"), true),
+        (json!("未来角色"), true),
+        (json!(7), true),
+    ] {
+        let path = temp_file("roles");
+        let mut text = task_started("2026-11-05T01:00:00.000Z", "原轮");
+        text += &line(
+            "2026-11-05T01:00:01.000Z",
+            "response_item",
+            json!({"type":"message","role":role,"content":[]}),
+        );
+        append(&path, &text);
+        let chunk = read_chunk(&path_str(&path), None).unwrap();
+        assert_eq!(chunk.bad_lines, 0, "{role}：角色不认识也不是坏行");
+        assert_eq!(chunk.entries.len(), usize::from(input), "{role}");
+        if input {
+            assert!(
+                matches!(
+                    &chunk.entries[0].record,
+                    RolloutRecord::Message { turn: Some(t), .. } if t == "原轮"
+                ),
+                "{role}：输入记在所在的轮上"
+            );
+        }
+    }
+}
+
+/// 读取时游标之后还有内容（没读到的完整行或末尾半行）要如实报告，调用方据此决定能不能把这次读取当成读完。
+#[test]
+fn gap_fix_读取结果报告游标之后还有没有内容() {
+    let path = temp_file("unread");
+    let mut text = task_started("2026-11-05T01:00:00.000Z", "轮");
+    text += &message("2026-11-05T01:00:01.000Z", "完整消费", "消息");
+    append(&path, &text);
+    let whole = read_chunk(&path_str(&path), None).unwrap();
+    assert_eq!(whole.cursor.offset, text.len() as u64);
+    assert!(!whole.unread, "首次读取读到文件末尾");
+    let pending = message("2026-11-05T01:00:02.000Z", "没写完的消费", "消息");
+    let (head, tail) = pending.split_at(pending.len() / 2);
+    append(&path, head);
+    let first = read_chunk(&path_str(&path), None).unwrap();
+    assert_eq!(first.cursor.offset, text.len() as u64, "前置：半行未被消费");
+    assert!(first.unread, "首次读取：末尾半行算还有内容");
+    assert!(!first.more, "半行不是「尽快再读」的理由");
+    let follow = read_chunk(&path_str(&path), Some(&whole.cursor)).unwrap();
+    assert!(follow.entries.is_empty(), "前置：半行不产生记录");
+    assert!(
+        follow.unread && !follow.more,
+        "跟随读取：末尾半行算还有内容"
+    );
+    append(&path, tail);
+    let done = read_chunk(&path_str(&path), Some(&follow.cursor)).unwrap();
+    assert_eq!(done.entries.len(), 1, "前置：补全后读到这条消费");
+    assert!(!done.unread, "读到文件末尾后不再有内容");
+    let idle = read_chunk(&path_str(&path), Some(&done.cursor)).unwrap();
+    assert!(!idle.unread && idle.bytes_read == 0, "没有新增内容");
 }
 
 #[test]
@@ -513,7 +629,7 @@ fn 无关输出与配置记录的内部取值不清轮锚() {
             json!({"type":"configuration_update","reasoning":{"effort":"future_effort"}}),
             false,
         ),
-        // 对照：类型未知的记录可能是新的消费，仍按坏行处理并清掉轮锚。
+        // 对照：类型未知的记录可能是新的消费，仍计入坏行；轮的定位不变。
         (json!({"type":"future_consumed_input"}), true),
     ] {
         let path = temp_file("coverage-fields");
@@ -524,7 +640,7 @@ fn 无关输出与配置记录的内部取值不清轮锚() {
         let chunk = read_chunk(&path_str(&path), None).unwrap();
         assert_eq!(chunk.bad_lines, u32::from(bad));
         assert!(
-            matches!(&chunk.entries[0].record, RolloutRecord::Message { turn, .. } if turn.is_none() == bad)
+            matches!(&chunk.entries[0].record, RolloutRecord::Message { turn: Some(t), .. } if t == "原轮")
         );
     }
 }

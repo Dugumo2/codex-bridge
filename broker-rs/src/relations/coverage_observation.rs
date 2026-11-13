@@ -406,14 +406,26 @@ impl Machine {
     }
 
     /// 用户、开发者、系统或钩子输入是正常的非协作消费：所属轮不能按纯协作免报，
-    /// 但它不是观察断档，不影响这个线程之后的轮。定位不到所属轮时才按断档处理。
+    /// 但它不是观察断档，不影响这个线程之后的轮。
+    ///
+    /// 只有通知上的轮正在进行（亲眼见过它开始、还没收到完成）时才能这样归属。上游在没有轮进行时
+    /// 写入历史用的是内部编号，或沿用已结束的轮的上下文：这条输入要到之后某一轮才被消费，
+    /// 定不了是哪一轮，按断档处理。
     fn coverage_other_input(&mut self, thread: Option<&str>, turn: Option<&str>) {
         match (thread, turn) {
-            (Some(thread), Some(turn)) => {
+            (Some(thread), Some(turn)) if self.coverage_turn_running(thread, turn) => {
                 self.coverage_veto(Some(thread), Some(turn), "本轮含非协作输入", true);
             }
-            _ => self.observation_gap(thread, "非协作输入缺少轮身份"),
+            _ => self.observation_gap(thread, "非协作输入对应不到进行中的轮"),
         }
+    }
+
+    fn coverage_turn_running(&self, thread: &str, turn: &str) -> bool {
+        self.relations
+            .aux
+            .coverage_starts
+            .get(&(thread.into(), turn.into()))
+            .is_some_and(|start| !start.ended && start.epoch == self.relations.conn_epoch)
     }
 }
 

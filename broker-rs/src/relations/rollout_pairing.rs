@@ -931,7 +931,7 @@ impl Machine {
             }
             Err(_) => self.observation_gap(Some(thread), "会话文件读取失败"),
         }
-        // 这次读满了上限、文件里还有完整的行没读，而下面的提前返回都不会再续读：
+        // 读取时文件里还有内容没解析（没读到的完整行，或末尾没写完的半行），而下面的提前返回都不会再续读：
         // 没读到的部分可能含反证，这个线程尚未裁决的轮不能按纯协作放行。之后开始的轮不受影响。
         let followed = self
             .relations
@@ -941,7 +941,7 @@ impl Machine {
             .get(thread)
             .is_some_and(|f| f.reading == Some(id) && f.epoch == epoch)
             && self.rollout_needed().contains(thread);
-        if !followed && matches!(&result, Ok(chunk) if chunk.more) {
+        if !followed && matches!(&result, Ok(chunk) if chunk.unread) {
             self.coverage_veto(Some(thread), None, "会话文件未读完即停止跟随", true);
         }
         let Some(file) = self.relations.aux.rollout.files.get_mut(thread) else {

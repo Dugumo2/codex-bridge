@@ -528,6 +528,29 @@ fn gap_b_review1_raw系统和开发者输入不是无关输出() {
     );
     assert!(m.coverage_open_proof(C, FIRST).is_none());
     assert_eq!(m.coverage_observation_gen(C), None, "缺轮号的输入封锁线程");
+    // 通知上的轮不在进行中（上游轮外写历史用的内部编号、已结束的轮、没见过开始的轮）：
+    // 这条输入要到之后某一轮才被消费，只否决通知上的那个编号会放过真正消费它的轮。
+    for label in ["auto-compact-3", SEED, FIRST] {
+        let mut m = seeded();
+        raw(
+            &mut m,
+            label,
+            json!({"type":"message","role":"user","content":[{"type":"input_text","text":"轮外写入的输入"}]}),
+        );
+        assert_eq!(
+            m.coverage_observation_gen(C),
+            None,
+            "{label}：对应不到进行中的轮，封锁线程"
+        );
+        start(&mut m, SECOND);
+        raw(&mut m, SECOND, delivery("之后的协作", "内容"));
+        complete(&mut m, SECOND);
+        assert_eq!(
+            m.coverage_disposition(C, SECOND),
+            CoverageDisposition::OrdinaryGap,
+            "{label}：之后消费了这条输入的轮不能按纯协作免报"
+        );
+    }
     let mut m = seeded();
     open(&mut m);
     raw(

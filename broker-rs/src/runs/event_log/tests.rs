@@ -2464,6 +2464,61 @@ fn gap_fix_非协作输入只让所属轮写缺口不影响下一轮() {
     }
 }
 
+/// 通知上的轮不在进行中时，这条输入要到之后某一轮才被消费：只否决通知上的编号会放过真正消费它的轮。
+#[test]
+fn gap_fix_对应不到进行中的轮的输入之后照常写缺口() {
+    for label in ["内部编号", "已结束的轮", "没见过开始的轮"] {
+        let mut m = gap_b_seeded();
+        let done = turn_at(5000);
+        let mut all = gap_b_started(&mut m, &done);
+        all.extend(gap_b_delivery(&mut m, &done, "兄弟一", "/root/甲"));
+        gap_b_summary(&mut m, &done);
+        all.extend(gap_b_completed(&mut m, &done));
+        assert_eq!(
+            m.coverage_disposition("乙", &done),
+            CoverageDisposition::AllowCollaborationExclusion,
+            "前置：输入到达前这一轮已封存为纯协作"
+        );
+        // 完成通知本身也会暂存一条摘要，所以在完成之后数。
+        let count = m.event_log_pending_stats("乙", &done).0;
+        assert!(count > 0, "前置：封存轮的摘要还没裁决");
+        let turn_on_notice = match label {
+            // 上游在没有轮进行时写入历史用的内部编号（core/src/session/mod.rs 的 next_internal_sub_id）。
+            "内部编号" => "auto-compact-3".to_owned(),
+            "已结束的轮" => done.clone(),
+            _ => turn_at(5500),
+        };
+        all.extend(gap_fix_raw_message(&mut m, &turn_on_notice, "user"));
+        assert!(
+            m.coverage_observation_gen("乙").is_none(),
+            "{label}：定不了哪一轮消费，线程不再免报"
+        );
+        if m.runs.event_log.timer.is_some() {
+            all.extend(gap_b_sweep(&mut m));
+        }
+        assert_eq!(m.event_log_pending_stats("乙", &done), (0, 0, 0));
+        assert!(
+            gap_fix_gaps(&all, &done) >= count,
+            "{label}：尚未裁决的封存轮也照常写缺口"
+        );
+        let next = turn_at(6000);
+        let mut later = gap_b_started(&mut m, &next);
+        later.extend(gap_b_delivery(&mut m, &next, "兄弟二", "/root/甲"));
+        gap_b_summary(&mut m, &next);
+        let next_count = m.event_log_pending_stats("乙", &next).0;
+        assert!(next_count > 0, "前置：下一轮的摘要已暂存");
+        later.extend(gap_b_completed(&mut m, &next));
+        if m.runs.event_log.timer.is_some() {
+            later.extend(gap_b_sweep(&mut m));
+        }
+        assert_eq!(m.event_log_pending_stats("乙", &next), (0, 0, 0));
+        assert!(
+            gap_fix_gaps(&later, &next) >= next_count,
+            "{label}：之后消费了这条输入的轮不能按纯协作免报"
+        );
+    }
+}
+
 #[test]
 fn gap_fix_设置更新与执行环境通知不断档() {
     for (method, params) in [
@@ -2508,7 +2563,13 @@ fn gap_fix_文件未读完即停止跟随不能放行完成轮() {
     use crate::relations::rollout_pairing::{
         ReadTicket, ReadTicketState, RolloutFile, RolloutPathState,
     };
-    for (more, file_kept) in [(true, true), (true, false), (false, true)] {
+    // 第三组是只剩末尾半行（没读满上限，但读取时文件里还有没解析的内容）；第四组是读完了的对照。
+    for (more, unread, file_kept) in [
+        (true, true, true),
+        (true, true, false),
+        (false, true, true),
+        (false, false, true),
+    ] {
         let mut m = gap_b_seeded();
         let turn = turn_at(5000);
         let mut all = gap_b_started(&mut m, &turn);
@@ -2571,6 +2632,7 @@ fn gap_fix_文件未读完即停止跟随不能放行完成轮() {
                         ..Default::default()
                     },
                     more,
+                    unread,
                     ..Default::default()
                 }),
             },
@@ -2583,11 +2645,11 @@ fn gap_fix_文件未读完即停止跟随不能放行完成轮() {
             all.extend(gap_b_sweep(&mut m));
         }
         assert_eq!(m.event_log_pending_stats("乙", &turn), (0, 0, 0));
-        let expected = if more { count } else { 0 };
+        let expected = if unread { count } else { 0 };
         assert_eq!(
             gap_fix_gaps(&all, &turn),
             expected,
-            "还有内容没读（{more}）、文件登记保留（{file_kept}）：没读完的轮必须写缺口，读完的对照零缺口"
+            "读满上限（{more}）、还有内容没解析（{unread}）、文件登记保留（{file_kept}）：没读完的轮必须写缺口，读完的对照零缺口"
         );
         assert!(
             m.coverage_observation_gen("乙").is_some(),
