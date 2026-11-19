@@ -1551,6 +1551,9 @@ impl Machine {
         completed: bool,
         actions: &mut Vec<Action>,
     ) {
+        if completed {
+            self.input_turn_boundary(thread, turn, false);
+        }
         if turn.is_empty() || self.claims.contains_key(thread) {
             return;
         }
@@ -1599,7 +1602,7 @@ impl Machine {
             }
         };
         for thread in lost_starts {
-            self.observation_continuity_lost(&thread, "真实开始凭据淘汰");
+            self.coverage_proof_lost(&thread, "真实开始凭据淘汰");
         }
         // 配对重试必须先于事件标志去重：发现回查已恢复有效观察，但 started/completed 可能均未变化。
         self.retry_v2_pairing(thread, actions);

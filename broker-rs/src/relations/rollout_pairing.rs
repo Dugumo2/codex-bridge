@@ -915,6 +915,9 @@ impl Machine {
                 if chunk.bad_lines > 0 || chunk.skipped_lines > 0 || chunk.cursor.skipping {
                     self.observation_gap(Some(thread), "会话文件含无法解释或跳过的记录");
                 }
+                if chunk.clipped_input {
+                    self.coverage_veto(Some(thread), None, "跨窗消费缺少所属轮", true);
+                }
                 for entry in &chunk.entries {
                     if let RolloutRecord::Message { turn, .. } = &entry.record {
                         self.coverage_veto(

@@ -673,3 +673,232 @@ fn 无关输出格式和消费记录扩展字段不撤销覆盖() {
         CoverageDisposition::AllowCollaborationExclusion
     );
 }
+
+#[test]
+fn gap_fix3_重放与迟到终态不能夺回或清掉新轮() {
+    for order in [
+        "结束后重放",
+        "替换后重放",
+        "迟到完成",
+        "终态先到",
+        "未见过的旧开始",
+    ] {
+        for valid in [true, false] {
+            let mut m = seeded();
+            if order != "终态先到" && order != "未见过的旧开始" {
+                start(&mut m, FIRST);
+            }
+            if matches!(order, "结束后重放" | "终态先到") {
+                complete(&mut m, FIRST);
+                start(&mut m, FIRST);
+                if valid {
+                    start(&mut m, SECOND);
+                }
+            } else {
+                start(&mut m, SECOND);
+                if order == "迟到完成" {
+                    complete(&mut m, FIRST);
+                } else {
+                    start(&mut m, FIRST);
+                }
+            }
+            assert!(
+                m.coverage_observation_gen(C).is_some(),
+                "{order}：前置，输入前仍可观察"
+            );
+            let turn = if valid { SECOND } else { FIRST };
+            raw(&mut m, turn, json!({"type":"message","role":"user"}));
+            assert_eq!(
+                m.coverage_observation_gen(C).is_some(),
+                valid,
+                "{order}：只接受当前轮的输入"
+            );
+            assert!(m.coverage_open_proof(C, turn).is_none());
+        }
+    }
+}
+
+#[test]
+fn gap_fix3_发现回查终态后旧轮输入按断档() {
+    let mut m = seeded();
+    open(&mut m);
+    let read = crate::relations::discovery::ChildTurnRead {
+        status: Some("idle".into()),
+        turns: vec![(FIRST.into(), "completed".into())],
+        ..Default::default()
+    };
+    assert!(m.convergence_apply_child_turns(R, C, &read, &mut vec![]));
+    assert!(m.relations.aux.observed[C]
+        .iter()
+        .any(|o| o.turn == FIRST && o.completed));
+    assert!(
+        m.coverage_open_proof(C, FIRST).is_some(),
+        "回查不能封存覆盖证明"
+    );
+    raw(&mut m, FIRST, json!({"type":"message","role":"developer"}));
+    assert!(
+        m.coverage_observation_gen(C).is_none(),
+        "回查终态之后已不能归入旧轮"
+    );
+}
+
+#[test]
+fn gap_fix3_不可排序的新开始使旧定位失效() {
+    let mut m = seeded();
+    start(&mut m, FIRST);
+    start(&mut m, "内部编号");
+    assert!(m.coverage_observation_gen(C).is_some());
+    raw(&mut m, FIRST, json!({"type":"message","role":"user"}));
+    assert!(m.coverage_observation_gen(C).is_none());
+}
+
+fn gap_fix3_预处理(m: &mut Machine, method: &str, params: Value) {
+    m.coverage_preprocess_notification(&crate::claim::HeldNotification {
+        method: method.into(),
+        params: Some(params),
+        committed: false,
+    });
+}
+
+#[test]
+fn gap_fix3_定位容量只拒绝新线程且换代回收() {
+    let mut m = Machine::new(false);
+    let begin = |m: &mut Machine, thread: &str, turn: &str| {
+        gap_fix3_预处理(
+            m,
+            "turn/started",
+            json!({"threadId":thread,"turn":{"id":turn,"status":"inProgress"}}),
+        )
+    };
+    for i in 0..MAX_OPERATIONS {
+        begin(&mut m, &format!("线程{i}"), FIRST);
+    }
+    assert!(m.coverage_turn_running("线程0", FIRST));
+    begin(&mut m, C, FIRST);
+    assert!(!m.coverage_turn_running(C, FIRST), "满表拒绝新线程");
+    begin(&mut m, "线程0", SECOND);
+    assert!(
+        m.coverage_turn_running("线程0", SECOND),
+        "满表仍可替换已有轮"
+    );
+    m.relations.conn_epoch += 1;
+    m.coverage_check_epoch();
+    assert!(!m.coverage_turn_running("线程0", SECOND), "换代清掉旧定位");
+    begin(&mut m, C, FIRST);
+    assert!(m.coverage_turn_running(C, FIRST), "新代恢复可用容量");
+}
+
+#[test]
+fn gap_fix3_单独登记的定位随生命周期清除() {
+    for (method, params) in [
+        ("thread/started", json!({"thread":{"id":C}})),
+        (
+            "thread/status/changed",
+            json!({"threadId":C,"status":{"type":"notLoaded"}}),
+        ),
+        ("thread/archived", json!({"threadId":C})),
+        ("退订", json!({})),
+    ] {
+        let mut m = Machine::new(false);
+        m.observe_turn(C, FIRST, true, false, &mut vec![]);
+        assert!(
+            !m.coverage_turn_running(C, FIRST),
+            "回查进行中不能充当真实开始"
+        );
+        start(&mut m, FIRST);
+        assert!(m.coverage_turn_running(C, FIRST));
+        assert!(!m.relations.aux.raw_observations.contains_key(C));
+        if method == "退订" {
+            m.observation_continuity_lost(C, "订阅操作切换");
+        } else {
+            gap_fix3_预处理(&mut m, method, params);
+        }
+        assert!(
+            !m.coverage_turn_running(C, FIRST),
+            "{method}：直接核对定位已清除"
+        );
+    }
+}
+
+#[test]
+fn gap_fix3_同毫秒不同轮号不能反复夺回定位() {
+    let other = "01900000-0001-7000-8000-000000000002";
+    let mut m = seeded();
+    start(&mut m, FIRST);
+    start(&mut m, FIRST);
+    assert!(m.coverage_turn_running(C, FIRST), "同轮重复开始幂等");
+    start(&mut m, other);
+    start(&mut m, FIRST);
+    assert!(!m.coverage_turn_running(C, FIRST) && !m.coverage_turn_running(C, other));
+    start(&mut m, SECOND);
+    assert!(m.coverage_turn_running(C, SECOND));
+}
+
+#[test]
+fn gap_fix3_发现回查已卸载清掉进行轮() {
+    let mut m = seeded();
+    open(&mut m);
+    assert!(m.coverage_turn_running(C, FIRST));
+    let read = crate::relations::discovery::ChildTurnRead {
+        status: Some("notLoaded".into()),
+        ..Default::default()
+    };
+    m.convergence_apply_child_turns(R, C, &read, &mut vec![]);
+    assert!(!m.coverage_turn_running(C, FIRST), "回查已确认线程卸载");
+}
+
+#[test]
+fn gap_fix3_同毫秒另一轮迟到完成不清当前轮() {
+    let mut m = seeded();
+    start(&mut m, FIRST);
+    complete(&mut m, "01900000-0001-7000-8000-000000000002");
+    assert!(m.coverage_turn_running(C, FIRST));
+    raw(&mut m, FIRST, json!({"type":"message","role":"user"}));
+    assert_eq!(m.coverage_observation_gen(C), Some(0));
+}
+
+#[test]
+fn gap_fix3_旧锚点淘汰仍能定位当前输入并保留其他封存轮() {
+    let mut m = seeded();
+    open(&mut m);
+    start(&mut m, SECOND);
+    raw(&mut m, SECOND, delivery("封存", "协作"));
+    complete(&mut m, SECOND);
+    assert_eq!(
+        m.coverage_disposition(C, SECOND),
+        CoverageDisposition::AllowCollaborationExclusion
+    );
+    for i in 3..=MAX_OBSERVED_TURNS + 3 {
+        let current = format!("01900000-{i:04x}-7000-8000-000000000001");
+        start(&mut m, &current);
+        if !m
+            .relations
+            .aux
+            .coverage_starts
+            .contains_key(&(C.into(), FIRST.into()))
+        {
+            assert!(m
+                .relations
+                .aux
+                .coverage_starts
+                .contains_key(&(C.into(), current.clone())));
+            assert!(
+                m.coverage_observation_gen(C).is_none(),
+                "旧开放锚点淘汰已撤销后续覆盖资格"
+            );
+            assert_eq!(
+                m.coverage_disposition(C, SECOND),
+                CoverageDisposition::AllowCollaborationExclusion
+            );
+            raw(&mut m, &current, json!({"type":"message","role":"user"}));
+            assert_eq!(
+                m.coverage_disposition(C, SECOND),
+                CoverageDisposition::AllowCollaborationExclusion,
+                "当前输入只能否决当前轮"
+            );
+            return;
+        }
+        complete(&mut m, &current);
+    }
+    panic!("前置：必须实际淘汰旧开放锚点");
+}

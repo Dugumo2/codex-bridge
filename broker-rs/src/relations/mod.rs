@@ -153,6 +153,7 @@ pub struct RelationsAux {
     pub(crate) coverage_epoch: Option<u64>,
     pub(crate) raw_globally_blocked: bool,
     pub(crate) raw_observations: BTreeMap<String, coverage_observation::RawObservation>,
+    pub(crate) input_turns: BTreeMap<String, coverage_observation::InputTurns>,
     pub(crate) coverage_starts: BTreeMap<(String, String), coverage_observation::RawStart>,
     /// 仅真实 turn/started 登记；发现或迟到 completed 不能伪造轮次开始。
     pub live_turn_starts: BTreeMap<(String, String), (u64, u64)>,

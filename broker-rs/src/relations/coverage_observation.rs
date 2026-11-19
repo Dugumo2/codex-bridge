@@ -32,6 +32,51 @@ pub(crate) struct RawStart {
     ended: bool,
 }
 
+/// 只用于归属正常输入。真实开始证明、raw 见证及其淘汰水位由覆盖表独立维护。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct InputTurns {
+    current: Option<(u64, String)>,
+    ended_through: Option<u64>,
+}
+
+impl InputTurns {
+    fn end(&mut self, ms: u64, turn: &str) {
+        self.ended_through = Some(self.ended_through.map_or(ms, |old| old.max(ms)));
+        if self
+            .current
+            .as_ref()
+            .is_some_and(|(active, id)| *active < ms || id == turn)
+        {
+            self.current = None;
+        }
+    }
+
+    fn retire_current(&mut self) {
+        if let Some((ms, _)) = self.current.take() {
+            // 当前轮的时间不早于水位；较新终态到达时已经清除了当前轮。
+            self.ended_through = Some(ms);
+        }
+    }
+
+    fn start(&mut self, ms: u64, turn: &str) {
+        if self.ended_through.is_some_and(|ended| ms <= ended) {
+            return;
+        }
+        if let Some((active, id)) = &self.current {
+            if id == turn || *active > ms {
+                return;
+            }
+            let replaced = *active;
+            self.retire_current();
+            // 同毫秒的不同轮无法排序，两者都不再用来归属输入。
+            if ms == replaced {
+                return;
+            }
+        }
+        self.current = Some((ms, turn.into()));
+    }
+}
+
 fn identity(value: Option<&Value>) -> Option<&str> {
     value
         .and_then(Value::as_str)
@@ -43,6 +88,7 @@ impl Machine {
         let epoch = self.relations.conn_epoch;
         let previous = self.relations.aux.coverage_epoch.replace(epoch);
         if previous.is_some_and(|previous| previous != epoch) {
+            self.relations.aux.input_turns.clear();
             self.observation_gap(None, "上游连接代际变化");
         }
     }
@@ -100,6 +146,12 @@ impl Machine {
 
     /// 正常结束后退订只否决未来资格，不反推已封存轮有缺口。
     pub(crate) fn observation_continuity_lost(&mut self, thread: &str, reason: &str) {
+        self.relations.aux.input_turns.remove(thread);
+        self.coverage_proof_lost(thread, reason);
+    }
+
+    /// 证明缓存淘汰会中断授信，已经收到的当前轮边界仍可用于归属正常输入。
+    pub(super) fn coverage_proof_lost(&mut self, thread: &str, reason: &str) {
         self.coverage_veto(Some(thread), None, reason, false);
         self.block_raw_observation(thread, reason);
     }
@@ -211,7 +263,7 @@ impl Machine {
                 .map(|(key, start)| (key.clone(), start.ended))
             {
                 if !ended {
-                    self.observation_continuity_lost(&oldest.0, "真实开始锚点淘汰");
+                    self.coverage_proof_lost(&oldest.0, "真实开始锚点淘汰");
                 }
                 self.relations.aux.coverage_starts.remove(&oldest);
             }
@@ -323,7 +375,10 @@ impl Machine {
                     self.observation_gap(Some(thread), "无法解释的开始状态");
                     return;
                 }
-                if method == "turn/completed" {
+                if method == "turn/started" {
+                    self.input_turn_boundary(thread, turn, true);
+                } else {
+                    self.input_turn_boundary(thread, turn, false);
                     let Some(seq) = self.coverage_next_seq() else {
                         return;
                     };
@@ -373,6 +428,7 @@ impl Machine {
             }
             "thread/started" => {
                 if let Some(thread) = thread {
+                    self.relations.aux.input_turns.remove(thread);
                     if self.relations.aux.raw_observations.contains_key(thread) {
                         self.observation_continuity_lost(thread, "线程重新开始");
                     }
@@ -420,12 +476,38 @@ impl Machine {
         }
     }
 
-    fn coverage_turn_running(&self, thread: &str, turn: &str) -> bool {
+    pub(super) fn input_turn_boundary(&mut self, thread: &str, turn: &str, started: bool) {
+        let turns = &mut self.relations.aux.input_turns;
+        let Some(ms) = crate::runs::event_log::turn_started_ms(turn) else {
+            // 新开始不能排序，但旧轮已不能可靠定位。保留已替换轮的时间水位。
+            if started {
+                if let Some(state) = turns.get_mut(thread) {
+                    state.retire_current();
+                }
+            }
+            return;
+        };
+        if thread.is_empty()
+            || thread.len() > 256
+            || (turns.len() >= MAX_OPERATIONS && !turns.contains_key(thread))
+        {
+            return;
+        }
+        let state = turns.entry(thread.into()).or_default();
+        if started {
+            state.start(ms, turn);
+        } else {
+            state.end(ms, turn);
+        }
+    }
+
+    pub(super) fn coverage_turn_running(&self, thread: &str, turn: &str) -> bool {
         self.relations
             .aux
-            .coverage_starts
-            .get(&(thread.into(), turn.into()))
-            .is_some_and(|start| !start.ended && start.epoch == self.relations.conn_epoch)
+            .input_turns
+            .get(thread)
+            .and_then(|state| state.current.as_ref())
+            .is_some_and(|(_, active)| active == turn)
     }
 }
 

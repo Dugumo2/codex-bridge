@@ -748,7 +748,7 @@ fn 无raw_大文件只读末尾窗口与新增内容() {
     let (reads, bytes) = fx::with(|f| (f.reads, f.bytes));
     assert!(reads >= 3);
     assert!(
-        bytes <= 2 * (crate::rollout::TAIL_BYTES + 1) + 64 * 1024,
+        bytes <= 2 * (crate::rollout::MAX_READ_BYTES + 1) + 64 * 1024,
         "读取字节有界：{bytes}"
     );
 }
@@ -2192,5 +2192,193 @@ fn gap_b_未知票据与身份冲突不得释放他人的物理占位() {
     assert!(
         m.relations.aux.rollout.coverage_reads.is_empty(),
         "只有真实任务返回才释放名额"
+    );
+}
+
+#[test]
+fn gap_fix3_首次派读与实时见证交接按真实文件结算() {
+    const ORIGINAL: &str = "fffffffe-0001-7000-8000-000000000001";
+    for tail in [
+        "读完",
+        "跟随时返回半行",
+        "超长半行",
+        "超长整行",
+        "跨窗消费",
+        "跨窗历史输出",
+    ] {
+        let (mut m, mut mock) = setup();
+        spawn(&mut m, &mut mock, P, T, C, "原派生", ORIGINAL);
+        files(&m);
+        turn_marker(C, ORIGINAL, m.clock.now_ms);
+        call_line(&m, "交接", "followup_task", C, "旧轮任务");
+        fx::with(|f| f.hold = true);
+        let mut all = interacted_to(&mut m, "交接", C);
+        // 父文件先交回调用证据，子文件仍是同一张真实的首次读取票据。
+        fx::with(|f| {
+            let i = f.held.iter().position(|r| r.thread == P).unwrap();
+            f.held.swap(0, i);
+        });
+        all.extend(fx::release_one_held(&mut m));
+        let request = fx::with(|f| f.held.iter().find(|r| r.thread == C).unwrap().clone());
+        assert!(request.cursor.is_none() && m.relations.aux.rollout.files[C].reads == 0);
+        assert_eq!(m.relations.aux.rollout.files[C].reading, Some(request.id));
+        assert!(!m.relations.aux.v2_raw_threads.contains_key(C));
+        assert!(awaiting(&m, "交接"), "子文件首次读取仍在途");
+        if tail == "跟随时返回半行" {
+            fx::append_raw(C, "{");
+            let chunk = crate::rollout::read_chunk(&request.path, None).unwrap();
+            assert!(chunk.unread && !chunk.more && !chunk.cursor.skipping);
+            all.extend(fx::release_held(&mut m));
+            assert!(m.relations.aux.rollout.files[C].cursor.is_some());
+            assert!(m.coverage_open_proof(C, ORIGINAL).is_none());
+        }
+        assert!(
+            m.binding(C, ORIGINAL).is_some(),
+            "种子轮已绑定，不产生无归属摘要"
+        );
+        all.extend(notify(
+            &mut m,
+            "rawResponseItem/completed",
+            json!({"threadId":C,"turnId":ORIGINAL,"item":{"type":"reasoning"}}),
+        ));
+        assert!(
+            op(&m, "交接").v2_strict,
+            "子线程 raw 已到达，可按父文件证据配对"
+        );
+        delivery(&mut m, ORIGINAL, "旧轮消费", "旧轮任务", false);
+        all.extend(complete(&mut m, &mut mock, C, ORIGINAL, "completed"));
+        all.extend(apply(&mut m, mock.turn_started(C, GAP_B_FILE_TURN)));
+        all.extend(notify(&mut m, "rawResponseItem/completed", json!({"threadId":C,"turnId":GAP_B_FILE_TURN,"item":gap_b_file_message("/root/兄弟", "实时兄弟", "协作")})));
+        assert_eq!(op(&m, "交接").proven_turns[C], [ORIGINAL.to_owned()].into());
+        gap_b_assert_unbound_without_other_exclusion(&m);
+        assert_eq!(
+            m.relations.aux.v2_raw_threads.get(C),
+            Some(&m.relations.conn_epoch)
+        );
+        all.extend(notify(&mut m, "item/completed", json!({"threadId":C,"turnId":GAP_B_FILE_TURN,"item":{"type":"agentMessage","id":"摘要","text":"等待裁决"}})));
+        assert!(m.coverage_open_proof(C, GAP_B_FILE_TURN).is_some());
+        let pending = m.event_log_pending_stats(C, GAP_B_FILE_TURN);
+        assert!(pending.0 > 0 && pending.1 > 0);
+        let actions = complete(&mut m, &mut mock, C, GAP_B_FILE_TURN, "completed");
+        all.extend(replies(&mut m, &mock, actions));
+        let long = tail.starts_with("超长");
+        if tail != "跟随时返回半行" {
+            assert!(m
+                .relations
+                .aux
+                .rollout
+                .coverage_reads
+                .contains_key(&request.id));
+            assert!(m.event_log_pending_stats(C, GAP_B_FILE_TURN).0 >= pending.0);
+            if tail.starts_with("跨窗") {
+                let mut payload = if tail == "跨窗消费" {
+                    gap_b_file_message("/root", "窗口前开始的消费", "任务")
+                } else {
+                    json!({"type":"function_call_output"})
+                };
+                payload["扩展"] = json!("x".repeat(crate::rollout::TAIL_BYTES as usize + 16));
+                fx::append_line(C, m.clock.now_ms, "response_item", payload);
+                turn_marker(C, GAP_B_FILE_TURN, m.clock.now_ms);
+            }
+            if long {
+                fx::append_raw(C, &"x".repeat(crate::rollout::MAX_TAIL_BYTES as usize + 1));
+                if tail == "超长整行" {
+                    fx::append_raw(C, "\n");
+                }
+            }
+            all.extend(fx::release_held(&mut m));
+        }
+        if let Some((token, kind)) = all.iter().rev().find_map(|a| match a {
+            Action::Schedule {
+                token,
+                kind: kind @ TimerKind::Run(crate::runs::RunTimer::EventLogSweep { .. }),
+                ..
+            } => Some((token.clone(), kind.clone())),
+            _ => None,
+        }) {
+            m.clock.mono_ms += 31_000;
+            m.clock.now_ms += 31_000;
+            all.extend(apply(&mut m, Event::Timer { token, kind }));
+        }
+        assert!(!m
+            .relations
+            .aux
+            .rollout
+            .coverage_reads
+            .contains_key(&request.id));
+        assert_eq!(m.event_log_pending_stats(C, GAP_B_FILE_TURN), (0, 0, 0));
+        let gap = all.iter().any(|a| matches!(a, Action::Store(crate::store::StoreOp::AppendLog { lines, .. }) if lines.iter().any(|l| l.contains("beforeBindingUnknown") && l.contains(GAP_B_FILE_TURN))));
+        assert_eq!(
+            gap,
+            long || tail == "跨窗消费",
+            "{tail}：原票据回包后按文件实际内容裁决"
+        );
+        if !long && tail != "跨窗消费" {
+            assert!(!all.iter().any(|a| matches!(a, Action::Store(crate::store::StoreOp::AppendLog { lines, .. }) if lines.iter().any(|l| l.contains("beforeBindingUnknown")))), "{tail}：正常交接没有其他轮的缺口");
+        }
+    }
+}
+
+#[test]
+fn gap_fix3_代理状态终态和卸载均使旧轮输入按断档() {
+    const ACTIVE: &str = "01900000-0001-7000-8000-000000000001";
+    for status in ["completed", "notLoaded"] {
+        let (mut m, mut mock) = setup();
+        spawn(&mut m, &mut mock, P, T, C, "派生", ACTIVE);
+        assert_eq!(m.unique_active_bound_turn(C).as_deref(), Some(ACTIVE));
+        assert!(m.coverage_observation_gen(C).is_some());
+        m.convergence_agent_states(
+            P,
+            T,
+            &json!({"agentsStates":{C:{"status":status}}}),
+            &mut vec![],
+        );
+        if status == "completed" {
+            assert!(m.relations.aux.observed[C]
+                .iter()
+                .any(|o| o.turn == ACTIVE && o.completed));
+        }
+        notify(
+            &mut m,
+            "rawResponseItem/completed",
+            json!({"threadId":C,"turnId":ACTIVE,"item":{"type":"message","role":"user"}}),
+        );
+        assert!(
+            m.coverage_observation_gen(C).is_none(),
+            "{status} 后输入已在轮外"
+        );
+    }
+}
+
+#[test]
+fn gap_fix3_代理已确认关闭而当前轮未绑定也失效() {
+    const ORIGINAL: &str = "01900000-0001-7000-8000-000000000001";
+    const ACTIVE: &str = "01900000-0002-7000-8000-000000000001";
+    let (mut m, mut mock) = setup();
+    spawn(&mut m, &mut mock, P, T, C, "派生", ORIGINAL);
+    complete(&mut m, &mut mock, C, ORIGINAL, "completed");
+    apply(&mut m, mock.turn_started(C, ACTIVE));
+    assert!(m.binding(C, ACTIVE).is_none() && m.unique_active_bound_turn(C).is_none());
+    assert!(m.coverage_observation_gen(C).is_some());
+    assert_eq!(m.relations.aux.observed[C].back().unwrap().turn, ACTIVE);
+    assert!(m.relations.aux.input_turns.contains_key(C));
+    m.convergence_agent_states(
+        P,
+        T,
+        &json!({"tool":"closeAgent","status":"completed","agentsStates":{C:{"status":"shutdown"}}}),
+        &mut vec![],
+    );
+    assert!(
+        !m.relations.aux.input_turns.contains_key(C),
+        "关闭已核实，应清除该线程的定位"
+    );
+    notify(
+        &mut m,
+        "rawResponseItem/completed",
+        json!({"threadId":C,"turnId":ACTIVE,"item":{"type":"message","role":"user"}}),
+    );
+    assert!(
+        m.coverage_observation_gen(C).is_none(),
+        "确认关闭后的输入不能归入已关闭线程的旧轮"
     );
 }

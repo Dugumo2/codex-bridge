@@ -1160,7 +1160,7 @@ impl Machine {
     }
 
     /// 线程状态和全部轮次都到齐后的判定。返回这个子代理是否核实通过。
-    fn convergence_apply_child_turns(
+    pub(super) fn convergence_apply_child_turns(
         &mut self,
         run: &str,
         thread: &str,
@@ -1220,6 +1220,9 @@ impl Machine {
                 self.observe_turn(thread, id, true, ended, actions);
             }
             valid = true;
+        }
+        if status == Some("notLoaded") {
+            self.observation_continuity_lost(thread, "发现回查确认线程卸载");
         }
         valid
     }

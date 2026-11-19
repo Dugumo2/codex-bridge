@@ -164,6 +164,9 @@ impl Machine {
             } else if matches!(status, "notFound" | "notLoaded" | "shutdown") {
                 self.convergence_observation_gap(thread, actions);
             }
+            if status == "notLoaded" || closed {
+                self.observation_continuity_lost(thread, "代理状态确认线程关闭或卸载");
+            }
             self.convergence_sync_facts(&run);
             self.touch_context(&run, MemberChange::Activity, actions);
         }

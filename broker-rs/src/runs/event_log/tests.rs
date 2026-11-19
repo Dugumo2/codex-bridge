@@ -2657,3 +2657,82 @@ fn gap_fix_文件未读完即停止跟随不能放行完成轮() {
         );
     }
 }
+
+#[test]
+fn gap_fix3_发现先登记时同轮输入不封锁冷热线程() {
+    for warm in [false, true] {
+        let mut m = if warm {
+            gap_fix_realistic_seed()
+        } else {
+            setup()
+        };
+        if !warm {
+            candidate(&mut m, "乙", "root");
+        }
+        let turn = turn_at(5000);
+        m.observe_turn("乙", &turn, true, false, &mut vec![]);
+        assert!(m.relations.aux.observed["乙"]
+            .iter()
+            .any(|o| o.turn == turn && !o.completed));
+        gap_b_started(&mut m, &turn);
+        assert!(!m
+            .relations
+            .aux
+            .coverage_starts
+            .contains_key(&("乙".into(), turn.clone())));
+        gap_fix_raw_message(&mut m, &turn, "user");
+        assert!(
+            !matches!(
+                m.relations.aux.raw_observations.get("乙"),
+                Some(crate::relations::coverage_observation::RawObservation::Blocked { .. })
+            ),
+            "同轮输入不应封锁线程，热启动={warm}"
+        );
+        gap_b_delivery(&mut m, &turn, "同轮消费", "/root/甲");
+        gap_b_summary(&mut m, &turn);
+        let mut all = gap_b_completed(&mut m, &turn);
+        all.extend(gap_b_sweep(&mut m));
+        assert!(gap_fix_gaps(&all, &turn) > 0);
+        if warm {
+            let next = turn_at(6000);
+            assert_eq!(
+                gap_fix_gaps(&gap_fix_sibling_turn(&mut m, &next, "兄弟"), &next),
+                0
+            );
+        }
+    }
+}
+
+#[test]
+fn gap_fix3_覆盖已否决或淘汰仍能定位且不能复活证明() {
+    for evicted in [false, true] {
+        let mut m = gap_fix_realistic_seed();
+        let turn = turn_at(5000);
+        m.coverage_veto(Some("乙"), Some(&turn), "已有反证", true);
+        if evicted {
+            for n in 0..COVERAGE_TURNS as u64 {
+                m.coverage_start("填充", &turn_at(6000 + n), None);
+            }
+            assert_eq!(m.runs.event_log.evicted_through_ms, Some(5000));
+        }
+        assert!(m.coverage_turn_seen("乙", &turn));
+        gap_b_started(&mut m, &turn);
+        assert!(!m
+            .relations
+            .aux
+            .coverage_starts
+            .contains_key(&("乙".into(), turn.clone())));
+        gap_fix_raw_message(&mut m, &turn, "user");
+        assert_eq!(
+            m.coverage_observation_gen("乙"),
+            Some(0),
+            "已真实开始的普通输入只否决所属轮"
+        );
+        assert!(m.coverage_open_proof("乙", &turn).is_none());
+        gap_b_completed(&mut m, &turn);
+        assert_eq!(
+            m.coverage_disposition("乙", &turn),
+            CoverageDisposition::OrdinaryGap
+        );
+    }
+}

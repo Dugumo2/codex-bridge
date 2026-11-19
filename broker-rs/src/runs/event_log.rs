@@ -30,7 +30,7 @@ pub(super) struct EventLog {
 
 /// 轮号里的开始毫秒。上游的轮号是 UUIDv7，前 48 位是生成时刻的毫秒时间戳；
 /// 只认格式完整的 UUIDv7（版本 7、RFC 4122 变体），别的格式没有开始时间。
-fn turn_started_ms(turn: &str) -> Option<u64> {
+pub(crate) fn turn_started_ms(turn: &str) -> Option<u64> {
     let b = turn.as_bytes();
     let well_formed = b.len() == 36
         && b.iter().enumerate().all(|(i, c)| match i {

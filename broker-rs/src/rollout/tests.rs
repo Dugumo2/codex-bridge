@@ -304,7 +304,12 @@ fn 大文件只读末尾窗口与新增内容_读取字节有界() {
     text += &message("2026-11-05T01:00:01.000Z", "m", "正文");
     append(&path, &text);
     let chunk = read_chunk(&path_str(&path), None).unwrap();
-    assert!(chunk.bytes_read <= TAIL_BYTES + 1, "{}", chunk.bytes_read);
+    assert_eq!(chunk.skipped_lines, 1, "窗口前的空洞属于同一条超长行");
+    assert!(
+        chunk.bytes_read <= MAX_READ_BYTES + text.len() as u64 + 1,
+        "{}",
+        chunk.bytes_read
+    );
     assert_eq!(chunk.entries.len(), 1);
     assert_eq!(chunk.cursor.offset, hole + text.len() as u64);
     append(&path, &message("2026-11-05T01:00:02.000Z", "m2", "正文"));
@@ -417,17 +422,17 @@ fn 窗口里只有工具输出没有消息时也向前找到当前轮() {
 }
 
 /// 合法 JSON 仍可能无法解释；真实读取器必须把这一点带到覆盖判定入口。
-/// 结构坏了的行可能正是轮边界，之后不能沿用原来的轮；结构完好、只是类型不认识的行计入坏行，
+/// 缺失轮边界身份时不能沿用原轮；消费字段损坏或记录类型不认识时计入坏行，
 /// 但轮的定位照旧（v0.4.0 的配对行为），上游新增记录类型不会让文件配对降级。
 #[test]
 fn gap_b_red_合法json但无法解释的记录必须报告坏行() {
     for (tag, kind, payload, anchor_kept) in [
-        ("缺类型", "response_item", json!({"id":"未知"}), false),
+        ("缺类型", "response_item", json!({"id":"未知"}), true),
         (
             "数字类型",
             "response_item",
             json!({"type":7,"id":"未知"}),
-            false,
+            true,
         ),
         (
             "未知条目",
@@ -473,7 +478,7 @@ fn gap_b_red_合法json但无法解释的记录必须报告坏行() {
         assert_eq!(
             turn.as_deref(),
             anchor_kept.then_some("原轮"),
-            "{tag}：结构坏了的行之后不能沿用旧轮；类型不认识的行不改变轮的定位"
+            "{tag}：只有可能损坏轮边界的记录才清定位"
         );
         assert_eq!(
             chunk.entries[0].turn_lost, !anchor_kept,
@@ -613,7 +618,7 @@ fn gap_b_red_确认无关记录与尚未补齐的半行不制造坏行() {
 }
 
 #[test]
-fn 无关输出与配置记录的内部取值不清轮锚() {
+fn gap_fix3_无关输出与配置记录的内部取值不清轮锚() {
     for (payload, bad) in [
         (json!({"type":"reasoning","summary":[7]}), false),
         (
@@ -643,4 +648,153 @@ fn 无关输出与配置记录的内部取值不清轮锚() {
             matches!(&chunk.entries[0].record, RolloutRecord::Message { turn: Some(t), .. } if t == "原轮")
         );
     }
+}
+
+#[test]
+fn gap_fix3_首次读到超长整行计一次跳行() {
+    let path = temp_file("整行");
+    append(&path, &"x".repeat(MAX_TAIL_BYTES as usize + 16));
+    append(&path, "\n");
+    let chunk = read_chunk(&path_str(&path), None).unwrap();
+    assert_eq!(chunk.cursor.offset, path.metadata().unwrap().len());
+    assert!(!chunk.unread && !chunk.cursor.skipping);
+    assert_eq!(chunk.skipped_lines, 1, "首次窗口跳过了完整长行");
+}
+
+#[test]
+fn gap_fix3_首次超长半行续读接回正常记录() {
+    let path = temp_file("半行");
+    append(&path, &"x".repeat(MAX_TAIL_BYTES as usize + 16));
+    let chunk = read_chunk(&path_str(&path), None).unwrap();
+    assert_eq!(chunk.cursor.offset, path.metadata().unwrap().len());
+    assert!(!chunk.unread && chunk.skipped_lines == 0);
+    assert!(chunk.cursor.skipping, "半行尚未结束");
+    let ts = "2026-11-05T01:00:00.000Z";
+    append(
+        &path,
+        &format!(
+            "\n{}{}",
+            task_started(ts, "轮"),
+            message(ts, "后续", "正文")
+        ),
+    );
+    let next = read_chunk(&path_str(&path), Some(&chunk.cursor)).unwrap();
+    assert_eq!((next.skipped_lines, next.bad_lines), (1, 0));
+    assert!(!next.cursor.skipping && !next.unread);
+    assert!(
+        matches!(&next.entries[..], [RolloutEntry { record: RolloutRecord::Message {turn: Some(t), ..}, turn_lost: false, .. }] if t == "轮")
+    );
+}
+
+#[test]
+fn gap_fix3_跳过长行中间块仍报告未读() {
+    let path = temp_file("中间块");
+    append(&path, &"x".repeat(2 * MAX_READ_BYTES as usize + 2));
+    let first = read_chunk(&path_str(&path), Some(&RolloutCursor::default())).unwrap();
+    assert!(first.cursor.skipping && first.more);
+    let next = read_chunk(&path_str(&path), Some(&first.cursor)).unwrap();
+    assert!(
+        next.cursor.skipping && next.more && next.cursor.offset < path.metadata().unwrap().len()
+    );
+    assert!(next.unread);
+}
+
+#[test]
+fn gap_fix3_跨窗首行按真实长度报告且接上轮标记() {
+    let ts = "2026-11-05T01:00:00.000Z";
+    for long in [false, true] {
+        let path = temp_file("跨窗");
+        let first = line(
+            ts,
+            "world_state",
+            json!({"数据":"x".repeat(if long { MAX_READ_BYTES as usize } else { 1024 })}),
+        );
+        // 轮标记在最后一轮扩窗时才出现，窗口正好切进其前一行中间。
+        let tail = task_started(ts, "轮")
+            + &message(ts, "消息", "正文")
+            + &line(ts, "world_state", json!({}));
+        let padding = MAX_TAIL_BYTES as usize - tail.len() - 500;
+        append(&path, &(first + &tail + &" ".repeat(padding - 1) + "\n"));
+        let size = path.metadata().unwrap().len();
+        let mut file = std::fs::File::open(&path).unwrap();
+        let window = read_range(&mut file, size - MAX_TAIL_BYTES - 1, MAX_TAIL_BYTES + 1).unwrap();
+        assert_eq!(window.iter().position(|&b| b == b'\n'), Some(500));
+        let chunk = read_chunk(&path_str(&path), None).unwrap();
+        assert_eq!(chunk.bad_lines, 0);
+        assert_eq!(
+            chunk.skipped_lines,
+            u32::from(long),
+            "跨窗行是否确实超长：{long}"
+        );
+        assert!(
+            matches!(&chunk.entries[..], [RolloutEntry {record: RolloutRecord::Message {turn: Some(t), ..}, turn_lost: false, ..}] if t == "轮")
+        );
+    }
+}
+
+#[test]
+fn gap_fix3_消费结构异常只计坏行仍按原轮配对() {
+    let ts = "2026-11-05T01:00:00.000Z";
+    for row in [
+        json!({"type":"response_item"}),
+        json!({"type":"response_item","payload":{}}),
+        json!({"type":"response_item","payload":{"type":42}}),
+        json!({"type":"response_item","payload":{"type":"agent_message","recipient":"乙","content":[]}}),
+        json!({"type":"response_item","payload":{"type":"agent_message","author":"甲","content":[]}}),
+        json!({"type":"response_item","payload":{"type":"agent_message","author":"甲","recipient":"乙","content":[{"type":"新部件"}]}}),
+        json!({"type":"response_item","payload":{"type":"function_call","name":"send_message","arguments":"{}"}}),
+        json!({"type":"response_item","payload":{"type":"function_call","name":"followup_task","call_id":"调用"}}),
+        json!({"type":"response_item","payload":{"type":"message","role":"user"}}),
+    ] {
+        let path = temp_file("消费");
+        append(
+            &path,
+            &(task_started(ts, "原轮") + &format!("{row}\n") + &message(ts, "消费", "正文")),
+        );
+        let chunk = read_chunk(&path_str(&path), None).unwrap();
+        assert_eq!((chunk.bad_lines, chunk.entries.len()), (1, 1), "{row}");
+        assert!(
+            matches!(&chunk.entries[0], RolloutEntry { record: RolloutRecord::Message { turn:Some(t), .. }, turn_lost:false, .. } if t == "原轮"),
+            "{row}"
+        );
+    }
+}
+
+#[test]
+fn gap_fix3_取得长度后文件变短须报告截断() {
+    let path = temp_file("变短");
+    append(&path, "{}\n");
+    let mut file = std::fs::File::open(&path).unwrap();
+    let len = file.metadata().unwrap().len();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_len(len - 1)
+        .unwrap();
+    assert_eq!(read_tail(&mut file, len), Err(RolloutError::Shrunk));
+    assert_eq!(
+        read_follow(&mut file, len, &RolloutCursor::default()),
+        Err(RolloutError::Shrunk)
+    );
+}
+
+#[test]
+fn gap_fix3_普通历史跨窗只补首行且不扩大解析窗口() {
+    let path = temp_file("短历史");
+    let ts = "2026-11-05T01:00:00.000Z";
+    let history = line(
+        ts,
+        "response_item",
+        json!({"type":"function_call_output","output":"x".repeat(256)}),
+    );
+    let marker = task_started(ts, "当前");
+    let text = history.repeat(MAX_TAIL_BYTES as usize / history.len() + 2) + &marker;
+    let from = text.len() - TAIL_BYTES as usize - 1;
+    assert!(text.as_bytes()[from] != b'\n' && text[from..].find('\n').unwrap() < history.len());
+    append(&path, &text);
+    let chunk = read_chunk(&path_str(&path), None).unwrap();
+    assert_eq!((chunk.bad_lines, chunk.skipped_lines), (0, 0));
+    assert!(chunk.bytes_read <= TAIL_BYTES + 1 + 4096);
+    assert_eq!(chunk.cursor.turn.as_deref(), Some("当前"));
 }
