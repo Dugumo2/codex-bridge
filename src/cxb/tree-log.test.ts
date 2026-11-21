@@ -16,6 +16,7 @@ let dir: string;
 beforeEach(() => { dir = mkdtempSync(join(tmpdir(), "cxb-tree-log-")); mkdirSync(join(dir, "runs")); });
 afterEach(async () => { await removeTemp(dir); }, 10_000);
 const ts = "2026-11-02T00:00:00.000Z";
+const stamp = (identity: string, revision = "") => ({ identity, revision });
 const payload = (patch: Partial<TreeLogPayload> = {}): TreeLogPayload => ({
   eventId: "42:1", rootThreadId: "thread-test", threadId: "thread-test", parentThreadId: null,
   shortId: "abcd1234", sourceRole: "run", turnId: null, itemId: null, summary: "摘要", truncated: false, ...patch,
@@ -28,7 +29,7 @@ describe("树日志解析与静态保留窗口", () => {
   test("旧读取在读取期间正常增长时保留当次完整行，树模式仍要求稳定快照", () => {
     let generation = 0;
     const io: LogReadIO = {
-      fingerprint: (path) => path.endsWith(".1") ? null : `同一文件:${generation}`,
+      fingerprint: (path) => path.endsWith(".1") ? null : stamp("同一文件", String(generation)),
       read() { generation++; return line() + `${ts} run-test 条目完成 未写完`; },
     };
     expect(readRunLog(dir, "abcd1234", io)?.map((row) => row.text)).toEqual(["轮次开始 摘要"]);
@@ -88,7 +89,7 @@ describe("树日志解析与静态保留窗口", () => {
   test("轮转中有限重试，不把旧活动文件和新备份拼在一起", () => {
     let changed = false, reads = 0;
     const io: LogReadIO = {
-      fingerprint: (path) => path.endsWith(".1") ? changed ? "旧活动" : null : changed ? "新活动" : "旧活动",
+      fingerprint: (path) => path.endsWith(".1") ? changed ? stamp("旧活动") : null : stamp(changed ? "新活动" : "旧活动"),
       read(path) { reads++; if (!changed) { changed = true; return line({ eventId: "42:1" }); }
         return line({ eventId: path.endsWith(".1") ? "42:1" : "42:2" }); },
     };
@@ -99,7 +100,7 @@ describe("树日志解析与静态保留窗口", () => {
   });
   test("轮转期间 ENOENT 可重试，持续变化三次后退出 1", () => {
     let missing = true;
-    const io: LogReadIO = { fingerprint: () => "存在", read() {
+    const io: LogReadIO = { fingerprint: () => stamp("存在"), read() {
       if (missing) { missing = false; throw Object.assign(new Error("轮转"), { code: "ENOENT" }); }
       return line();
     } };
@@ -117,7 +118,7 @@ describe("树日志解析与静态保留窗口", () => {
     write("坏行\n");
     expect(() => readRunLog(dir, "abcd1234")).toThrow("损坏的行");
     expect(() => readRunLogSnapshot(dir, "abcd1234", {
-      fingerprint: () => "存在", read: () => { throw Object.assign(new Error("禁止"), { code: "EACCES" }); },
+      fingerprint: () => stamp("存在"), read: () => { throw Object.assign(new Error("禁止"), { code: "EACCES" }); },
     })).toThrow("无法读取");
   });
   test("文件级丢行标记始终保留，包括运行首尾之外", () => {
@@ -136,13 +137,14 @@ describe("树日志解析与静态保留窗口", () => {
     expect(result.coverage.issues).toEqual([{ code: "metadataUnavailable", runId: "run-test" }]);
   });
   test("旧来源未知与候选暂存缺口、发现不完整保持稳定代码", () => {
-    write(`${ts} run-test 运行开始 旧\n` + line({ eventId: "42:2", coverageIssue: "beforeBindingUnknown", late: true })
+    write(`${ts} run-test 运行开始 旧\n` + line({ eventId: "42:2", coverageIssue: "beforeBindingUnknown", late: true }, "记录缺口")
       + line({ eventId: "42:3", coverageIssue: "discoveryIncomplete" }));
     const result = treeTimeline("thread-test", readRunLog(dir, "abcd1234")!, [runResult()]);
     expect(result.coverage.issues.map((issue) => issue.code)).toEqual(["legacySourceUnknown", "beforeBindingUnknown", "discoveryIncomplete"]);
     expect(result.items[0]!.threadId).toBeNull();
     expect(treeLogLine(result.items[0]!, new Map())).toContain("旧执行源未记录");
     expect(result.items[1]!.late).toBe(true);
+    expect(treeLogLine(result.items[1]!, new Map())).toContain("记录缺口");
   });
   test("停止核验中不推导日志缺口，定案后仍保留真实发现缺口", () => {
     const report: ChildrenStopReport = { trigger: "userStop", phase: "pending", version: 1,
@@ -168,6 +170,74 @@ describe("树日志解析与静态保留窗口", () => {
 });
 
 describe("show 静态树日志离线接口", () => {
+  test("无备份时同文件追加只重试，活动文件身份更换才提示窗口", () => {
+    for (const replaced of [false, true]) {
+      let reads = 0;
+      const extra = line({ eventId: "新增", attribution: "unconfirmed", sourceRole: "subagent", summary: "原文" });
+      const io: LogReadIO = {
+        fingerprint: (p) => p.endsWith(".1") ? null : stamp(replaced && reads ? "新" : "旧", reads ? "2" : "1"),
+        read: () => ++reads === 1 ? line() : line() + extra,
+      };
+      const snapshot = readRunLogSnapshot(dir, "abcd1234", io);
+      expect(reads).toBe(2);
+      expect(snapshot.lines?.at(-1)?.source?.summary).toBe("原文");
+      expect(snapshot.issues).toEqual(replaced ? [{ code: "rotationWindow" }] : []);
+    }
+  });
+  test("树日志机器输出逐字保留段落分隔符，完整文本仍单行", async () => {
+    ledger(dir);
+    const summary = "第一段\u2028第二段\u2029第三段";
+    write(line({ summary, attribution: "unconfirmed", sourceRole: "subagent", threadId: "乙", turnId: "子轮" }, "条目完成"));
+    const json = context(dir, ["show", "abcd", "--log", "--tree", "--json"]);
+    expect(await show(json.ctx)).toBe(0);
+    expect(json.json[0].items[0].summary).toBe(summary);
+    const full = context(dir, ["show", "abcd", "--log", "--tree", "--full"]);
+    expect(await show(full.ctx)).toBe(0);
+    expect(full.texts.join("")).toContain("第一段 第二段 第三段");
+    expect(full.texts.join("")).not.toMatch(/[\u2028\u2029]/);
+  });
+  test("归属未确认按运行线程和轮折叠，完整文本和机器输出可逐条取回", async () => {
+    ledger(dir);
+    const event = (id: string, thread: string, turn: string, run = "run-test") => line({
+      eventId: id, threadId: thread, turnId: turn, shortId: null, sourceRole: "subagent",
+      parentThreadId: "thread-test", attribution: "unconfirmed", itemId: id, summary: `原摘要-${id}`,
+    }, "条目完成", ts, run);
+    write(event("一", "乙", "第二轮"), ".1");
+    write(event("二", "乙", "第二轮") + event("三", "乙", "第三轮")
+      + event("四", "丙", "第二轮") + event("五", "乙", "第二轮", "run-other")
+      + event("六", "乙", "第二轮", "run-other"));
+    const run = async (...args: string[]) => {
+      const t = context(dir, ["show", "abcd", ...args]);
+      expect(await show(t.ctx)).toBe(0);
+      return t;
+    };
+    const folded = (await run("--log", "--tree")).texts.join("");
+    expect(folded.match(/未计入本运行/g)).toHaveLength(4);
+    expect(folded).toContain("2 条摘要归属未确认");
+    expect(folded).not.toContain("原摘要-");
+    const full = (await run("--log", "--tree", "--full")).texts.join("");
+    const json = (await run("--log", "--tree", "--json")).json[0];
+    expect(json.items).toHaveLength(6);
+    for (const [i, id] of ["一", "二", "三", "四", "五", "六"].entries()) {
+      expect(full).toContain(`原摘要-${id}`);
+      expect(json.items[i]).toMatchObject({ attribution: "unconfirmed", itemId: id, summary: `原摘要-${id}` });
+    }
+    expect(json.coverage.issues.map((i: { code: string }) => i.code)).toEqual(["rotationWindow", "metadataUnavailable"]);
+    const tail = (await run("--tail", "--tree", "--limit", "2", "--json")).json[0];
+    expect(tail.items.map((i: { itemId: string }) => i.itemId)).toEqual(["五", "六"]);
+    expect(ownLogLines(readRunLog(dir, "abcd1234")!)).toEqual([]);
+    expect((await run("--log", "--full")).texts.join("")).not.toContain("原摘要-");
+  });
+  test("普通结果的启动失败提示只读取本运行的行", async () => {
+    ledger(dir, [runResult({ status: "failed", turns: [], turnsTotal: 0 })]);
+    write(line({ summary: "本运行启动失败" }, "启动失败")
+      + line({ eventId: "42:2", attribution: "unconfirmed", sourceRole: "subagent",
+        threadId: "乙", turnId: "子轮", summary: "未确认错误" }, "启动失败"));
+    const t = context(dir, ["show", "abcd"]);
+    expect(await show(t.ctx)).toBe(0);
+    expect(t.notices.join("")).toContain("本运行启动失败");
+    expect(t.notices.join("")).not.toContain("未确认错误");
+  });
   test("升级后的 log 与 tail 接受旧裸标志正文，树模式仅报告来源未知", async () => {
     ledger(dir);
     const content = "@cxb2 升级前保存的普通正文";
@@ -294,7 +364,7 @@ describe("show 静态树日志离线接口", () => {
       if (method === "broker/threads/list") return { threads: [summary()] };
       if (method === "broker/runs/modelSummaries") return { runs: [] };
       if (params.threadId === "review-child") {
-        fs.appendFileSync(path, line({ eventId: "1:4", summary: "执行二", sourceRole: "subagent", threadId: "ordinary-child" }, "条目完成")
+        fs.appendFileSync(path, line({ eventId: "1:4", summary: "执行二", attribution: "unconfirmed", sourceRole: "subagent", threadId: "ordinary-child" }, "条目完成")
           + line({ eventId: "1:5", summary: "执行二", sourceRole: "execution", threadId: "review-child" }, "条目完成"));
       }
       return { thread: summary({ threadId: params.threadId }), run: ended };

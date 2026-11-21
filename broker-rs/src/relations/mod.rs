@@ -10,7 +10,6 @@ pub mod types;
 
 mod classification;
 pub mod convergence;
-pub(crate) mod coverage_observation;
 pub(crate) use classification::{CandidateClassification, CandidateObservation, Membership};
 mod discovery;
 mod facts;
@@ -101,6 +100,7 @@ pub enum ParentWait {
 /// 一个线程的回查状态：同一线程只有一个在途 thread/read。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Lookup {
+    pub read_stamp: (u64, u64),
     pub op_id: u64,
     pub generation: u64,
     pub attempt: u32,
@@ -147,14 +147,11 @@ pub struct RelationsAux {
     pub observed_order: VecDeque<String>,
     /// 原始工具调用先于执行结果；只存身份、顺序和期限，不保存参数正文。
     pub followup_starts: BTreeMap<EvidenceKey, v2_pairing::FollowupStart>,
+    /// 开始表满时只暂存实时留言的身份，不保存正文或授予接收方权限。
+    pub raw_queue_receipts: BTreeMap<EvidenceKey, (u64, u64)>,
+    /// 两张表同时满且实际未能登记留言身份时，记下其连接代际与证据截止时刻。
+    pub raw_queue_receipts_full: Option<(u64, u64)>,
     pub observation_seq: u64,
-    /// 覆盖入口顺序与不可恢复的连续观察凭据，不随配对清理或连接换代删除。
-    pub(crate) coverage_seq: u64,
-    pub(crate) coverage_epoch: Option<u64>,
-    pub(crate) raw_globally_blocked: bool,
-    pub(crate) raw_observations: BTreeMap<String, coverage_observation::RawObservation>,
-    pub(crate) input_turns: BTreeMap<String, coverage_observation::InputTurns>,
-    pub(crate) coverage_starts: BTreeMap<(String, String), coverage_observation::RawStart>,
     /// 仅真实 turn/started 登记；发现或迟到 completed 不能伪造轮次开始。
     pub live_turn_starts: BTreeMap<(String, String), (u64, u64)>,
     pub v2_receiver_paths: BTreeMap<EvidenceKey, String>,

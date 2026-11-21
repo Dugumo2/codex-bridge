@@ -11,6 +11,7 @@ export interface TreeLogPayload {
   summary: string;
   truncated: boolean;
   late?: boolean;
+  attribution?: "unconfirmed";
   coverageIssue?: "beforeBindingUnknown" | "discoveryIncomplete";
 }
 
@@ -31,6 +32,7 @@ export interface TreeLogEvent {
   summary: string;
   truncated: boolean;
   late?: boolean;
+  attribution?: TreeLogPayload["attribution"];
 }
 
 export interface LogCoverageIssue {

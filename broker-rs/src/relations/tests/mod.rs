@@ -4,7 +4,6 @@ use crate::claim::{Claim, Event, Owner, State};
 use crate::test_support::subagent::SubagentMock;
 use serde_json::json;
 
-mod coverage_observation;
 mod discovery;
 mod discovery_idle;
 mod discovery_turns;

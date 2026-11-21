@@ -632,19 +632,19 @@ fn 无raw_授权或连接换代与停止后不再读文件且无残留轮询() {
                 .relations
                 .aux
                 .rollout
-                .coverage_reads
+                .rollout_reads
                 .values()
                 .filter(|t| t.state == crate::relations::rollout_pairing::ReadTicketState::Active)
                 .map(|t| t.deadline)
                 .min();
             assert!(
-                active_deadline.is_some(),
-                "授权换代取消配对，但不能放弃仍在本连接的覆盖读取"
+                active_deadline.is_none(),
+                "授权换代取消跟随后只保留物理占位"
             );
             assert_eq!(
                 m.relations.aux.rollout.timer.map(|t| t.0),
                 active_deadline,
-                "没有配对工作后仅保留Active票据的独立到期计时"
+                "逻辑票据退休后不再为其排到期计时"
             );
             let late = fx::release_held(&mut m);
             assert!(!late.iter().any(|a| matches!(a, Action::ReadRollout(_))));
@@ -1720,23 +1720,23 @@ fn 等文件期间父线程送来raw_停止读它的文件并按缺开始记录�
     no_lingering_poll(&mut m, &mock);
 }
 
-const GAP_B_FILE_TURN: &str = "ffffffff-ffff-7000-8000-000000000091";
+const FILE_TURN: &str = "ffffffff-ffff-7000-8000-000000000091";
 
-fn gap_b_file_message(author: &str, id: &str, text: &str) -> serde_json::Value {
+fn 文件消息(author: &str, id: &str, text: &str) -> serde_json::Value {
     let recipient = format!("/root/{C}");
     json!({"type":"agent_message","id":id,"author":author,"recipient":recipient,
         "content":[{"type":"input_text","text":format!(
             "Message Type: MESSAGE\nTask name: {recipient}\nSender: {author}\nPayload:\n{text}")} ]})
 }
 
-fn gap_b_assert_unbound_without_other_exclusion(m: &Machine) {
+fn 核对未绑定候选(m: &Machine) {
     assert!(
-        m.binding(C, GAP_B_FILE_TURN).is_none(),
+        m.binding(C, FILE_TURN).is_none(),
         "前置：测试轮没有操作归属"
     );
     assert!(
         !m.historical_subagent_for_run(R, C),
-        "前置：不能通过历史成员排除免报"
+        "前置：该轮有本运行的候选"
     );
     assert!(
         m.relations.operations.values().any(|o| o.run_id == R
@@ -1750,16 +1750,24 @@ fn gap_b_assert_unbound_without_other_exclusion(m: &Machine) {
             .values()
             .any(|o| o.receivers.contains(C)
                 && (o.outcome == EvidenceOutcome::Pending || o.proof_expired)),
-        "前置：没有在途归属续期或 proof_expired 掩盖覆盖分支"
+        "前置：没有在途或过期的归属证据"
     );
     assert!(!m.relations.aux.rollout.waits.values().any(|w| w.child == C));
     assert!(!m.relations.aux.spawn_waits.contains_key(C));
 }
 
-fn gap_b_expire_file_turn(m: &mut Machine, mock: &mut SubagentMock, all: &mut Vec<Action>) {
-    let actions = complete(m, mock, C, GAP_B_FILE_TURN, "completed");
+fn 完成并核对文件摘要(m: &mut Machine, mock: &mut SubagentMock, all: &mut Vec<Action>) {
+    let actions = complete(m, mock, C, FILE_TURN, "completed");
     all.extend(replies(m, mock, actions));
-    gap_b_assert_unbound_without_other_exclusion(m);
+    核对未绑定候选(m);
+    暂存到期(m, all);
+    assert!(all.iter().any(|a| matches!(a,
+        Action::Store(crate::store::StoreOp::AppendLog { lines, .. })
+            if lines.iter().any(|line| line.contains("\"attribution\":\"unconfirmed\"") && line.contains(FILE_TURN) && line.contains("轮次开始")))),
+        "目标轮原摘要可取回");
+}
+
+fn 暂存到期(m: &mut Machine, all: &mut Vec<Action>) {
     let (token, kind) = all
         .iter()
         .rev()
@@ -1775,32 +1783,28 @@ fn gap_b_expire_file_turn(m: &mut Machine, mock: &mut SubagentMock, all: &mut Ve
     m.clock.mono_ms += 31_000;
     m.clock.now_ms += 31_000;
     all.extend(apply(m, Event::Timer { token, kind }));
-    assert!(all.iter().any(|a| matches!(a,
-        Action::Store(crate::store::StoreOp::AppendLog { lines, .. })
-            if lines.iter().any(|line| line.contains("beforeBindingUnknown") && line.contains(GAP_B_FILE_TURN)))),
-        "文件包含未完整观察的消费，必须保留记录缺口，不能以纯协作丢弃");
 }
 
 /// 同一轮早期上级消费被 floor 过滤，后来的兄弟消费仍登记；另一轮正确消费跟进，排除归属续期遮挡。
 #[test]
-fn gap_b_red_文件过滤早期上级消费后只剩兄弟仍须报告缺口() {
+fn gap_wu_文件过滤早期消费仍保留目标轮摘要() {
     let (mut m, mut mock) = base();
     files(&m);
-    let actions = apply(&mut m, mock.turn_started(C, GAP_B_FILE_TURN));
+    let actions = apply(&mut m, mock.turn_started(C, FILE_TURN));
     let mut all = replies(&mut m, &mock, actions);
     let old_at = m.clock.now_ms - crate::relations::rollout_pairing::ROLLOUT_FLOOR_SLACK_MS - 1;
-    turn_marker(C, GAP_B_FILE_TURN, old_at);
+    turn_marker(C, FILE_TURN, old_at);
     fx::append_line(
         C,
         old_at,
         "response_item",
-        gap_b_file_message("/root", "被过滤上级", "早期跟进"),
+        文件消息("/root", "被过滤上级", "早期跟进"),
     );
     fx::append_line(
         C,
         m.clock.now_ms,
         "response_item",
-        gap_b_file_message("/root/兄弟", "文件兄弟", "只协作"),
+        文件消息("/root/兄弟", "文件兄弟", "只协作"),
     );
     turn_marker(C, "旧轮", m.clock.now_ms);
     message_line(&m, C, "正常跟进入站", "NEW_TASK", "只归旧轮的任务");
@@ -1810,7 +1814,7 @@ fn gap_b_red_文件过滤早期上级消费后只剩兄弟仍须报告缺口() {
     assert!(
         parsed.entries.iter().any(|e| matches!(&e.record,
         crate::rollout::RolloutRecord::Message { turn: Some(t), item }
-            if t == GAP_B_FILE_TURN && item["id"] == "被过滤上级")),
+            if t == FILE_TURN && item["id"] == "被过滤上级")),
         "前置：上级消息确实在真实读取结果里"
     );
     all.extend(interacted_to(&mut m, "文件红测跟进", C));
@@ -1833,184 +1837,10 @@ fn gap_b_red_文件过滤早期上级消费后只剩兄弟仍须报告缺口() {
             .aux
             .v2_deliveries
             .iter()
-            .any(|d| d.id == "文件兄弟" && d.turn == GAP_B_FILE_TURN),
+            .any(|d| d.id == "文件兄弟" && d.turn == FILE_TURN),
         "前置：同轮兄弟消费确已登记"
     );
-    gap_b_expire_file_turn(&mut m, &mut mock, &mut all);
-}
-
-/// 文件读取已经真实派发并暂扣；随后 raw 让线程退出 needed，再回来时仍须处理反证。
-#[test]
-fn gap_b_red_raw使线程停止文件跟随后在途文件消费和坏行仍否决() {
-    const ORIGINAL: &str = "ffffffff-ffff-7000-8000-000000000089";
-    for (malformed, registration) in [
-        (false, "原登记"),
-        (true, "原登记"),
-        (false, "删除登记"),
-        (false, "替换reading"),
-        (false, "floor过滤"),
-        (false, "重复id"),
-    ] {
-        // 覆盖资格测试使用真实规范轮号，避免旧配对夹具的“旧轮”消费本身先触发身份否决。
-        let (mut m, mut mock) = setup();
-        spawn(&mut m, &mut mock, P, T, C, "原派生", ORIGINAL);
-        files(&m);
-        turn_marker(C, ORIGINAL, m.clock.now_ms);
-        call_line(&m, "在途文件跟进", "followup_task", C, "只归旧轮的任务");
-        let mut all = interacted_to(&mut m, "在途文件跟进", C);
-        assert!(op(&m, "在途文件跟进").v2_strict);
-        pending(&m, 1);
-        fx::with(|f| f.hold = true);
-        all.extend(fx::poll(&mut m));
-        assert!(
-            fx::with(|f| f.held.iter().any(|r| r.thread == C)),
-            "前置：真实读取动作已发出且未返回"
-        );
-        let read_id = fx::with(|f| f.held.iter().find(|r| r.thread == C).unwrap().id);
-        assert_eq!(m.relations.aux.rollout.files[C].reading, Some(read_id));
-        assert!(
-            m.relations.aux.rollout.files[C].cursor.is_some(),
-            "前置：首次文件读取已经建立游标"
-        );
-
-        // 第一轮真实 raw 作为之后轮的见证；raw 也让 file_allowed(C) 为 false。
-        const SEED: &str = "ffffffff-ffff-7000-8000-000000000090";
-        all.extend(apply(&mut m, mock.turn_started(C, SEED)));
-        all.extend(notify(
-            &mut m,
-            "rawResponseItem/completed",
-            json!({"threadId":C,"turnId":SEED,
-            "item":{"type":"reasoning","summary":[]}}),
-        ));
-        all.extend(complete(&mut m, &mut mock, C, SEED, "completed"));
-        all.extend(apply(&mut m, mock.turn_started(C, GAP_B_FILE_TURN)));
-        all.extend(notify(
-            &mut m,
-            "rawResponseItem/completed",
-            json!({"threadId":C,"turnId":GAP_B_FILE_TURN,
-            "item":gap_b_file_message("/root/兄弟", "实时兄弟", "只协作")}),
-        ));
-        delivery(&mut m, ORIGINAL, "真实跟进入站", "只归旧轮的任务", false);
-        assert_eq!(
-            op(&m, "在途文件跟进").proven_turns[C],
-            [ORIGINAL.to_owned()].into()
-        );
-        assert_eq!(
-            m.relations.aux.v2_raw_threads.get(C),
-            Some(&m.relations.conn_epoch),
-            "前置：needed 对线程应用的 raw 过滤条件已成立"
-        );
-        gap_b_assert_unbound_without_other_exclusion(&m);
-        assert!(
-            m.coverage_open_proof(C, GAP_B_FILE_TURN).is_some(),
-            "前置：文件结果回来前确有实时覆盖资格，不能被已有否决掩盖"
-        );
-        all.extend(notify(
-            &mut m,
-            "item/completed",
-            json!({"threadId":C,"turnId":GAP_B_FILE_TURN,
-            "item":{"type":"agentMessage","id":"文件反证前摘要","text":"文件结果回来前不得丢弃"}}),
-        ));
-        let pending_before = m.event_log_pending_stats(C, GAP_B_FILE_TURN);
-        assert!(
-            pending_before.0 > 0 && pending_before.1 > 0,
-            "前置：有真实暂存摘要和占用字节"
-        );
-        assert!(
-            m.coverage_open_proof(C, GAP_B_FILE_TURN).is_some(),
-            "摘要入口仍保持Open"
-        );
-        turn_marker(C, GAP_B_FILE_TURN, m.clock.now_ms);
-        let file_id = if registration == "重复id" {
-            "实时兄弟"
-        } else {
-            "在途文件上级"
-        };
-        let file_wall = if registration == "floor过滤" {
-            m.clock.now_ms - crate::relations::rollout_pairing::ROLLOUT_FLOOR_SLACK_MS - 1
-        } else {
-            m.clock.now_ms
-        };
-        if malformed {
-            fx::append_raw(C, "这不是JSON\n");
-        } else {
-            fx::append_line(
-                C,
-                file_wall,
-                "response_item",
-                gap_b_file_message("/root", file_id, "遗漏跟进"),
-            );
-        }
-        let request = fx::with(|f| f.held.iter().find(|r| r.thread == C).unwrap().clone());
-        let actual = crate::rollout::read_chunk(&request.path, request.cursor.as_ref()).unwrap();
-        if malformed {
-            assert!(actual.bad_lines > 0, "前置：真实读取器产出坏行信号");
-        } else {
-            assert!(
-                actual.entries.iter().any(|e| matches!(&e.record,
-                crate::rollout::RolloutRecord::Message { turn: Some(t), item }
-                    if t == GAP_B_FILE_TURN && item["id"] == file_id)),
-                "前置：真实读取器读到目标轮反证"
-            );
-        }
-        match registration {
-            "删除登记" => {
-                m.relations.aux.rollout.files.remove(C);
-            }
-            "替换reading" => {
-                m.relations.aux.rollout.files.get_mut(C).unwrap().reading = Some(u64::MAX);
-            }
-            _ => {}
-        }
-        let previous_cursor = m
-            .relations
-            .aux
-            .rollout
-            .files
-            .get(C)
-            .and_then(|f| f.cursor.clone());
-        all.extend(fx::release_held(&mut m));
-        assert!(
-            m.coverage_open_proof(C, GAP_B_FILE_TURN).is_none(),
-            "文件反证必须在配对过滤之前撤销实时覆盖资格：{registration}"
-        );
-        assert_eq!(
-            m.event_log_pending_stats(C, GAP_B_FILE_TURN),
-            pending_before,
-            "文件反证仅否决免报，不能提前丢弃摘要或减少字节"
-        );
-        if malformed {
-            assert!(
-                m.coverage_observation_gen(C).is_none(),
-                "无法解释文件记录封锁未来raw授信"
-            );
-        }
-        assert!(
-            m.relations
-                .aux
-                .rollout
-                .files
-                .get(C)
-                .is_none_or(|f| f.cursor.is_none()
-                    || registration == "替换reading" && f.cursor == previous_cursor),
-            "停止跟随后结果不推进配对游标；覆盖否决必须在这个早退之前"
-        );
-        assert!(
-            !m.relations
-                .aux
-                .v2_deliveries
-                .iter()
-                .any(|d| d.id == "在途文件上级"),
-            "反证不进入配对表，必须由独立覆盖入口处理"
-        );
-        gap_b_expire_file_turn(&mut m, &mut mock, &mut all);
-        let pending_after = m.event_log_pending_stats(C, GAP_B_FILE_TURN);
-        assert_eq!(
-            (pending_after.0, pending_after.1),
-            (0, 0),
-            "最终缺口写出后对应摘要与字节一并清零"
-        );
-    }
+    完成并核对文件摘要(&mut m, &mut mock, &mut all);
 }
 
 /// 删除全部配对登记后，已经派发的物理读取仍必须有独立到期唤醒。
@@ -2025,7 +1855,6 @@ fn gap_b_red_仅剩在途读取仍独立调度期限() {
         2,
         "前置：两个真实读取动作被执行器暂扣"
     );
-    let previous_generation = m.coverage_read_observation_gen(C);
     let deadline = m.clock.mono_ms + 30_000;
     m.relations.aux.rollout.files.clear();
     m.relations.aux.rollout.waits.clear();
@@ -2058,21 +1887,17 @@ fn gap_b_red_仅剩在途读取仍独立调度期限() {
         .relations
         .aux
         .rollout
-        .coverage_reads
+        .rollout_reads
         .values()
         .all(|t| t.state == crate::relations::rollout_pairing::ReadTicketState::Retired));
     assert_eq!(
-        m.relations.aux.rollout.coverage_reads.len(),
+        m.relations.aux.rollout.rollout_reads.len(),
         2,
         "逻辑到期仍占物理名额"
     );
     assert!(
         m.relations.aux.rollout.timer.is_none(),
         "只有退休占位不能忙循环"
-    );
-    assert!(
-        m.coverage_read_observation_gen(C) > previous_generation,
-        "退休前必须推进观察代际，封锁未来raw授信"
     );
 }
 
@@ -2118,7 +1943,7 @@ fn gap_b_red_六十四个物理读取跨代际仍阻止第六十五个() {
         .relations
         .aux
         .rollout
-        .coverage_reads
+        .rollout_reads
         .values()
         .all(|t| t.state == crate::relations::rollout_pairing::ReadTicketState::Retired));
     let before_deliveries = m.relations.aux.v2_deliveries.clone();
@@ -2129,7 +1954,7 @@ fn gap_b_red_六十四个物理读取跨代际仍阻止第六十五个() {
         "旧结果只释放一个名额，新代际只补一个任务"
     );
     assert_eq!(m.relations.aux.rollout.reads_issued, 65);
-    assert_eq!(m.relations.aux.rollout.coverage_reads.len(), 64);
+    assert_eq!(m.relations.aux.rollout.rollout_reads.len(), 64);
     assert_eq!(
         m.relations.aux.v2_deliveries, before_deliveries,
         "退休结果不配对旧消费"
@@ -2141,7 +1966,7 @@ fn gap_b_red_六十四个物理读取跨代际仍阻止第六十五个() {
         "关闭确实执行rollout_stop"
     );
     assert_eq!(
-        m.relations.aux.rollout.coverage_reads.len(),
+        m.relations.aux.rollout.rollout_reads.len(),
         64,
         "关闭和stop同样不能释放物理占位"
     );
@@ -2149,7 +1974,7 @@ fn gap_b_red_六十四个物理读取跨代际仍阻止第六十五个() {
         .relations
         .aux
         .rollout
-        .coverage_reads
+        .rollout_reads
         .values()
         .all(|t| t.state == crate::relations::rollout_pairing::ReadTicketState::Retired));
 }
@@ -2161,13 +1986,9 @@ fn gap_b_未知票据与身份冲突不得释放他人的物理占位() {
     fx::with(|f| f.hold = true);
     interacted_to(&mut m, "身份核验", C);
     let request = fx::with(|f| f.held[0].clone());
-    let tickets = m.relations.aux.rollout.coverage_reads.len();
+    let tickets = m.relations.aux.rollout.rollout_reads.len();
     assert_eq!(tickets, 2, "前置：有两个已派发未完成的真实IO");
-    let identity = (
-        request.conn_epoch,
-        request.observation_gen,
-        request.issued_seq,
-    );
+    let identity = request.conn_epoch;
     m.rollout_read_done(
         u64::MAX,
         &request.thread,
@@ -2175,7 +1996,7 @@ fn gap_b_未知票据与身份冲突不得释放他人的物理占位() {
         Ok(crate::rollout::RolloutChunk::default()),
         &mut vec![],
     );
-    assert_eq!(m.relations.aux.rollout.coverage_reads.len(), tickets);
+    assert_eq!(m.relations.aux.rollout.rollout_reads.len(), tickets);
     m.rollout_read_done(
         request.id,
         "冲突线程",
@@ -2183,202 +2004,617 @@ fn gap_b_未知票据与身份冲突不得释放他人的物理占位() {
         Ok(crate::rollout::RolloutChunk::default()),
         &mut vec![],
     );
-    assert_eq!(m.relations.aux.rollout.coverage_reads.len(), tickets);
-    assert!(
-        m.relations.aux.raw_globally_blocked,
-        "无法核验身份的结果封锁未来授信"
-    );
+    assert_eq!(m.relations.aux.rollout.rollout_reads.len(), tickets);
     fx::release_held(&mut m);
     assert!(
-        m.relations.aux.rollout.coverage_reads.is_empty(),
+        m.relations.aux.rollout.rollout_reads.is_empty(),
         "只有真实任务返回才释放名额"
     );
 }
 
+fn 留言参数(args: Option<serde_json::Value>) {
+    let (mut m, _) = base();
+    files(&m);
+    let mut call = json!({"type":"function_call","name":"send_message","call_id":"留言"});
+    if let Some(args) = args {
+        call["arguments"] = args;
+    }
+    assert!(!m.relations.aux.v2_raw_threads.contains_key(P));
+    fx::append_line(P, m.clock.now_ms, "response_item", call);
+    interacted_to(&mut m, "留言", C);
+    let o = op(&m, "留言");
+    assert!(
+        o.v2_strict && o.v2_queue_only,
+        "按文件调用身份识别只入队留言"
+    );
+    assert_eq!(o.v2_source, V2EvidenceSource::RolloutFile);
+    assert!(o.receivers.is_empty());
+}
 #[test]
-fn gap_fix3_首次派读与实时见证交接按真实文件结算() {
-    const ORIGINAL: &str = "fffffffe-0001-7000-8000-000000000001";
-    for tail in [
-        "读完",
-        "跟随时返回半行",
-        "超长半行",
-        "超长整行",
-        "跨窗消费",
-        "跨窗历史输出",
-    ] {
-        let (mut m, mut mock) = setup();
-        spawn(&mut m, &mut mock, P, T, C, "原派生", ORIGINAL);
+fn gap_fix4_文件留言缺参数仍只入队() {
+    留言参数(None);
+}
+#[test]
+fn gap_fix4_文件留言对象参数仍只入队() {
+    留言参数(Some(json!({"扩展":true})));
+}
+
+#[test]
+fn gap_wu_首读在途遇真实断档仍退休物理票据() {
+    let (mut m, _) = base();
+    files(&m);
+    fx::with(|f| f.hold = true);
+    interacted_to(&mut m, "被扣住", C);
+    let request = fx::with(|f| f.held.iter().find(|r| r.thread == C).unwrap().clone());
+    assert_eq!(m.relations.aux.rollout.files[C].reading, Some(request.id));
+    apply(&mut m, Event::ObservationGap { thread: Some(C.into()) });
+    assert_eq!(
+        m.relations.aux.rollout.rollout_reads[&request.id].state,
+        crate::relations::rollout_pairing::ReadTicketState::Retired
+    );
+    assert!(m.relations.aux.rollout.files[C].reading.is_none());
+}
+
+#[test]
+fn gap_wu_卸载关闭及附着淘汰使旧读取失效() {
+    for event in ["卸载", "关闭", "淘汰"] {
+        let (mut m, _) = base();
         files(&m);
-        turn_marker(C, ORIGINAL, m.clock.now_ms);
-        call_line(&m, "交接", "followup_task", C, "旧轮任务");
         fx::with(|f| f.hold = true);
-        let mut all = interacted_to(&mut m, "交接", C);
-        // 父文件先交回调用证据，子文件仍是同一张真实的首次读取票据。
-        fx::with(|f| {
-            let i = f.held.iter().position(|r| r.thread == P).unwrap();
-            f.held.swap(0, i);
-        });
-        all.extend(fx::release_one_held(&mut m));
-        let request = fx::with(|f| f.held.iter().find(|r| r.thread == C).unwrap().clone());
-        assert!(request.cursor.is_none() && m.relations.aux.rollout.files[C].reads == 0);
-        assert_eq!(m.relations.aux.rollout.files[C].reading, Some(request.id));
-        assert!(!m.relations.aux.v2_raw_threads.contains_key(C));
-        assert!(awaiting(&m, "交接"), "子文件首次读取仍在途");
-        if tail == "跟随时返回半行" {
-            fx::append_raw(C, "{");
-            let chunk = crate::rollout::read_chunk(&request.path, None).unwrap();
-            assert!(chunk.unread && !chunk.more && !chunk.cursor.skipping);
-            all.extend(fx::release_held(&mut m));
-            assert!(m.relations.aux.rollout.files[C].cursor.is_some());
-            assert!(m.coverage_open_proof(C, ORIGINAL).is_none());
-        }
-        assert!(
-            m.binding(C, ORIGINAL).is_some(),
-            "种子轮已绑定，不产生无归属摘要"
-        );
-        all.extend(notify(
-            &mut m,
-            "rawResponseItem/completed",
-            json!({"threadId":C,"turnId":ORIGINAL,"item":{"type":"reasoning"}}),
-        ));
-        assert!(
-            op(&m, "交接").v2_strict,
-            "子线程 raw 已到达，可按父文件证据配对"
-        );
-        delivery(&mut m, ORIGINAL, "旧轮消费", "旧轮任务", false);
-        all.extend(complete(&mut m, &mut mock, C, ORIGINAL, "completed"));
-        all.extend(apply(&mut m, mock.turn_started(C, GAP_B_FILE_TURN)));
-        all.extend(notify(&mut m, "rawResponseItem/completed", json!({"threadId":C,"turnId":GAP_B_FILE_TURN,"item":gap_b_file_message("/root/兄弟", "实时兄弟", "协作")})));
-        assert_eq!(op(&m, "交接").proven_turns[C], [ORIGINAL.to_owned()].into());
-        gap_b_assert_unbound_without_other_exclusion(&m);
-        assert_eq!(
-            m.relations.aux.v2_raw_threads.get(C),
-            Some(&m.relations.conn_epoch)
-        );
-        all.extend(notify(&mut m, "item/completed", json!({"threadId":C,"turnId":GAP_B_FILE_TURN,"item":{"type":"agentMessage","id":"摘要","text":"等待裁决"}})));
-        assert!(m.coverage_open_proof(C, GAP_B_FILE_TURN).is_some());
-        let pending = m.event_log_pending_stats(C, GAP_B_FILE_TURN);
-        assert!(pending.0 > 0 && pending.1 > 0);
-        let actions = complete(&mut m, &mut mock, C, GAP_B_FILE_TURN, "completed");
-        all.extend(replies(&mut m, &mock, actions));
-        let long = tail.starts_with("超长");
-        if tail != "跟随时返回半行" {
-            assert!(m
-                .relations
-                .aux
-                .rollout
-                .coverage_reads
-                .contains_key(&request.id));
-            assert!(m.event_log_pending_stats(C, GAP_B_FILE_TURN).0 >= pending.0);
-            if tail.starts_with("跨窗") {
-                let mut payload = if tail == "跨窗消费" {
-                    gap_b_file_message("/root", "窗口前开始的消费", "任务")
-                } else {
-                    json!({"type":"function_call_output"})
-                };
-                payload["扩展"] = json!("x".repeat(crate::rollout::TAIL_BYTES as usize + 16));
-                fx::append_line(C, m.clock.now_ms, "response_item", payload);
-                turn_marker(C, GAP_B_FILE_TURN, m.clock.now_ms);
+        interacted_to(&mut m, "等待", C);
+        let id = m.relations.aux.rollout.files[C].reading.unwrap();
+        if event == "淘汰" {
+            m.relations.attachments.get_mut(C).unwrap().observed_at_ms = 0;
+            for i in 0..crate::relations::MAX_ATTACHMENTS {
+                m.attach(&format!("其他线程{i}"), AttachmentSource::ThreadEvent);
             }
-            if long {
-                fx::append_raw(C, &"x".repeat(crate::rollout::MAX_TAIL_BYTES as usize + 1));
-                if tail == "超长整行" {
-                    fx::append_raw(C, "\n");
+            assert!(!m.relations.attachments.contains_key(C));
+        } else {
+            let status = if event == "关闭" { "shutdown" } else { "notLoaded" };
+            m.convergence_agent_states(P, T, &json!({
+                "tool":"closeAgent","status":"completed","agentsStates":{C:{"status":status}}
+            }), &mut vec![]);
+        }
+        m.drive_rollout(&mut vec![]);
+        assert_eq!(m.relations.aux.rollout.rollout_reads[&id].state,
+            crate::relations::rollout_pairing::ReadTicketState::Retired, "{event}");
+    }
+}
+
+#[test]
+fn gap_wu_无原始调用的兄弟跟进不触发文件等待() {
+    let (mut m, mut mock) = base();
+    spawn(&mut m, &mut mock, P, T, "甲", "派甲", "甲轮");
+    files(&m);
+    let (started, done) = SubagentMock::v2_activity("interacted", "甲", "甲轮", "平级", C);
+    let mut actions = apply(&mut m, started);
+    actions.extend(apply(&mut m, done));
+    assert!(!fx::touches_rollout(&actions));
+    assert!(op(&m, "平级").rejected_receivers.contains_key(C));
+}
+
+#[test]
+fn gap_fix4_文件跟进没有正文摘要按调用缺失回退() {
+    let (mut m, _) = base();
+    files(&m);
+    fx::append_line(P, m.clock.now_ms, "response_item",
+        json!({"type":"function_call","name":"followup_task","call_id":"无正文"}));
+    assert!(!m.relations.aux.v2_raw_threads.contains_key(P));
+    interacted_to(&mut m, "无正文", C);
+    let operation = op(&m, "无正文");
+    assert!(!operation.v2_strict && !operation.v2_queue_only);
+    assert_eq!(operation.v2_fallback, Some(V2FallbackReason::RolloutCallMissing));
+    assert!(!awaiting(&m, "无正文"));
+}
+
+fn 上一轮父侧快照(m: &mut Machine, id: &str) -> Vec<Action> {
+    notify(m, "item/completed", json!({"threadId":P,"turnId":T,"item":{
+        "type":"collabAgentToolCall","tool":"wait","status":"completed",
+        "id":format!("等待-{id}"),"agentsStates":{"乙":{"status":"completed"}}
+    }}))
+}
+
+fn 兄弟唤醒两轮(快照位置: usize) {
+    let mut all = vec![];
+    let (mut m, mut mock) = setup_with_actions(&mut all);
+    for (child, id, turn) in [("甲", "派甲", "甲轮"), ("乙", "派乙", "首轮")] {
+        mock.register(child, Some(P), "v2", false, true);
+        let (started, done) = SubagentMock::v2_activity("started", P, T, id, child);
+        all.extend(apply(&mut m, started));
+        all.extend(apply(&mut m, done));
+        all.extend(apply(&mut m, mock.turn_started(child, turn)));
+        all.extend(notify(&mut m, "thread/goal/cleared", json!({"threadId":child})));
+        assert_eq!(m.binding(child, turn).unwrap().status, BindingStatus::Bound);
+    }
+    for role in ["developer", "user"] {
+        all.extend(notify(&mut m, "rawResponseItem/completed", json!({
+            "threadId":"乙","turnId":"首轮","item":{"type":"message","role":role}
+        })));
+    }
+    all.extend(complete(&mut m, &mut mock, "乙", "首轮", "completed"));
+    for (turn, id) in [("第二轮", "跟进一"), ("第三轮", "跟进二")] {
+        all.extend(notify(&mut m, "rawResponseItem/completed",
+            json!({"threadId":"甲","turnId":"甲轮","item":{
+                "type":"function_call","name":"followup_task","call_id":id,
+                "arguments":json!({"target":"乙","message":id}).to_string()
+            }})));
+        let key = EvidenceKey { parent_thread_id: "甲".into(), parent_turn_id: "甲轮".into(), item_id: id.into() };
+        let start = &m.relations.aux.followup_starts[&key];
+        assert_eq!(start.source, EvidenceSource::Raw);
+        assert!(start.trigger);
+        assert_eq!(start.target.as_deref(), Some("乙"));
+        let (started, done) = SubagentMock::v2_activity("interacted", "甲", "甲轮", id, "乙");
+        all.extend(apply(&mut m, started));
+        all.extend(apply(&mut m, done));
+        assert!(op(&m, id).rejected_receivers.contains_key("乙"));
+        if 快照位置 == 0 { all.extend(上一轮父侧快照(&mut m, id)); }
+        all.extend(apply(&mut m, mock.turn_started("乙", turn)));
+        if 快照位置 == 1 { all.extend(上一轮父侧快照(&mut m, id)); }
+        let text = format!("Message Type: NEW_TASK\nTask name: /root/乙\nSender: /root/甲\nPayload:\n{id}");
+        all.extend(notify(&mut m, "rawResponseItem/completed",
+            json!({"threadId":"乙","turnId":turn,"item":{"type":"agent_message","id":id,
+                "author":"/root/甲","recipient":"/root/乙","content":[{"type":"input_text","text":text}]}})));
+        let fact = m.relations.aux.v2_deliveries.iter().find(|d| d.id == id).unwrap();
+        assert!(fact.trigger);
+        assert_eq!((&*fact.thread, &*fact.author, &*fact.turn), ("乙", "/root/甲", turn));
+        all.extend(notify(&mut m, "item/completed", json!({"threadId":"乙","turnId":turn,
+            "item":{"type":"agentMessage","id":id,"text":format!("答复-{id}")}})));
+        all.extend(complete(&mut m, &mut mock, "乙", turn, "completed"));
+        if 快照位置 == 2 { all.extend(上一轮父侧快照(&mut m, id)); }
+        assert!(m.binding("乙", turn).is_none());
+        assert_eq!(m.event_log_pending_stats("乙", turn).0, 3);
+        暂存到期(&mut m, &mut all);
+        assert_eq!(m.event_log_pending_stats("乙", turn), (0, 0, 0));
+    }
+    all.extend(complete(&mut m, &mut mock, "甲", "甲轮", "completed"));
+    all.extend(finish(&mut m, &mut mock));
+    let rows: Vec<_> = all.iter().filter_map(|a| match a {
+        Action::Store(crate::store::StoreOp::AppendLog { lines, .. }) => Some(lines),
+        _ => None,
+    }).flatten().map(|line| {
+        let fields: Vec<_> = line.splitn(4, ' ').collect();
+        let payload: serde_json::Value = serde_json::from_str(fields[3].strip_prefix("\t@cxb2 ").unwrap()).unwrap();
+        (fields[2], payload)
+    }).collect();
+    assert!(rows.iter().any(|(k, _)| *k == "运行开始"));
+    assert!(rows.iter().any(|(k, _)| *k == "运行结束"));
+    assert_eq!(rows.iter().filter(|(k, _)| *k == "记录缺口").count(), 0);
+    for (turn, answer) in [("第二轮", "答复-跟进一"), ("第三轮", "答复-跟进二")] {
+        assert!(m.binding("乙", turn).is_none());
+        let saved: Vec<_> = rows.iter().filter(|(_, p)| p["threadId"] == "乙" && p["turnId"] == turn).collect();
+        assert!(saved.iter().all(|(_, p)| p["attribution"] == "unconfirmed" && p.get("coverageIssue").is_none()));
+        assert_eq!(saved.iter().map(|(k,p)| (*k,p["summary"].as_str().unwrap())).collect::<Vec<_>>(),
+            [("轮次开始", turn), ("条目完成", answer), ("轮次完成", "completed")]);
+    }
+}
+
+#[test]
+fn gap_wu_兄弟双唤醒上一轮快照在开始前到达() { 兄弟唤醒两轮(0); }
+#[test]
+fn gap_wu_兄弟双唤醒上一轮快照在开始后到达() { 兄弟唤醒两轮(1); }
+#[test]
+fn gap_wu_兄弟双唤醒上一轮快照在完成后到达() { 兄弟唤醒两轮(2); }
+
+#[test]
+fn gap_wu_首次线程开始不退休在途读取且正常严格配对() {
+    let (mut m, mock) = base();
+    files(&m);
+    call_line(&m, "跟进", "followup_task", C, "任务");
+    message_line(&m, C, "消费", "NEW_TASK", "任务");
+    fx::with(|f| f.hold = true);
+    interacted_to(&mut m, "跟进", C);
+    let id = fx::with(|f| f.held.iter().find(|r| r.thread == C).unwrap().id);
+    apply(&mut m, mock.thread_started(C));
+    assert_eq!(m.relations.aux.rollout.files[C].reading, Some(id));
+    fx::release_held(&mut m);
+    let operation = op(&m, "跟进");
+    assert_eq!(operation.v2_source, V2EvidenceSource::RolloutFile);
+    assert_eq!(operation.proven_turns[C], ["旧轮".to_owned()].into());
+}
+
+#[test]
+fn gap_wu_连接换代后旧首读不能登记消费() {
+    let (mut m, _) = base();
+    files(&m);
+    message_line(&m, C, "旧连接消费", "NEW_TASK", "任务");
+    fx::with(|f| f.hold = true);
+    interacted_to(&mut m, "跟进", C);
+    let request = fx::with(|f| f.held.iter().find(|r| r.thread == C).unwrap().clone());
+    let chunk = crate::rollout::read_chunk(&request.path, None).unwrap();
+    assert!(chunk.entries.iter().any(|e| matches!(&e.record,
+        crate::rollout::RolloutRecord::Message { item, .. } if item["id"] == "旧连接消费")));
+    m.relations.conn_epoch += 1;
+    m.rollout_read_done(request.id, C, request.conn_epoch, Ok(chunk), &mut vec![]);
+    assert!(!m.relations.aux.rollout.rollout_reads.contains_key(&request.id));
+    assert!(m.relations.aux.v2_deliveries.iter().all(|d| d.id != "旧连接消费"));
+    assert!(m.relations.aux.rollout.files[C].reading.is_none());
+}
+
+#[test]
+fn gap_wu_续读登记消失被替换或改走实时后不接纳旧文件消息() {
+    for change in ["登记消失", "读取替换", "改走实时"] {
+        let (mut m, _) = base();
+        files(&m);
+        call_line(&m, "跟进", "followup_task", C, "任务");
+        interacted_to(&mut m, "跟进", C);
+        assert!(op(&m, "跟进").v2_strict);
+        message_line(&m, C, "旧文件消息", "NEW_TASK", "任务");
+        fx::with(|f| f.hold = true);
+        fx::poll(&mut m);
+        let request = fx::with(|f| f.held.iter().find(|r| r.thread == C).unwrap().clone());
+        assert!(request.cursor.is_some());
+        match change {
+            "登记消失" => { m.relations.aux.rollout.files.remove(C); }
+            "读取替换" => m.relations.aux.rollout.files.get_mut(C).unwrap().reading = Some(u64::MAX),
+            _ => {
+                notify(&mut m, "rawResponseItem/completed", json!({
+                    "threadId":C,"turnId":"旧轮","item":{"type":"reasoning"}
+                }));
+            }
+        }
+        let chunk = crate::rollout::read_chunk(&request.path, request.cursor.as_ref()).unwrap();
+        assert!(chunk.entries.iter().any(|e| matches!(&e.record,
+            crate::rollout::RolloutRecord::Message { item, .. } if item["id"] == "旧文件消息")));
+        m.rollout_read_done(request.id, C, request.conn_epoch, Ok(chunk), &mut vec![]);
+        assert!(m.relations.aux.v2_deliveries.iter().all(|d| d.id != "旧文件消息"));
+        assert!(m.relations.aux.rollout.files.get(C).is_none_or(|f|
+            f.cursor.is_none() || f.cursor == request.cursor));
+    }
+}
+
+#[test]
+fn gap_wu_子文件冷却与能力未知均先判父调用类型() {
+    use crate::relations::rollout_pairing::{RolloutFile, RolloutPathState};
+    for (cached, unknown) in [(false, false), (true, false), (true, true)] {
+        for (tool, queue_only) in [("send_message", true), ("followup_task", false)] {
+            let (mut m, _) = base();
+            files(&m);
+            call_line(&m, "预读", "send_message", C, "");
+            call_line(&m, "目标", tool, C, "任务");
+            if cached { interacted_to(&mut m, "预读", C); }
+            assert_eq!(m.relations.aux.rollout.calls.contains_key(&(P.into(), "目标".into())), cached);
+            let reads = m.relations.aux.rollout.reads_issued;
+            let epoch = m.relations.conn_epoch;
+            m.relations.aux.rollout.files.insert(C.into(), RolloutFile {
+                epoch, path: RolloutPathState::Failed(V2FallbackReason::RolloutUnreadable),
+                cursor: None, reading: None, reads: 0, next_at: m.clock.mono_ms + 30_000,
+            });
+            if unknown { m.relations.aux.v2_raw_overflow = Some(epoch); }
+            interacted_to(&mut m, "目标", C);
+            assert_eq!(m.relations.aux.rollout.reads_issued, reads + u64::from(!cached));
+            let operation = op(&m, "目标");
+            assert_eq!(operation.v2_queue_only, queue_only);
+            if queue_only {
+                assert!(operation.receivers.is_empty() && operation.proven_turns.is_empty());
+                assert!(operation.v2_strict);
+            } else {
+                assert!(!operation.v2_strict);
+                assert_eq!(operation.v2_fallback, Some(if unknown { V2FallbackReason::RawUnknown }
+                    else { V2FallbackReason::RolloutUnreadable }));
+            }
+        }
+    }
+}
+
+#[test]
+fn gap_wu_截止时同一文件回包确认两轮后才清扫() {
+    let (mut m, mut mock) = base();
+    files(&m);
+    complete(&mut m, &mut mock, C, "旧轮", "completed");
+    for id in ["跟进甲", "跟进乙"] {
+        call_line(&m, id, "followup_task", C, id);
+    }
+    for id in ["跟进甲", "跟进乙"] {
+        interacted_to(&mut m, id, C);
+        assert_eq!(op(&m, id).v2_source, V2EvidenceSource::RolloutFile);
+    }
+    let start = m.clock.mono_ms;
+    for turn in ["甲轮", "乙轮"] {
+        apply(&mut m, mock.turn_started(C, turn));
+        notify(&mut m, "item/completed", json!({"threadId":C,"turnId":turn,"item":{
+            "id":turn,"type":"agentMessage","text":format!("答复-{turn}")
+        }}));
+        complete(&mut m, &mut mock, C, turn, "completed");
+        assert!(m.binding(C, turn).is_none());
+        assert_eq!(m.event_log_pending_stats(C, turn).0, 3);
+    }
+    // 读取本身仍健康，在摘要的独立期限前一毫秒派发。
+    m.clock.mono_ms = start + 119_999 - ROLLOUT_POLL_MS;
+    m.clock.now_ms += 119_999 - ROLLOUT_POLL_MS;
+    fx::with(|f| f.hold = true);
+    fx::poll(&mut m);
+    assert_eq!(m.clock.mono_ms, start + 119_999);
+    assert_eq!(fx::with(|f| f.held.iter().filter(|r| r.thread == C).count()), 1);
+    for (turn, id) in [("甲轮","跟进甲"), ("乙轮","跟进乙")] {
+        turn_marker(C, turn, m.clock.now_ms);
+        message_line(&m, C, id, "NEW_TASK", id);
+    }
+    m.clock.mono_ms += 1;
+    let actions = fx::release_held(&mut m);
+    for (turn, id) in [("甲轮","跟进甲"), ("乙轮","跟进乙")] {
+        assert_eq!(op(&m,id).proven_turns[C], [turn.to_owned()].into());
+        assert_eq!(m.binding(C, turn).unwrap().status, BindingStatus::Bound);
+        let mut saved = vec![];
+        for action in &actions {
+            if let Action::Store(crate::store::StoreOp::AppendLog { lines, .. }) = action {
+                for line in lines {
+                    let fields: Vec<_> = line.splitn(4, ' ').collect();
+                    let row: serde_json::Value = serde_json::from_str(fields[3].strip_prefix("\t@cxb2 ").unwrap()).unwrap();
+                    if row["threadId"] == C && row["turnId"] == turn && row["late"] == true {
+                        assert!(row.get("attribution").is_none());
+                        saved.push(row["summary"].as_str().unwrap().to_owned());
+                    }
                 }
             }
-            all.extend(fx::release_held(&mut m));
         }
-        if let Some((token, kind)) = all.iter().rev().find_map(|a| match a {
-            Action::Schedule {
-                token,
-                kind: kind @ TimerKind::Run(crate::runs::RunTimer::EventLogSweep { .. }),
-                ..
-            } => Some((token.clone(), kind.clone())),
-            _ => None,
-        }) {
-            m.clock.mono_ms += 31_000;
-            m.clock.now_ms += 31_000;
-            all.extend(apply(&mut m, Event::Timer { token, kind }));
-        }
-        assert!(!m
-            .relations
-            .aux
-            .rollout
-            .coverage_reads
-            .contains_key(&request.id));
-        assert_eq!(m.event_log_pending_stats(C, GAP_B_FILE_TURN), (0, 0, 0));
-        let gap = all.iter().any(|a| matches!(a, Action::Store(crate::store::StoreOp::AppendLog { lines, .. }) if lines.iter().any(|l| l.contains("beforeBindingUnknown") && l.contains(GAP_B_FILE_TURN))));
-        assert_eq!(
-            gap,
-            long || tail == "跨窗消费",
-            "{tail}：原票据回包后按文件实际内容裁决"
-        );
-        if !long && tail != "跨窗消费" {
-            assert!(!all.iter().any(|a| matches!(a, Action::Store(crate::store::StoreOp::AppendLog { lines, .. }) if lines.iter().any(|l| l.contains("beforeBindingUnknown")))), "{tail}：正常交接没有其他轮的缺口");
+        assert_eq!(saved, [turn.to_owned(), format!("答复-{turn}"), "completed".into()]);
+        assert_eq!(m.event_log_pending_stats(C, turn), (0,0,0));
+    }
+}
+
+#[test]
+fn gap_wu_父缓存命中不提前结束失败冷却() {
+    use crate::relations::rollout_pairing::{RolloutPathState, ROLLOUT_RETRY_MS};
+    let (mut m, _) = base();
+    files(&m);
+    call_line(&m, "预读", "send_message", C, "");
+    call_line(&m, "缓存留言", "send_message", C, "");
+    interacted_to(&mut m, "预读", C);
+    fx::with(|f| { f.replies.insert(P.into(), Err(json!({"message":"暂不可读"}))); });
+    let deadline = m.clock.mono_ms + ROLLOUT_RETRY_MS;
+    let file = m.relations.aux.rollout.files.get_mut(P).unwrap();
+    file.path = RolloutPathState::Failed(V2FallbackReason::RolloutUnreadable);
+    file.next_at = deadline;
+    let paths = fx::with(|f| f.path_reads);
+    interacted_to(&mut m, "缓存留言", C);
+    assert!(op(&m, "缓存留言").v2_queue_only);
+    assert_eq!(m.relations.aux.rollout.files[P].next_at, deadline);
+    m.clock.mono_ms = deadline - 1;
+    interacted_to(&mut m, "未命中", C);
+    assert_eq!(op(&m, "未命中").v2_fallback, Some(V2FallbackReason::RolloutUnreadable));
+    assert_eq!(fx::with(|f| f.path_reads), paths);
+    m.clock.mono_ms = deadline;
+    interacted_to(&mut m, "冷却结束", C);
+    assert!(fx::with(|f| f.path_reads) > paths);
+}
+
+#[test]
+fn gap_wu_开始记录满时文件留言零绑定而跟进按证据回退() {
+    let (mut m, _) = base();
+    files(&m);
+    call_line(&m, "种子", "followup_task", C, "已有任务");
+    interacted_to(&mut m, "种子", C);
+    let seed = op(&m, "种子").key.clone();
+    let start = m.relations.aux.followup_starts[&seed].clone();
+    for n in 1..MAX_OPERATIONS {
+        let mut key = seed.clone();
+        key.item_id = format!("占位{n}");
+        let mut filler = start.clone();
+        filler.message = None;
+        m.relations.aux.followup_starts.insert(key, filler);
+    }
+    assert_eq!(m.relations.aux.followup_starts.len(), MAX_OPERATIONS);
+    assert!(m.v2_index_consistent());
+    assert!(m.relations.operations.len() < MAX_OPERATIONS);
+    // 预读缓存也已满，当前等待的调用仍须直接交给它的操作。
+    let cached = m.relations.aux.rollout.calls[&(P.into(), "种子".into())].clone();
+    for n in 1..MAX_OPERATIONS {
+        m.relations.aux.rollout.calls.insert((P.into(), format!("缓存{n}")), cached.clone());
+    }
+    assert_eq!(m.relations.aux.rollout.calls.len(), MAX_OPERATIONS);
+    for (id, tool) in [("留言","send_message"), ("跟进","followup_task")] {
+        call_line(&m, id, tool, C, id);
+        interacted_to(&mut m, id, C);
+        let operation = op(&m, id);
+        assert!(!m.relations.aux.followup_starts.contains_key(&operation.key));
+        if id == "留言" {
+            assert!(operation.v2_queue_only && operation.v2_strict);
+            assert_eq!(operation.v2_source, V2EvidenceSource::RolloutFile);
+            assert!(operation.receivers.is_empty() && operation.proven_turns.is_empty());
+        } else {
+            assert!(!operation.v2_queue_only && !operation.v2_strict);
+            assert_eq!(operation.v2_fallback, Some(V2FallbackReason::StartMissing));
         }
     }
 }
 
 #[test]
-fn gap_fix3_代理状态终态和卸载均使旧轮输入按断档() {
-    const ACTIVE: &str = "01900000-0001-7000-8000-000000000001";
-    for status in ["completed", "notLoaded"] {
-        let (mut m, mut mock) = setup();
-        spawn(&mut m, &mut mock, P, T, C, "派生", ACTIVE);
-        assert_eq!(m.unique_active_bound_turn(C).as_deref(), Some(ACTIVE));
-        assert!(m.coverage_observation_gen(C).is_some());
-        m.convergence_agent_states(
-            P,
-            T,
-            &json!({"agentsStates":{C:{"status":status}}}),
-            &mut vec![],
-        );
-        if status == "completed" {
-            assert!(m.relations.aux.observed[C]
-                .iter()
-                .any(|o| o.turn == ACTIVE && o.completed));
+fn gap_wu_发起路径未知时先按子证据决定是否等待() {
+    use crate::relations::rollout_pairing::RolloutPathState;
+    for mode in ["可读", "冷却", "未知"] {
+        let (mut m, _) = resumed_tree(false);
+        call_in(&m, C, "等路径", "followup_task", G, "孙任务");
+        let (a, b) = SubagentMock::v2_activity("interacted", C, "新轮", "等路径", G);
+        apply(&mut m, a);
+        apply(&mut m, b);
+        assert!(awaiting(&m, "等路径"));
+        assert!(m.relations.aux.rollout.calls.contains_key(&(C.into(),"等路径".into())));
+        assert!(!m.relations.aux.v2_agent_paths.contains_key(C));
+        let now = m.clock.mono_ms;
+        if mode == "冷却" {
+            let file = m.relations.aux.rollout.files.get_mut(G).unwrap();
+            file.path = RolloutPathState::Failed(V2FallbackReason::RolloutUnreadable);
+            file.next_at = now + 30_000;
+        } else if mode == "未知" {
+            m.relations.aux.v2_raw_overflow = Some(m.relations.conn_epoch);
         }
-        notify(
-            &mut m,
-            "rawResponseItem/completed",
-            json!({"threadId":C,"turnId":ACTIVE,"item":{"type":"message","role":"user"}}),
-        );
-        assert!(
-            m.coverage_observation_gen(C).is_none(),
-            "{status} 后输入已在轮外"
-        );
+        m.drive_rollout(&mut vec![]);
+        if mode == "可读" {
+            assert!(awaiting(&m, "等路径"));
+            m.clock.mono_ms += ROLLOUT_WAIT_MS;
+            m.drive_rollout(&mut vec![]);
+        }
+        assert!(!awaiting(&m, "等路径"));
+        assert_eq!(op(&m, "等路径").v2_fallback, Some(match mode {
+            "冷却" => V2FallbackReason::RolloutUnreadable,
+            "未知" => V2FallbackReason::RawUnknown,
+            _ => V2FallbackReason::RolloutSenderUnknown,
+        }));
     }
 }
 
 #[test]
-fn gap_fix3_代理已确认关闭而当前轮未绑定也失效() {
-    const ORIGINAL: &str = "01900000-0001-7000-8000-000000000001";
-    const ACTIVE: &str = "01900000-0002-7000-8000-000000000001";
-    let (mut m, mut mock) = setup();
-    spawn(&mut m, &mut mock, P, T, C, "派生", ORIGINAL);
-    complete(&mut m, &mut mock, C, ORIGINAL, "completed");
-    apply(&mut m, mock.turn_started(C, ACTIVE));
-    assert!(m.binding(C, ACTIVE).is_none() && m.unique_active_bound_turn(C).is_none());
-    assert!(m.coverage_observation_gen(C).is_some());
-    assert_eq!(m.relations.aux.observed[C].back().unwrap().turn, ACTIVE);
-    assert!(m.relations.aux.input_turns.contains_key(C));
-    m.convergence_agent_states(
-        P,
-        T,
-        &json!({"tool":"closeAgent","status":"completed","agentsStates":{C:{"status":"shutdown"}}}),
-        &mut vec![],
-    );
-    assert!(
-        !m.relations.aux.input_turns.contains_key(C),
-        "关闭已核实，应清除该线程的定位"
-    );
-    notify(
-        &mut m,
-        "rawResponseItem/completed",
-        json!({"threadId":C,"turnId":ACTIVE,"item":{"type":"message","role":"user"}}),
-    );
-    assert!(
-        m.coverage_observation_gen(C).is_none(),
-        "确认关闭后的输入不能归入已关闭线程的旧轮"
-    );
+fn gap_wu_停止再跟随隔离旧读取的成功和失败() {
+    use crate::relations::rollout_pairing::{ReadTicketState, RolloutPathState};
+    for restart in [false,true] {
+        for fail in [false,true] {
+            let (mut m, _) = base();
+            files(&m);
+            call_line(&m, "旧跟进", "followup_task", C, "旧任务");
+            interacted_to(&mut m, "旧跟进", C);
+            fx::with(|f| f.hold = true);
+            fx::poll(&mut m);
+            let old = fx::with(|f| f.held.iter().find(|r| r.thread == C).unwrap().clone());
+            assert!(old.cursor.is_some());
+            let key = op(&m,"旧跟进").key.clone();
+            m.relations.operations.get_mut(&key).unwrap().outcome = EvidenceOutcome::Failed;
+            m.drive_rollout(&mut vec![]);
+            assert_eq!(m.relations.aux.rollout.rollout_reads[&old.id].state, ReadTicketState::Retired);
+            if restart {
+                call_line(&m, "新跟进", "followup_task", C, "新任务");
+                interacted_to(&mut m, "新跟进", C);
+                let new = fx::with(|f| f.held.iter().find(|r| r.thread == C && r.id != old.id).unwrap().clone());
+                assert!(new.cursor.is_none());
+            }
+            let before = m.relations.aux.rollout.files[C].clone();
+            message_line(&m,C,"旧回包消费","NEW_TASK","旧任务");
+            let result = if fail { Err(crate::rollout::RolloutError::Unreadable) }
+                else { crate::rollout::read_chunk(&old.path,old.cursor.as_ref()) };
+            m.rollout_read_done(old.id,C,old.conn_epoch,result,&mut vec![]);
+            assert_eq!(m.relations.aux.rollout.files[C], before);
+            assert!(matches!(before.path, RolloutPathState::Ready(_)));
+            assert!(!m.relations.aux.rollout.rollout_reads.contains_key(&old.id));
+            assert!(m.relations.aux.v2_deliveries.iter().all(|d| d.id != "旧回包消费"));
+        }
+    }
+}
+
+#[test]
+fn gap_wu_缓存确认的文件留言在父线程转实时后仍只入队() {
+    let (mut m, _) = base();
+    files(&m);
+    call_line(&m,"预读","send_message",C,"");
+    call_line(&m,"已知留言","send_message",C,"");
+    interacted_to(&mut m,"预读",C);
+    notify(&mut m, "rawResponseItem/completed", json!({"threadId":P,"turnId":T,"item":{"type":"reasoning"}}));
+    let reads = m.relations.aux.rollout.reads_issued;
+    interacted_to(&mut m,"已知留言",C);
+    let known = op(&m,"已知留言");
+    assert!(known.v2_queue_only && known.receivers.is_empty());
+    assert_eq!(known.v2_source,V2EvidenceSource::RolloutFile);
+    interacted_to(&mut m,"无缓存",C);
+    assert_eq!(op(&m,"无缓存").v2_fallback, Some(V2FallbackReason::StartMissing));
+    assert_eq!(m.relations.aux.rollout.reads_issued, reads);
+}
+
+
+#[test]
+fn gap_wu_操作刚失去需求时错误回包不能留下冷却() {
+    use crate::relations::rollout_pairing::RolloutPathState;
+    for live in [false, true] {
+        let (mut m, _) = base();
+        files(&m);
+        call_line(&m,"跟进","followup_task",C,"任务");
+        interacted_to(&mut m,"跟进",C);
+        fx::with(|f| f.hold = true);
+        fx::poll(&mut m);
+        let id = m.relations.aux.rollout.files[C].reading.unwrap();
+        if !live {
+            let key = op(&m,"跟进").key.clone();
+            m.relations.operations.get_mut(&key).unwrap().outcome = EvidenceOutcome::Failed;
+        }
+        let epoch = m.relations.conn_epoch;
+        m.rollout_read_done(id,C,epoch,Err(crate::rollout::RolloutError::Unreadable),&mut vec![]);
+        let file = &m.relations.aux.rollout.files[C];
+        assert!(file.reading.is_none());
+        assert_eq!(matches!(file.path, RolloutPathState::Failed(V2FallbackReason::RolloutUnreadable)), live);
+        if !live {
+            assert!(matches!(file.path, RolloutPathState::Ready(_)));
+            assert!(file.cursor.is_none());
+            assert_eq!(file.reads, 0);
+        }
+    }
+}
+
+#[test]
+fn gap_wu_重新跟随时不沿用旧路径请求的成功或失败() {
+    use crate::relations::rollout_pairing::RolloutPathState;
+    for (success, early) in [(false,false), (true,false), (false,true), (true,true)] {
+        let (mut m, _) = base();
+        files(&m);
+        let request = |m: &mut Machine, id: &str| {
+            let (start, _) = SubagentMock::v2_activity("interacted", P, T, id, C);
+            let (next, actions) = step(std::mem::take(m), start);
+            *m = next;
+            actions.into_iter().find_map(|a| match a {
+                Action::Request(ctx) => match ctx.operation {
+                    crate::claim::Operation::RolloutPath { thread, generation } if thread == C => Some(generation),
+                    _ => None,
+                },
+                _ => None,
+            }).expect("新的一段跟随须有独立路径请求")
+        };
+        let old = request(&mut m, "旧跟进");
+        let key = op(&m,"旧跟进").key.clone();
+        m.relations.operations.get_mut(&key).unwrap().outcome = EvidenceOutcome::Failed;
+        let good = Ok(json!({"thread":{"id":C,"path":fx::path(C)}}));
+        let old_result = if success { good.clone() } else { Err(json!({"message":"旧读取失败"})) };
+        if early {
+            m.rollout_path_reply(C,old,&old_result);
+            assert!(!m.relations.aux.rollout.files.contains_key(C));
+        }
+        m.drive_rollout(&mut vec![]);
+        let new = request(&mut m, "新跟进");
+        assert_ne!(old, new);
+        m.rollout_path_reply(C,old,&old_result);
+        assert_eq!(m.relations.aux.rollout.files[C].path, RolloutPathState::Requested(new));
+        m.rollout_path_reply(C,new,&good);
+        assert!(matches!(m.relations.aux.rollout.files[C].path, RolloutPathState::Ready(_)));
+    }
+}
+
+#[test]
+fn gap_wu_实时开始表满仍区分留言与跟进() {
+    for receipts_full in [false, true] {
+        let (mut m, _) = base();
+        raw(&mut m, "已知跟进", "调用正文");
+        let (key, start) = m.relations.aux.followup_starts.iter()
+            .find(|(key,_)| key.item_id == "已知跟进").map(|(k,s)| (k.clone(),s.clone())).unwrap();
+        for i in 1..MAX_OPERATIONS {
+            let mut filler = start.clone();
+            filler.message = None;
+            let mut id = key.clone();
+            id.item_id = format!("占位{i}");
+            m.relations.aux.followup_starts.insert(id, filler);
+        }
+        let epoch = m.relations.conn_epoch;
+        if receipts_full {
+            for i in 0..MAX_OPERATIONS {
+                let mut id = key.clone();
+                id.item_id = format!("已缓存留言{i}");
+                m.relations.aux.raw_queue_receipts.insert(id, (epoch, m.clock.mono_ms + 30_000));
+            }
+        }
+        assert_eq!(m.relations.aux.followup_starts.len(), MAX_OPERATIONS);
+        notify(&mut m, "rawResponseItem/completed",json!({"threadId":P,"turnId":T,
+            "item":{"type":"function_call","name":"send_message","call_id":"即时留言"}}));
+        interacted_to(&mut m,"即时留言",C);
+        let message = op(&m,"即时留言");
+        assert!(message.proven_turns.is_empty());
+        if receipts_full {
+            assert_eq!(message.outcome, EvidenceOutcome::Unproven);
+        } else {
+            assert!(message.v2_queue_only && message.receivers.is_empty());
+            assert_eq!(message.v2_source,V2EvidenceSource::Raw);
+        }
+        interacted_to(&mut m,"已知跟进",C);
+        let known = op(&m,"已知跟进");
+        assert!(known.v2_strict && !known.v2_queue_only);
+        assert_eq!(known.v2_source,V2EvidenceSource::Raw);
+        m.clock.mono_ms += 30_000;
+        interacted_to(&mut m,"窗口后",C);
+        let later = op(&m,"窗口后");
+        assert_eq!(later.v2_fallback, Some(V2FallbackReason::StartMissing));
+        assert_ne!(later.outcome, EvidenceOutcome::Unproven);
+    }
 }

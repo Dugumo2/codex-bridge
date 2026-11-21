@@ -37,7 +37,8 @@ export function treeTimeline(rootThreadId: string, lines: LogLine[], records: Ru
       parentThreadId: source?.parentThreadId ?? null, shortId: source?.shortId ?? null,
       sourceRole: source?.sourceRole ?? (line.runId === null ? "log" : "legacy"),
       turnId: source?.turnId ?? null, itemId: source?.itemId ?? null,
-      kind: clean(line.event), text: clean(line.text), summary: clean(line.content), truncated: source?.truncated ?? false,
+      kind: line.event, text: line.text, summary: line.content, truncated: source?.truncated ?? false,
+      ...(source?.attribution === "unconfirmed" ? { attribution: source.attribution } : {}),
       ...(source?.late !== undefined ? { late: source.late } : {}) });
   }
   for (const run of records) {
@@ -55,13 +56,16 @@ export function treeTimeline(rootThreadId: string, lines: LogLine[], records: Ru
   return { items, coverage: { scope: "retained", issues } };
 }
 
-export function treeLogLine(item: TreeLogEvent, labels: ReadonlyMap<string, string>): string {
+export function treeLogLine(item: TreeLogEvent, labels: ReadonlyMap<string, string>, count?: number): string {
   const label = (id: string, shortId?: string | null) => threadLabel(id, shortId ?? labels.get(id));
   const source = item.sourceRole === "run" ? `根 ${label(item.threadId!, item.shortId)}`
     : item.sourceRole === "execution" ? `执行 ${label(item.threadId!, item.shortId)}`
     : item.sourceRole === "subagent" ? `子 ${label(item.threadId!, item.shortId)}${item.parentThreadId ? ` ← ${label(item.parentThreadId)}` : ""}`
     : item.sourceRole === "log" ? "日志" : "旧执行源未记录";
-  return `${item.ts} [${clean(item.runId ?? "文件")}][${source}] ${item.text}\n`;
+  const text = count !== undefined
+    ? `轮 ${clean(item.turnId ?? "未知")} 观察到子代理活动，${count} 条摘要归属未确认，未计入本运行`
+    : item.attribution === "unconfirmed" ? `[归属未确认] ${item.text}` : item.text;
+  return `${item.ts} [${clean(item.runId ?? "文件")}][${clean(source)}] ${clean(text)}\n`;
 }
 
 /** 沿直接父链逐级上溯，遇缺链或环即止；返回已走过的祖先，近者在前。 */
@@ -111,11 +115,30 @@ export function showTreeLog(ctx: CommandContext, ref: ThreadRef): 0 {
   const timeline = treeTimeline(ref.threadId, snapshot.lines ?? [], records, snapshot.issues);
   const tail = !!ctx.parsed.options.tail;
   const items = tail ? timeline.items.slice(-Number(ctx.parsed.options.limit))
-    : timeline.items.filter((item) => ctx.parsed.options.full || !itemKinds.has(item.kind));
+    : timeline.items.filter((item) => item.attribution === "unconfirmed" || ctx.parsed.options.full || !itemKinds.has(item.kind));
   const labels = new Map(index.map((item) => [item.threadId, item.shortId]));
   // 历史事件身份优先；索引只给直接父线程提供展示标签，不影响事件归属。
   for (const item of timeline.items) if (item.threadId && item.shortId) labels.set(item.threadId, item.shortId);
-  for (const item of items) ctx.out.result(treeLogLine(item, labels));
+  const group = (item: TreeLogEvent) => JSON.stringify([item.runId, item.threadId, item.turnId]);
+  const counts = new Map<string, number>();
+  const fold = !tail && !ctx.parsed.options.full;
+  if (fold) {
+    for (const item of items) if (item.attribution === "unconfirmed") {
+      const key = group(item);
+      counts.set(key, (counts.get(key) ?? 0) + 1);
+    }
+  }
+  for (const item of items) {
+    if (fold && item.attribution === "unconfirmed") {
+      const key = group(item);
+      const count = counts.get(key);
+      if (count === undefined) continue;
+      counts.delete(key);
+      ctx.out.result(treeLogLine(item, labels, count));
+    } else {
+      ctx.out.result(treeLogLine(item, labels));
+    }
+  }
   if (timeline.coverage.issues.length) ctx.out.notice(`日志仅覆盖保留窗口：${[...new Set(timeline.coverage.issues.map((issue) => issue.code))].join("、")}`);
   ctx.out.resultJson({ ok: true, command: "show", ...ref, tree: true, mode: tail ? "tail" : "log", order: "timestamp",
     items, coverage: timeline.coverage,

@@ -421,7 +421,7 @@ fn 窗口里只有工具输出没有消息时也向前找到当前轮() {
     ));
 }
 
-/// 合法 JSON 仍可能无法解释；真实读取器必须把这一点带到覆盖判定入口。
+/// 合法 JSON 也可能缺少解析轮边界或消费记录所需的字段。
 /// 缺失轮边界身份时不能沿用原轮；消费字段损坏或记录类型不认识时计入坏行，
 /// 但轮的定位照旧（v0.4.0 的配对行为），上游新增记录类型不会让文件配对降级。
 #[test]
@@ -561,37 +561,6 @@ fn gap_fix_文件里的消息按角色区分输入与输出() {
     }
 }
 
-/// 读取时游标之后还有内容（没读到的完整行或末尾半行）要如实报告，调用方据此决定能不能把这次读取当成读完。
-#[test]
-fn gap_fix_读取结果报告游标之后还有没有内容() {
-    let path = temp_file("unread");
-    let mut text = task_started("2026-11-05T01:00:00.000Z", "轮");
-    text += &message("2026-11-05T01:00:01.000Z", "完整消费", "消息");
-    append(&path, &text);
-    let whole = read_chunk(&path_str(&path), None).unwrap();
-    assert_eq!(whole.cursor.offset, text.len() as u64);
-    assert!(!whole.unread, "首次读取读到文件末尾");
-    let pending = message("2026-11-05T01:00:02.000Z", "没写完的消费", "消息");
-    let (head, tail) = pending.split_at(pending.len() / 2);
-    append(&path, head);
-    let first = read_chunk(&path_str(&path), None).unwrap();
-    assert_eq!(first.cursor.offset, text.len() as u64, "前置：半行未被消费");
-    assert!(first.unread, "首次读取：末尾半行算还有内容");
-    assert!(!first.more, "半行不是「尽快再读」的理由");
-    let follow = read_chunk(&path_str(&path), Some(&whole.cursor)).unwrap();
-    assert!(follow.entries.is_empty(), "前置：半行不产生记录");
-    assert!(
-        follow.unread && !follow.more,
-        "跟随读取：末尾半行算还有内容"
-    );
-    append(&path, tail);
-    let done = read_chunk(&path_str(&path), Some(&follow.cursor)).unwrap();
-    assert_eq!(done.entries.len(), 1, "前置：补全后读到这条消费");
-    assert!(!done.unread, "读到文件末尾后不再有内容");
-    let idle = read_chunk(&path_str(&path), Some(&done.cursor)).unwrap();
-    assert!(!idle.unread && idle.bytes_read == 0, "没有新增内容");
-}
-
 #[test]
 fn gap_b_red_确认无关记录与尚未补齐的半行不制造坏行() {
     let path = temp_file("known-and-partial");
@@ -614,7 +583,7 @@ fn gap_b_red_确认无关记录与尚未补齐的半行不制造坏行() {
     assert_eq!(first.cursor.offset, text.len() as u64, "半行未被消费");
     append(&path, tail);
     let second = read_chunk(&path_str(&path), Some(&first.cursor)).unwrap();
-    assert_eq!(second.bad_lines, 1, "补全后未知记录才进入覆盖缺口");
+    assert_eq!(second.bad_lines, 1, "补全后未知记录才计为坏行");
 }
 
 #[test]
@@ -657,7 +626,7 @@ fn gap_fix3_首次读到超长整行计一次跳行() {
     append(&path, "\n");
     let chunk = read_chunk(&path_str(&path), None).unwrap();
     assert_eq!(chunk.cursor.offset, path.metadata().unwrap().len());
-    assert!(!chunk.unread && !chunk.cursor.skipping);
+    assert!(!chunk.cursor.skipping);
     assert_eq!(chunk.skipped_lines, 1, "首次窗口跳过了完整长行");
 }
 
@@ -667,7 +636,7 @@ fn gap_fix3_首次超长半行续读接回正常记录() {
     append(&path, &"x".repeat(MAX_TAIL_BYTES as usize + 16));
     let chunk = read_chunk(&path_str(&path), None).unwrap();
     assert_eq!(chunk.cursor.offset, path.metadata().unwrap().len());
-    assert!(!chunk.unread && chunk.skipped_lines == 0);
+    assert!(chunk.skipped_lines == 0);
     assert!(chunk.cursor.skipping, "半行尚未结束");
     let ts = "2026-11-05T01:00:00.000Z";
     append(
@@ -680,7 +649,7 @@ fn gap_fix3_首次超长半行续读接回正常记录() {
     );
     let next = read_chunk(&path_str(&path), Some(&chunk.cursor)).unwrap();
     assert_eq!((next.skipped_lines, next.bad_lines), (1, 0));
-    assert!(!next.cursor.skipping && !next.unread);
+    assert!(!next.cursor.skipping);
     assert!(
         matches!(&next.entries[..], [RolloutEntry { record: RolloutRecord::Message {turn: Some(t), ..}, turn_lost: false, .. }] if t == "轮")
     );
@@ -696,7 +665,7 @@ fn gap_fix3_跳过长行中间块仍报告未读() {
     assert!(
         next.cursor.skipping && next.more && next.cursor.offset < path.metadata().unwrap().len()
     );
-    assert!(next.unread);
+    assert!(next.more);
 }
 
 #[test]
@@ -797,4 +766,40 @@ fn gap_fix3_普通历史跨窗只补首行且不扩大解析窗口() {
     assert_eq!((chunk.bad_lines, chunk.skipped_lines), (0, 0));
     assert!(chunk.bytes_read <= TAIL_BYTES + 1 + 4096);
     assert_eq!(chunk.cursor.turn.as_deref(), Some("当前"));
+}
+
+#[test]
+fn gap_fix4_跨窗调用只核边界不要求配对字段() {
+    let path = temp_file("跨窗调用");
+    let first = json!({"type":"response_item","payload":{"type":"function_call","name":"send_message","扩展":"x".repeat(TAIL_BYTES as usize)}});
+    let text = format!(
+        "{first}\n{}",
+        task_started("2026-11-05T01:00:00.000Z", "轮")
+    );
+    let cut = text.len() - TAIL_BYTES as usize;
+    assert!(!text[..cut].contains('\n'));
+    append(&path, &text);
+    let chunk = read_chunk(&path_str(&path), None).unwrap();
+    assert_eq!((chunk.bad_lines, chunk.skipped_lines), (0, 0));
+    assert!(chunk.entries.is_empty() && chunk.cursor.turn.as_deref() == Some("轮"));
+}
+
+#[test]
+fn gap_wu_末尾半行保留轮定位补齐后只读取一次() {
+    let file = temp_file("wu-partial");
+    let ts = "2026-11-05T01:00:00.000Z";
+    let marker = task_started(ts, "保留轮");
+    let msg = message(ts, "消息", "完整正文");
+    append(&file, &marker);
+    append(&file, msg.trim_end_matches('\n'));
+    let path = path_str(&file);
+    let first = read_chunk(&path, None).unwrap();
+    assert!(first.entries.is_empty() && !first.more);
+    assert_eq!(first.cursor.offset, marker.len() as u64);
+    append(&file, "\n");
+    let next = read_chunk(&path, Some(&first.cursor)).unwrap();
+    assert_eq!(next.entries.len(), 1);
+    assert!(matches!(&next.entries[0].record, RolloutRecord::Message { turn:Some(t), item }
+        if t == "保留轮" && item["id"] == "消息"));
+    assert!(read_chunk(&path,Some(&next.cursor)).unwrap().entries.is_empty());
 }

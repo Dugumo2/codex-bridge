@@ -235,9 +235,24 @@ fn 翻页有上限() {
 
 #[test]
 fn 翻页途中候选变化时按候选变化处理() {
+    核对发现分页("idle");
+}
+
+#[test]
+fn gap_wu_发现确认卸载在分页返回前使读取失效() {
+    核对发现分页("notLoaded");
+}
+
+fn 核对发现分页(status: &str) {
+    use crate::relations::rollout_pairing::{ReadTicket, ReadTicketState};
     let (mut m, mut mock) = machine();
     add_child(&mut m, &mut mock);
     let (op, mut queue) = begin(&mut m);
+    let id = 1;
+    m.relations.aux.rollout.rollout_reads.insert(id, ReadTicket {
+        id, thread: C.into(), conn_epoch: m.relations.conn_epoch,
+        deadline: m.clock.mono_ms + 30_000, state: ReadTicketState::Active,
+    });
     let mut list = None;
     while let Some(action) = queue.pop_front() {
         let Action::Request(context) = action else {
@@ -260,7 +275,7 @@ fn 翻页途中候选变化时按候选变化处理() {
             "thread/read" => {
                 let thread = params(&context)["threadId"].as_str().unwrap().to_owned();
                 let mut info = mock.thread_info(&thread).unwrap();
-                info["status"] = json!({"type": "idle"});
+                info["status"] = json!({"type": status});
                 json!({"thread": info})
             }
             "thread/turns/list" => {
@@ -278,6 +293,8 @@ fn 翻页途中候选变化时按候选变化处理() {
         ));
     }
     let list = list.expect("应走到轮次分页");
+    assert_eq!(m.relations.aux.rollout.rollout_reads[&id].state,
+        if status == "notLoaded" { ReadTicketState::Retired } else { ReadTicketState::Active });
     m.candidate_changed(C);
     let next = mock.inject(
         &mut m,
@@ -307,3 +324,60 @@ fn 翻页途中候选变化时按候选变化处理() {
         "要记成候选变化"
     );
 }
+
+fn 核对元数据卸载(loaded_read: bool) {
+    use crate::relations::rollout_pairing::{ReadTicket, ReadTicketState};
+    for case in ["卸载", "仍在线", "身份不符", "活动已变", "版本已淘汰"] {
+        let (mut m, mut mock) = machine();
+        m.convergences.capabilities.remove(P);
+        if loaded_read {
+            mock.register(C, Some(P), "v1", false, true);
+            assert!(m.thread_relation(C).is_none());
+        } else {
+            add_child(&mut m, &mut mock);
+            assert!(m.thread_capability(P).is_none());
+        }
+        let target = if loaded_read { C } else { P };
+        let (op, mut queue) = begin(&mut m);
+        let ctx = loop {
+            let action = queue.pop_front().expect("发现应派出指定元数据读取");
+            let Action::Request(ctx) = action else { continue };
+            if !matches!(ctx.operation, crate::claim::Operation::Discovery { .. }) { continue; }
+            if ctx.method == "thread/read" && params(&ctx)["threadId"] == target { break ctx; }
+            let value = match ctx.method.as_str() {
+                "thread/list" if !loaded_read && params(&ctx)["archived"] == false =>
+                    json!({"data":[mock.thread_info(C).unwrap()],"nextCursor":null}),
+                "thread/loaded/list" if loaded_read => json!({"data":[C],"nextCursor":null}),
+                "thread/list" | "thread/loaded/list" | "thread/turns/list" => json!({"data":[],"nextCursor":null}),
+                "thread/goal/get" => json!({"goal":null}),
+                "thread/read" => json!({"thread":mock.thread_info(C).unwrap()}),
+                other => panic!("未预期请求 {other}"),
+            };
+            queue.extend(mock.inject(&mut m, Event::Reply { context: ctx, result: Ok(value) }));
+        };
+        let work = &m.relations.aux.work[&op];
+        assert_eq!(work.reads_in_flight.contains(target), loaded_read);
+        assert!(work.read_stamps.contains_key(target));
+        let epoch = m.relations.conn_epoch;
+        m.relations.aux.rollout.rollout_reads.insert(1, ReadTicket {
+            id:1, thread:target.into(), conn_epoch:epoch, deadline:m.clock.mono_ms + 30_000,
+            state:ReadTicketState::Active,
+        });
+        if case == "活动已变" { m.candidate_changed(target); }
+        if case == "版本已淘汰" { m.relations.aux.candidate_versions.remove(target); }
+        let info = json!({"id":if case == "身份不符" { "别的线程" } else { target },
+            "status":{"type":if case == "仍在线" { "idle" } else { "notLoaded" }}, "canAcceptDirectInput":true});
+        mock.inject(&mut m, Event::Reply { context:ctx, result:Ok(json!({"thread":info})) });
+        assert_eq!(m.relations.aux.rollout.rollout_reads[&1].state,
+            if case == "卸载" { ReadTicketState::Retired } else { ReadTicketState::Active }, "{case}");
+        if !loaded_read && case == "活动已变" {
+            assert_eq!(m.thread_capability(P), Some(true), "活动变化只影响卸载取样的时效");
+        }
+    }
+}
+
+#[test]
+fn gap_wu_根能力回查只凭当前同线程卸载退休读取() { 核对元数据卸载(false); }
+
+#[test]
+fn gap_wu_已加载列表定向回查只凭当前同线程卸载退休读取() { 核对元数据卸载(true); }

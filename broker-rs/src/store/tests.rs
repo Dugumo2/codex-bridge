@@ -468,6 +468,37 @@ fn 日志部分追加重试不重复_超过十_mib_轮转一份() {
     assert!(!temp.dir().join("runs/log.log.2").exists());
 }
 
+#[tokio::test]
+async fn gap_wu_摘要部分写失败重试一次取回且最终放弃有文件登记() {
+    let temp = Temp::new();
+    let line = "2026-11-20T00:00:00.000Z run-a 条目完成 \t@cxb2 {\"attribution\":\"unconfirmed\",\"summary\":\"原摘要\"}\n";
+    {
+        let mut disk = temp.disk();
+        disk.fail_after_log_bytes = Some(5);
+        assert!(disk.append_log("runs/retry.log", line.as_bytes()).is_err());
+        disk.append_log("runs/retry.log", line.as_bytes()).unwrap();
+        assert_eq!(fs::read_to_string(temp.dir().join("runs/retry.log")).unwrap(), line);
+    }
+    let (store, _) = open(temp.config()).await.unwrap();
+    let recovered = temp.dir().join("runs/recovered.log");
+    fs::create_dir(&recovered).unwrap();
+    store.submit(StoreOp::AppendLog {
+        short_id: "recovered".into(),
+        lines: vec![line.trim_end().into()],
+    });
+    wait_for(|| store.status() == StorageStatus::Degraded).await;
+    fs::remove_dir(&recovered).unwrap();
+    wait_for(|| recovered.is_file() && store.status() == StorageStatus::Ok).await;
+    assert_eq!(fs::read_to_string(&recovered).unwrap(), line);
+    fs::create_dir(temp.dir().join("runs/failed.log")).unwrap();
+    store.submit(StoreOp::AppendLog {
+        short_id: "failed".into(),
+        lines: vec![line.trim_end().into()],
+    });
+    wait_for(|| store.status() == StorageStatus::Degraded).await;
+    assert_eq!(store.drain(Duration::from_secs(2)).await.abandoned, ["runs/failed.log"]);
+}
+
 #[test]
 fn n7_轮转前后逐行保留时间戳运行编号与事件格式() {
     let temp = Temp::new();

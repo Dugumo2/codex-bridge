@@ -39,8 +39,6 @@ pub struct RolloutReadRequest {
     pub id: u64,
     pub thread: String,
     pub conn_epoch: u64,
-    pub observation_gen: u64,
-    pub issued_seq: u64,
     pub path: String,
     /// None 表示首次读取（末尾窗口）。
     pub cursor: Option<RolloutCursor>,
@@ -71,15 +69,10 @@ pub struct RolloutChunk {
     pub bytes_read: u64,
     /// 不能当作无关记录的行：结构坏了，或类型不认识。
     pub bad_lines: u32,
-    /// 首次窗口切入了一条模型输入。其轮号在窗口外，不能把这条历史记录送入配对。
-    pub clipped_input: bool,
     /// 超过单行上限而整行跳过的行。
     pub skipped_lines: u32,
     /// 读完后文件里还有没读的完整内容，应尽快再读。
     pub more: bool,
-    /// 读取时游标之后文件里还有内容：没读到的完整行，或末尾没写完的半行。
-    /// 调用方不再续读时，不能把这次读取当成读完了整个文件。
-    pub unread: bool,
 }
 
 /// 一行为什么不能当作无关记录。
@@ -87,8 +80,7 @@ pub struct RolloutChunk {
 enum BadLine {
     /// 外层、事件类型或轮号无法解析，这一行可能是轮边界。
     PossibleBoundary,
-    /// 消费结构异常或记录类型未知。坏行已使读取回包封锁线程、撤销所有未裁决覆盖；
-    /// 轮定位只影响配对，清掉会使上游每新增一种记录都可能让同轮后续配对退步。
+    /// 消费结构异常或类型未知仍可保留轮定位，使之后的合法消息能按原轮配对。
     KeepTurn,
 }
 
@@ -182,7 +174,7 @@ fn is_collab_call(payload: &Value) -> bool {
             .is_some_and(|n| matches!(n, "followup_task" | "send_message"))
 }
 
-/// 只检查代理间消费的正文结构；其他输出的内部字段不参与覆盖判断。
+/// 只检查代理间消费的正文结构，其他输出的内部字段不影响配对。
 fn message_content_valid(payload: &Value) -> bool {
     payload
         .get("content")
@@ -247,6 +239,7 @@ fn parse_line(
     line: &[u8],
     turn: &mut Option<String>,
     lost: &mut bool,
+    boundary_only: bool,
 ) -> Result<Option<RolloutEntry>, BadLine> {
     use BadLine::{KeepTurn, PossibleBoundary};
     let line = line.strip_suffix(b"\r").unwrap_or(line);
@@ -300,6 +293,7 @@ fn parse_line(
             *lost = false;
             Ok(None)
         }
+        "response_item" if boundary_only => Ok(None),
         "response_item" => {
             let payload = value.get("payload").ok_or(KeepTurn)?;
             let kind = payload
@@ -329,16 +323,14 @@ fn parse_line(
                     if !is_collab_call(payload) {
                         return Ok(None);
                     }
-                    // 保留既有协作调用的配对输入，不验证其他工具的内部参数。
-                    for field in ["call_id", "arguments"] {
-                        payload
-                            .get(field)
-                            .and_then(Value::as_str)
-                            .ok_or(KeepTurn)?;
-                    }
+                    // 调用编号用于配对，缺少可比正文时由触发型调用的回退规则处理。
+                    payload
+                        .get("call_id")
+                        .and_then(Value::as_str)
+                        .ok_or(KeepTurn)?;
                     false
                 }
-                // 配置记录不是消费也不是轮边界，内部取值不参与覆盖判断。
+                // 配置内容不改变会话文件的轮定位。
                 "configuration_update"
                 | "reasoning"
                 | "function_call_output"
@@ -401,7 +393,7 @@ fn parse_lines(
         return 0;
     };
     for line in buf[..last].split(|&b| b == b'\n') {
-        match parse_line(line, turn, lost) {
+        match parse_line(line, turn, lost, false) {
             Ok(Some(entry)) => chunk.entries.push(entry),
             Ok(None) => {}
             Err(BadLine::PossibleBoundary) => {
@@ -428,8 +420,7 @@ fn read_range(file: &mut std::fs::File, start: u64, len: u64) -> Result<Vec<u8>,
     Ok(buf)
 }
 
-/// 跨窗首段可能与后面的 turn_context 属于同一轮。只向前补齐这一行，最多探到单行上限；
-/// 普通历史输出不影响覆盖，输入只用于否决待裁决轮，配对仍从窗口内第一条完整记录开始。
+/// 有界补齐跨窗首行只为核实长度与边界。窗口外的记录不送入配对，也不改写游标。
 fn inspect_clipped_line(
     file: &mut std::fs::File,
     mut from: u64,
@@ -458,12 +449,8 @@ fn inspect_clipped_line(
     } else {
         let mut line: Vec<u8> = parts.into_iter().rev().flatten().collect();
         line.extend_from_slice(&suffix[..suffix.len() - 1]);
-        match parse_line(&line, &mut None, &mut true) {
-            Ok(Some(entry)) => {
-                chunk.clipped_input = matches!(entry.record, RolloutRecord::Message { .. })
-            }
-            Err(_) => chunk.bad_lines += 1,
-            Ok(None) => {}
+        if parse_line(&line, &mut None, &mut true, true).is_err() {
+            chunk.bad_lines += 1;
         }
     }
     Ok(())
@@ -517,7 +504,6 @@ fn read_tail(file: &mut std::fs::File, len: u64) -> Result<RolloutChunk, Rollout
             lost,
         };
         chunk.bytes_read += bytes_read;
-        chunk.unread = offset < len;
         return Ok(chunk);
     }
 }
@@ -555,7 +541,6 @@ fn read_follow(
             None => {
                 chunk.cursor.offset += buf.len() as u64;
                 chunk.more = chunk.cursor.offset < len;
-                chunk.unread = chunk.more;
                 return Ok(chunk);
             }
         }
@@ -574,7 +559,6 @@ fn read_follow(
     chunk.cursor.lost = lost;
     // 还有完整的行没读到（本次读满了上限）时请调用方尽快再读；只剩半行时等下次轮询。
     chunk.more = buf.len() as u64 == want && want == MAX_READ_BYTES && chunk.cursor.offset < len;
-    chunk.unread = chunk.cursor.offset < len;
     Ok(chunk)
 }
 

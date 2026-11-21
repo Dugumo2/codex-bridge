@@ -216,8 +216,6 @@ impl Core {
                             id: request.id,
                             thread: request.thread,
                             conn_epoch: request.conn_epoch,
-                            observation_gen: request.observation_gen,
-                            issued_seq: request.issued_seq,
                             result,
                         });
                     });

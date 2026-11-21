@@ -160,7 +160,7 @@ fn tree_log_review_祖先晚绑定补写孙事件保留原时间且不重放完�
 }
 
 #[test]
-fn tree_log_review_祖先未绑定的孙事件超限与过期留下缺口() {
+fn gap_wu_祖先未绑定的孙摘要超限与到期均保留() {
     let (mut m, mut mock, _, mut actions) = delayed_ancestor();
     let event = mock.turn_started(G, "孙轮");
     actions.extend(mock.inject(&mut m, event));
@@ -169,7 +169,7 @@ fn tree_log_review_祖先未绑定的孙事件超限与过期留下缺口() {
     }
     let overflow: Vec<_> = log_rows(&actions)
         .into_iter()
-        .filter(|r| r["threadId"] == G && r["coverageIssue"] == "beforeBindingUnknown")
+        .filter(|r| r["threadId"] == G && r["attribution"] == "unconfirmed")
         .collect();
     assert!(!overflow.is_empty(), "未绑定祖先不能让孙事件静默丢失");
     assert!(overflow
@@ -211,7 +211,7 @@ fn tree_log_review_祖先未绑定的孙事件超限与过期留下缺口() {
         !log_rows(&renewed).iter().any(|r| r["threadId"] == G),
         "归属证据还在进行：暂存续期，不写缺口"
     );
-    // 证据等到期限转成未证明后，暂存再到期才写缺口（写得出缺口即说明续期时摘要仍在暂存）。
+    // 证据过期后结算保留原摘要。
     let timer = sweep_timer(&renewed);
     m.clock.mono_ms += 30_000;
     m.clock.now_ms += 30_000;
@@ -233,15 +233,18 @@ fn tree_log_review_祖先未绑定的孙事件超限与过期留下缺口() {
             kind: timer.1,
         },
     );
-    let gaps: Vec<_> = log_rows(&expired)
+    let saved: Vec<_> = log_rows(&expired)
         .into_iter()
         .filter(|r| r["threadId"] == G)
         .collect();
-    assert!(!gaps.is_empty());
-    assert!(gaps.iter().all(|r| r["kind"] == "记录缺口"
-        && r["coverageIssue"] == "beforeBindingUnknown"
+    assert!(!saved.is_empty());
+    assert!(saved.iter().all(|r| matches!(r["kind"].as_str(), Some("轮次开始" | "条目完成"))
+        && r["attribution"] == "unconfirmed"
         && r["runId"] == R
         && r["parentThreadId"] == C));
+    assert_eq!(overflow.len() + saved.len(), 501);
+    assert!(overflow.iter().chain(&saved).filter(|r| r["kind"] == "条目完成")
+        .all(|r| r["summary"] == "孙线程已观察摘要"));
     assert!(m.binding(G, "孙轮").is_none());
 }
 

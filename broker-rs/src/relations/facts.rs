@@ -173,11 +173,6 @@ impl Machine {
                 relevant
             }
             "turn/started" => {
-                if claimed {
-                    if let Some(turn) = &turn {
-                        self.v2_observe_start(&thread, turn);
-                    }
-                }
                 if let (false, Some(turn)) = (claimed, &turn) {
                     self.v2_observe_start(&thread, turn);
                     self.convergence_observe_activity(&thread, turn, "running", false);
@@ -259,9 +254,15 @@ impl Machine {
                 self.child_probe(&thread, actions);
                 if event.method == "thread/deleted" {
                     self.detach_evidence(&thread);
+                } else {
+                    self.invalidate_rollout_reads(Some(&thread));
                 }
                 self.lineage_touched(&thread, event.method == "thread/deleted", actions);
                 true
+            }
+            "thread/reverted" => {
+                self.invalidate_rollout_reads(Some(&thread));
+                false
             }
             _ => false,
         }
@@ -281,19 +282,6 @@ impl Machine {
             self.clock.mono_ms,
             self.relations.aux.version,
         );
-        if self.relations.attachments.len() >= MAX_ATTACHMENTS
-            && !self.relations.attachments.contains_key(thread)
-        {
-            if let Some(oldest) = self
-                .relations
-                .attachments
-                .iter()
-                .min_by_key(|(_, a)| a.observed_at_ms)
-                .map(|(t, _)| t.clone())
-            {
-                self.observation_continuity_lost(&oldest, "附着凭据淘汰");
-            }
-        }
         let attachments = &mut self.relations.attachments;
         if let Some(existing) = attachments.get_mut(thread) {
             existing.conn_epoch = epoch;
@@ -310,9 +298,10 @@ impl Machine {
                 .map(|(t, _)| t.clone())
             {
                 attachments.remove(&oldest);
+                self.invalidate_rollout_reads(Some(&oldest));
             }
         }
-        attachments.insert(
+        self.relations.attachments.insert(
             thread.into(),
             AttachmentEvidence {
                 thread_id: thread.into(),
@@ -358,7 +347,7 @@ impl Machine {
 
     /// 卸载、关闭、删除使附着证据立即失效。
     pub(crate) fn detach_evidence(&mut self, thread: &str) {
-        self.observation_continuity_lost(thread, "附着或订阅连续性失效");
+        self.invalidate_rollout_reads(Some(thread));
         if let Some(a) = self.relations.attachments.get_mut(thread) {
             a.valid = false;
         }
@@ -615,8 +604,8 @@ impl Machine {
         };
         let now = self.clock.mono_ms;
         let first = !self.relations.operations.contains_key(&key);
-        // 父线程本连接内没有 raw：可以改从会话文件找开始记录（`rollout_pairing`）。
-        let mut parent_without_raw = false;
+        // 没有可用的实时开始记录时，允许读文件或使用已经识别的文件调用。
+        let mut consider_file_call = false;
         if first {
             if !self.reserve_operation() {
                 actions.push(Action::Warn(format!(
@@ -669,7 +658,9 @@ impl Machine {
                         // 归属留空的开始记录只配给同样在等发起方绑定的操作。
                         && (!run_id.is_empty() || parent_run == ParentRun::AwaitBinding)
                 });
-            let v2_fallback = (kind == EvidenceKind::V2Interacted && begin.is_none()).then(|| {
+            let raw_queue_only = kind == EvidenceKind::V2Interacted && self.relations.aux.raw_queue_receipts
+                .remove(&key).is_some_and(|(epoch, until)| epoch == self.relations.conn_epoch && now < until);
+            let v2_fallback = (kind == EvidenceKind::V2Interacted && begin.is_none() && !raw_queue_only).then(|| {
                 if self.relations.aux.followup_starts.contains_key(&key) {
                     V2FallbackReason::StartStale
                 } else {
@@ -681,7 +672,11 @@ impl Machine {
                     }
                 }
             });
-            parent_without_raw = v2_fallback == Some(V2FallbackReason::ParentWithoutRaw);
+            consider_file_call = v2_fallback == Some(V2FallbackReason::ParentWithoutRaw)
+                || (v2_fallback == Some(V2FallbackReason::RawUnknown)
+                    && self.rollout_call(&key).is_some())
+                || (v2_fallback == Some(V2FallbackReason::StartMissing)
+                    && self.rollout_call(&key).is_some_and(|call| !call.trigger));
             let baseline_turns = receivers
                 .iter()
                 .filter_map(|child| {
@@ -696,6 +691,10 @@ impl Machine {
                     ))
                 })
                 .collect();
+            let unresolved_kind = matches!(v2_fallback, Some(V2FallbackReason::StartMissing | V2FallbackReason::RawUnknown))
+                && self.rollout_call(&key).is_none()
+                && self.relations.aux.raw_queue_receipts_full.is_some_and(|(epoch, until)|
+                    epoch == self.relations.conn_epoch && now < until);
             self.relations.operations.insert(
                 key.clone(),
                 EvidenceOperation {
@@ -706,14 +705,14 @@ impl Machine {
                     kind,
                     started_seen: false,
                     completed_seen: false,
-                    outcome,
+                    outcome: if unresolved_kind { EvidenceOutcome::Unproven } else { outcome },
                     receivers: BTreeSet::new(),
                     rejected_receivers: BTreeMap::new(),
                     proven_turns: BTreeMap::new(),
                     baseline_turns,
-                    v2_strict: begin.is_some(),
-                    v2_queue_only: begin.as_ref().is_some_and(|start| !start.trigger),
-                    v2_source: if begin.is_some() {
+                    v2_strict: raw_queue_only || begin.is_some(),
+                    v2_queue_only: raw_queue_only || begin.as_ref().is_some_and(|start| !start.trigger),
+                    v2_source: if raw_queue_only || begin.is_some() {
                         V2EvidenceSource::Raw
                     } else {
                         V2EvidenceSource::None
@@ -745,7 +744,7 @@ impl Machine {
                     .or_insert_with(|| path.into());
             }
             // 等会话文件定模式期间不配对：暂存通知，定案后由 `item_evidence_replay` 原样重放。
-            if parent_without_raw {
+            if consider_file_call {
                 match self.rollout_try_wait(&key, item, completed) {
                     Ok(true) => return,
                     Ok(false) => {}
@@ -1186,7 +1185,7 @@ impl Machine {
                 rejection.reason(),
                 false,
                 false,
-                Some("discoveryIncomplete"),
+                Some(crate::runs::event_log::LogNote::DiscoveryIncomplete),
                 actions,
             );
         }
@@ -1321,7 +1320,7 @@ impl Machine {
                 &reason,
                 false,
                 false,
-                Some("discoveryIncomplete"),
+                Some(crate::runs::event_log::LogNote::DiscoveryIncomplete),
                 actions,
             );
             if let Some(member) = self
@@ -1551,23 +1550,16 @@ impl Machine {
         completed: bool,
         actions: &mut Vec<Action>,
     ) {
-        if completed {
-            self.input_turn_boundary(thread, turn, false);
-        }
         if turn.is_empty() || self.claims.contains_key(thread) {
             return;
         }
         let now = self.clock.mono_ms;
-        let mut lost_starts = Vec::new();
         let aux = &mut self.relations.aux;
         if !aux.observed.contains_key(thread) {
             if aux.observed.len() >= MAX_OBSERVED_THREADS {
                 if let Some(oldest) = aux.observed_order.pop_front() {
-                    lost_starts.push(oldest.clone());
                     aux.observed.remove(&oldest);
                     aux.live_turn_starts
-                        .retain(|(thread, _), _| thread != &oldest);
-                    aux.coverage_starts
                         .retain(|(thread, _), _| thread != &oldest);
                 }
             }
@@ -1590,20 +1582,12 @@ impl Machine {
                 });
                 while list.len() > MAX_OBSERVED_TURNS {
                     if let Some(old) = list.pop_front() {
-                        if !old.completed {
-                            lost_starts.push(thread.to_owned());
-                        }
-                        aux.coverage_starts
-                            .remove(&(thread.into(), old.turn.clone()));
                         aux.live_turn_starts.remove(&(thread.into(), old.turn));
                     }
                 }
                 (true, true)
             }
         };
-        for thread in lost_starts {
-            self.coverage_proof_lost(&thread, "真实开始凭据淘汰");
-        }
         // 配对重试必须先于事件标志去重：发现回查已恢复有效观察，但 started/completed 可能均未变化。
         self.retry_v2_pairing(thread, actions);
         if !changed {
@@ -1768,7 +1752,9 @@ impl Machine {
             let Some(oldest) = oldest else {
                 return false;
             };
-            self.relations.operations.remove(&oldest);
+            if let Some(evicted) = self.relations.operations.remove(&oldest) {
+                self.remember_evicted_log_proof(&evicted);
+            }
             self.relations.aux.v2_receiver_paths.remove(&oldest);
         }
         true

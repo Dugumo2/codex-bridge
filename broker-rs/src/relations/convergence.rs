@@ -165,7 +165,7 @@ impl Machine {
                 self.convergence_observation_gap(thread, actions);
             }
             if status == "notLoaded" || closed {
-                self.observation_continuity_lost(thread, "代理状态确认线程关闭或卸载");
+                self.invalidate_rollout_reads(Some(thread));
             }
             self.convergence_sync_facts(&run);
             self.touch_context(&run, MemberChange::Activity, actions);

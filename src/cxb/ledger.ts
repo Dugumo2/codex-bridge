@@ -340,18 +340,18 @@ export function readRunLog(workspaceDir: string, shortId: string, io: LogReadIO 
 
 /** 文件身份与长度一起核验，避免轮转时把旧活动文件与新备份拼错。接口允许确定性模拟轮转。 */
 export interface LogReadIO {
-  fingerprint(path: string): string | null;
+  fingerprint(path: string): { identity: string; revision: string } | string | null;
   read(path: string): string;
 }
 const legacyLogIO: LogReadIO = {
-  fingerprint: (path) => existsSync(path) ? "存在" : null,
+  fingerprint: (path) => existsSync(path) ? { identity: path, revision: "" } : null,
   read: (path) => readFileSync(path, "utf8"),
 };
 const logIO: LogReadIO = {
   fingerprint(path) {
     try {
       const stat = statSync(path, { bigint: true });
-      return `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`;
+      return { identity: `${stat.dev}:${stat.ino}`, revision: `${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}` };
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
       throw error;
@@ -367,16 +367,28 @@ export function readRunLogSnapshot(workspaceDir: string, shortId: string, io: Lo
   const base = join(workspaceDir, "runs", `${shortId}.log`);
   const parts = [`${base}.1`, base];
   const label = `线程 ${shortId} 的日志`;
-  let changed = false;
+  let rotation = false;
+  let active: string | undefined;
+  const inspect = () => {
+    const stamps = parts.map((path) => {
+      const stamp = io.fingerprint(path);
+      // 旧读取器的字符串只能证明内容变化；它没有提供独立的文件身份。
+      return typeof stamp === "string" ? { identity: path, revision: stamp } : stamp;
+    });
+    const identity = stamps[1]?.identity;
+    rotation ||= stamps[0] != null || (active !== undefined && identity !== undefined && active !== identity);
+    if (identity !== undefined) active = identity;
+    return stamps;
+  };
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
-      const before = parts.map((path) => io.fingerprint(path));
+      const before = inspect();
       const texts = parts.map((path, i) => before[i] === null ? "" : io.read(path));
-      const after = parts.map((path) => io.fingerprint(path));
-      if (before.some((stamp, i) => stamp !== after[i])) { changed = true; continue; }
+      const after = inspect();
+      if (before.some((stamp, i) => stamp?.identity !== after[i]?.identity || stamp?.revision !== after[i]?.revision)) continue;
       if (before.every((stamp) => stamp === null)) return { lines: null, issues: [{ code: "missingLog" }] };
       const issues: LogCoverageIssue[] = [];
-      if (changed || before[0] !== null) issues.push({ code: "rotationWindow" });
+      if (rotation) issues.push({ code: "rotationWindow" });
       if (texts.some((text) => text.length > 0 && !text.endsWith("\n"))) issues.push({ code: "trailingPartialLine" });
       const seen = new Set<string>();
       const lines = texts.flatMap((text) => parseLog(text, label)).filter((line) => {
@@ -388,7 +400,7 @@ export function readRunLogSnapshot(workspaceDir: string, shortId: string, io: Lo
       });
       return { lines, issues };
     } catch (cause) {
-      if ((cause as NodeJS.ErrnoException).code === "ENOENT") { changed = true; continue; }
+      if ((cause as NodeJS.ErrnoException).code === "ENOENT") continue;
       if (cause instanceof CxbError) throw cause;
       throw new CxbError("LOCAL_ERROR", `${label}无法读取`, { cause });
     }
@@ -399,5 +411,6 @@ export function readRunLogSnapshot(workspaceDir: string, shortId: string, io: Lo
 /** 旧 show 的事件范围：必须在 limit、摘要筛选和补发去重之前调用。 */
 export function ownLogLines(lines: LogLine[]): LogLine[] {
   // 树发现缺口可挂在根身份上，它也是本期新增的树范围诊断，不能挤占旧视图。
-  return lines.filter((line) => line.source?.sourceRole !== "subagent" && !line.source?.coverageIssue);
+  return lines.filter((line) => line.source?.attribution !== "unconfirmed"
+    && line.source?.sourceRole !== "subagent" && !line.source?.coverageIssue);
 }

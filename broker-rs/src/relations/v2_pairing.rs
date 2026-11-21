@@ -145,8 +145,6 @@ pub(super) fn parse_call(item: &Value) -> Option<ParsedCall> {
 
 /// 子代理收到的一条消息：只留身份、类型与内容摘要。
 pub(super) struct ParsedDelivery {
-    /// 去重只比较消费事实，不把新增展示或宿主字段当作冲突消费。
-    pub raw: Value,
     pub id: String,
     pub author: String,
     pub recipient: String,
@@ -188,7 +186,6 @@ pub(super) fn parse_delivery(item: &Value) -> Option<ParsedDelivery> {
         return None;
     }
     Some(ParsedDelivery {
-        raw: serde_json::json!({"author":author,"recipient":recipient,"trigger":trigger,"message":message}),
         id: id.into(),
         author: author.into(),
         recipient: recipient.into(),
@@ -207,7 +204,6 @@ impl Machine {
     ) -> bool {
         self.prune_v2_deliveries();
         self.note_raw_thread(thread);
-        self.coverage_raw_witness(thread, turn);
         match item.get("type").and_then(Value::as_str) {
             Some("function_call") => {
                 let Some(call) = parse_call(item) else {
@@ -396,6 +392,19 @@ impl Machine {
         let now = self.clock.mono_ms;
         self.prune_followup_starts();
         if self.relations.aux.followup_starts.len() >= MAX_OPERATIONS {
+            if source == EvidenceSource::Raw && !call.trigger
+                && !self.relations.aux.followup_starts.contains_key(&key)
+            {
+                let epoch = self.relations.conn_epoch;
+                let until = now.saturating_add(EVIDENCE_TTL_MS);
+                let aux = &mut self.relations.aux;
+                if aux.raw_queue_receipts.len() < MAX_OPERATIONS || aux.raw_queue_receipts.contains_key(&key) {
+                    aux.raw_queue_receipts.insert(key, (epoch, until));
+                } else {
+                    // 连身份也放不下时，仅在这批证据的有效期内禁止用缺开始记录猜测管理权。
+                    aux.raw_queue_receipts_full = Some((epoch, until));
+                }
+            }
             return false;
         }
         if self.relations.aux.followup_starts.contains_key(&key) {
@@ -428,18 +437,6 @@ impl Machine {
         wall_ms: u64,
         actions: &mut Vec<Action>,
     ) -> bool {
-        // 覆盖消费必须先于配对查重；文件来源永远不能授予完整观察资格。
-        if source == EvidenceSource::RolloutFile {
-            self.coverage_veto(Some(thread), Some(turn), "文件来源消费", true);
-        } else {
-            let collaboration = crate::runs::event_log::collaboration_delivery(
-                &delivery.author,
-                &delivery.recipient,
-            );
-            if self.coverage_consume(thread, turn, &delivery.id, &delivery.raw, collaboration) {
-                self.observation_gap(Some(thread), "完成后新增或冲突消费");
-            }
-        }
         if self
             .relations
             .aux
@@ -525,7 +522,6 @@ impl Machine {
                 self.relations.conn_epoch,
                 self.relations.aux.observation_seq,
             ));
-        self.coverage_real_start(thread, turn);
     }
 
     pub(super) fn v2_start(&self, op: &EvidenceOperation) -> Option<&FollowupStart> {
@@ -982,6 +978,10 @@ impl Machine {
             .map(|op| op.key.clone())
             .collect();
         let aux = &mut self.relations.aux;
+        aux.raw_queue_receipts.retain(|_, (e, end)| *e == epoch && now < *end);
+        if aux.raw_queue_receipts_full.is_some_and(|(e, end)| e != epoch || now >= end) {
+            aux.raw_queue_receipts_full = None;
+        }
         let before = aux.followup_starts.len();
         aux.followup_starts.retain(|key, start| {
             start.epoch == epoch

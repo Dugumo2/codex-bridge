@@ -779,14 +779,11 @@ pub enum Event {
         id: u64,
         thread: String,
         conn_epoch: u64,
-        observation_gen: u64,
-        issued_seq: u64,
         result: Result<crate::rollout::RolloutChunk, crate::rollout::RolloutError>,
     },
     /// 与通知共用有序入站链的观察缺口，不能只记录传输告警。
     ObservationGap {
         thread: Option<String>,
-        reason: String,
     },
 }
 
@@ -865,8 +862,6 @@ pub struct Machine {
 
 /// 所有输入通过同一个纯函数迁移；运行时只持有返回的新状态。
 pub fn step(mut state: Machine, event: Event) -> (Machine, Vec<Action>) {
-    state.begin_event_log_step();
-    state.coverage_check_epoch();
     state.diagnostic_batch_active = true;
     let mut actions = Vec::new();
     state.child_subscription_event(&event, &mut actions);
@@ -1021,7 +1016,7 @@ pub fn step(mut state: Machine, event: Event) -> (Machine, Vec<Action>) {
         }
         Event::Disconnected { conn } => state.disconnect(conn, &mut actions),
         Event::Shutdown => {
-            state.observation_gap(None, "broker 关闭");
+            state.invalidate_rollout_reads(None);
             state.shutdown(&mut actions);
         }
         Event::ShutdownBegin => state.quiesce(&mut actions),
@@ -1057,18 +1052,16 @@ pub fn step(mut state: Machine, event: Event) -> (Machine, Vec<Action>) {
             id,
             thread,
             conn_epoch,
-            observation_gen,
-            issued_seq,
             result,
         } => state.rollout_read_done(
             id,
             &thread,
-            (conn_epoch, observation_gen, issued_seq),
+            conn_epoch,
             result,
             &mut actions,
         ),
-        Event::ObservationGap { thread, reason } => {
-            state.observation_gap(thread.as_deref(), &reason)
+        Event::ObservationGap { thread } => {
+            state.invalidate_rollout_reads(thread.as_deref())
         }
     }
     if let Some(thread) = settled_goal {
@@ -2424,7 +2417,6 @@ impl Machine {
 
     /// #5 的到达阶段先于 completed 查重与 goal 学习。
     fn arrive_notification(&mut self, event: HeldNotification, actions: &mut Vec<Action>) {
-        self.coverage_preprocess_notification(&event);
         self.runtime_notification(&event);
         // 先撤销历史根的旧证据，避免关系通知中的同步协调提前确认树停止。
         if !self.closing {

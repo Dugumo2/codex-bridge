@@ -66,7 +66,7 @@ pub(super) fn finish(m: &mut Machine, mock: &mut SubagentMock) -> Vec<Action> {
         all.extend(replies(m, mock, actions));
     }
     if m.convergences.progress[R].reading.is_some() {
-        confirm_parent(m);
+        confirm_parent_with_actions(m, &mut all);
         let actions = complete(m, mock, P, "汇总轮", "completed");
         all.extend(replies(m, mock, actions));
     }
@@ -454,6 +454,14 @@ pub(super) fn assert_no_alarm(actions: &[Action]) {
             Action::Warn(warning) => panic!("正常路径不应告警：{warning}"),
             Action::Store(crate::store::StoreOp::AppendLog { lines, .. }) => {
                 for line in lines {
+                    if let Some((header, payload)) = line.split_once("\t@cxb2 ") {
+                        let row: serde_json::Value = serde_json::from_str(payload).unwrap();
+                        if row["attribution"] == "unconfirmed" {
+                            assert_ne!(header.split_whitespace().nth(2), Some("记录缺口"));
+                            assert!(row.get("coverageIssue").is_none());
+                            continue;
+                        }
+                    }
                     for word in [
                         "缺口",
                         "冲突",
@@ -996,6 +1004,17 @@ fn 历史兄弟收到平级消息不算冲突_兄弟新轮在跑时仍阻塞收�
         } else {
             all.extend(sweep_pending_event_log(&mut m, &all));
         }
+        for action in &all {
+            if let Action::Store(crate::store::StoreOp::AppendLog { lines, .. }) = action {
+                for line in lines {
+                    let fields: Vec<_> = line.splitn(4, ' ').collect();
+                    if fields[1] == R2 {
+                        let row: serde_json::Value = serde_json::from_str(fields[3].strip_prefix("\t@cxb2 ").unwrap()).unwrap();
+                        assert!(!(row["threadId"] == S && row["turnId"] == "兄弟新轮"));
+                    }
+                }
+            }
+        }
         assert_no_alarm(&all);
     }
 }
@@ -1436,7 +1455,7 @@ fn 共享服务器review溢出迁移到子线程_等定案的跟进要结算不�
     assert_eq!(op(&m, "跟进").outcome, EvidenceOutcome::Unproven);
 }
 
-/// 只有等证据等到期限才算「证明超时」（日志要留缺口）；上游 completed 这种只记事实的条目不算。
+/// 只有等证据等到期限才算「证明超时」（保留未确认摘要）；上游 completed 这种只记事实的条目不算。
 #[test]
 fn 等归属的跟进到期才标证明超时_只记事实的条目不标() {
     const G: &str = "孙";
