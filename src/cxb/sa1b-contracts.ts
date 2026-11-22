@@ -70,7 +70,7 @@ export interface ConvergenceDiagnostic {
     fallbackReason:
       | "parentWithoutRaw" | "startMissing" | "startStale" | "rawUnknown"
       | "rolloutPathUnavailable" | "rolloutUnreadable" | "rolloutCallMissing" | "rolloutLost" | "rolloutCancelled"
-      | "rolloutSenderUnknown" | "rolloutTurnUnknown"
+      | "rolloutSenderUnknown" | "rolloutTurnUnknown" | "receiverPathTooLong"
       | null;
     /** 跟进还在等子代理读到时的起始时刻；不在等配对为 null。只供排查，不代表异常。 */
     awaitingPairingSince: number | null;

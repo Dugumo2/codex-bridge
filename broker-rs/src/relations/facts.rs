@@ -13,6 +13,9 @@ use crate::claim::{Owner, State};
 use crate::policy::Policy;
 use serde_json::json;
 
+/// broker 登记的接收方代理路径上限（字节）；超长的跟进不定为严格（上游不限代理名长度）。
+pub(crate) const MAX_AGENT_PATH_BYTES: usize = 256;
+
 /// 父线程某一轮的归属判断。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ParentRun {
@@ -726,6 +729,14 @@ impl Machine {
             // 「身份失记」的跟进：首次进入收敛账本时已经是 Unproven，
             // 在账本记下它的结算期限（该操作的 expires_at_ms），到期结算不等收敛总期限。
             let unproven_run = (unresolved_kind && !run_id.is_empty()).then(|| run_id.clone());
+            // E6：接收方路径超长时登记不进 `v2_receiver_paths`，定为严格永远配不出候选、
+            // 死等到收敛期限；有开始记录的跟进直接定为宽松。留言（只入队）不受影响。
+            let receiver_path_too_long = kind == EvidenceKind::V2Interacted
+                && begin.as_ref().is_some_and(|start| start.trigger)
+                && item
+                    .get("agentPath")
+                    .and_then(Value::as_str)
+                    .is_some_and(|s| s.len() > MAX_AGENT_PATH_BYTES);
             self.relations.operations.insert(
                 key.clone(),
                 EvidenceOperation {
@@ -745,15 +756,21 @@ impl Machine {
                     rejected_receivers: BTreeMap::new(),
                     proven_turns: BTreeMap::new(),
                     baseline_turns,
-                    v2_strict: raw_queue_only || begin.is_some(),
+                    v2_strict: !receiver_path_too_long && (raw_queue_only || begin.is_some()),
                     v2_queue_only: raw_queue_only
                         || begin.as_ref().is_some_and(|start| !start.trigger),
-                    v2_source: if raw_queue_only || begin.is_some() {
+                    v2_source: if receiver_path_too_long {
+                        V2EvidenceSource::None
+                    } else if raw_queue_only || begin.is_some() {
                         V2EvidenceSource::Raw
                     } else {
                         V2EvidenceSource::None
                     },
-                    v2_fallback,
+                    v2_fallback: if receiver_path_too_long {
+                        Some(V2FallbackReason::ReceiverPathTooLong)
+                    } else {
+                        v2_fallback
+                    },
                     rollout_arrival: None,
                     lenient_floor: None,
                     first_seen_ms: begin.as_ref().map_or(now, |start| start.at),
@@ -779,7 +796,7 @@ impl Machine {
             if let Some(path) = item
                 .get("agentPath")
                 .and_then(Value::as_str)
-                .filter(|s| s.len() <= 256)
+                .filter(|s| s.len() <= MAX_AGENT_PATH_BYTES)
             {
                 self.relations
                     .aux
