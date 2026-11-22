@@ -26,6 +26,8 @@ pub enum UpstreamErrorCategory {
     RateLimit,
     Server,
     Network,
+    SubscriptionSharingUnsupported,
+    SubscriptionSharingUsageLimit,
     Unknown,
 }
 
@@ -97,6 +99,22 @@ pub fn classify(info: Option<&Value>) -> UpstreamErrorCategory {
             Network
         }
         _ => Unknown,
+    }
+}
+
+/// 只在结构化归类落空时按正文 `error.code` 精确认两类订阅共享报错；
+/// 匹配正文修剪后的原文 JSON，不认识的 code 保持 Unknown。
+fn sharing_category(raw: Option<&str>) -> Option<UpstreamErrorCategory> {
+    let parsed = serde_json::from_str::<Value>(raw?.trim()).ok()?;
+    let code = parsed.get("error")?.as_object()?.get("code")?.as_str()?;
+    match code {
+        "subscription_sharing_unsupported_capability" => {
+            Some(UpstreamErrorCategory::SubscriptionSharingUnsupported)
+        }
+        "subscription_sharing_usage_limit_exceeded" => {
+            Some(UpstreamErrorCategory::SubscriptionSharingUsageLimit)
+        }
+        _ => None,
     }
 }
 
@@ -174,11 +192,20 @@ impl UpstreamError {
             }
             None => (None, false),
         };
+        // 截断前原文做 code 匹配；脱敏截断后的正文可能已不合法。
+        let category = match classify(info) {
+            UpstreamErrorCategory::Unknown => {
+                sharing_category(error.get("message").and_then(Value::as_str))
+                    .or_else(|| sharing_category(details))
+                    .unwrap_or(UpstreamErrorCategory::Unknown)
+            }
+            category => category,
+        };
         Self {
             thread_id: thread.into(),
             turn_id: turn.map(str::to_owned),
             source,
-            category: classify(info),
+            category,
             http_status_code: http_status_code(info),
             codex_error_info: info.cloned(),
             message,
@@ -916,6 +943,119 @@ mod tests {
             ),
         );
         assert_eq!(current.unwrap().count, u32::MAX);
+    }
+
+    /// 样本 2（WebSocket 形状）：额度用完正文按 error.code 归类。
+    const SS_USAGE_LIMIT_BODY: &str = r#"{"type":"error","status":400,"error":{"message":"The ChatGPT user has reached their Subscription Sharing usage limit. Ask the user to try again after their usage limit resets or use an API key instead.","type":"invalid_request_error","param":null,"code":"subscription_sharing_usage_limit_exceeded"}}"#;
+    /// t3code issue #29992 原文（HTTP 形状）：能力不支持正文按 error.code 归类。
+    const SS_UNSUPPORTED_BODY: &str = r#"{"error":{"message":"User subscription sharing currently supports only text, image, and file messages, item references, additional tools, compaction summaries, reasoning items, Web Search call items, developer function and custom tool call items, and programmatic tool calling items. Remove unsupported input items or use an API key instead.","type":"invalid_request_error","param":"input","code":"subscription_sharing_unsupported_capability"}}"#;
+
+    fn sharing_error(body: &str, now: u64) -> UpstreamError {
+        UpstreamError::from_error(
+            "线程",
+            Some("本轮"),
+            UpstreamErrorSource::ErrorNotification,
+            &json!({"message":body,"codexErrorInfo":"other"}),
+            Some(false),
+            now,
+        )
+    }
+
+    #[test]
+    fn ss_额度用完正文按code归类且其余字段不变() {
+        let diagnostic = sharing_error(SS_USAGE_LIMIT_BODY, 1);
+        assert_eq!(
+            diagnostic.category,
+            UpstreamErrorCategory::SubscriptionSharingUsageLimit
+        );
+        let value = serde_json::to_value(&diagnostic).unwrap();
+        assert_eq!(value["category"], "subscriptionSharingUsageLimit");
+        assert_eq!(diagnostic.codex_error_info, Some(json!("other")));
+        assert_eq!(diagnostic.http_status_code, None);
+        // 正文里的 code 形如长 token，按既有脱敏规则被隐藏；归类用的是脱敏前原文。
+        assert_eq!(
+            diagnostic.message,
+            SS_USAGE_LIMIT_BODY.replace("subscription_sharing_usage_limit_exceeded", "[已隐藏]")
+        );
+        assert!(!diagnostic.truncated);
+        assert_eq!(diagnostic.will_retry, Some(false));
+    }
+
+    #[test]
+    fn ss_能力不支持正文按code归类且截断不影响识别() {
+        let diagnostic = sharing_error(SS_UNSUPPORTED_BODY, 1);
+        assert_eq!(
+            diagnostic.category,
+            UpstreamErrorCategory::SubscriptionSharingUnsupported
+        );
+        let value = serde_json::to_value(&diagnostic).unwrap();
+        assert_eq!(value["category"], "subscriptionSharingUnsupported");
+        // 正文超过 4096 字节会被脱敏截断，归类仍用截断前的原文。
+        let long = SS_UNSUPPORTED_BODY.replace(
+            "\"param\":\"input\"",
+            &format!("\"param\":\"input\",\"extra\":\"{}\"", "长".repeat(5000)),
+        );
+        let diagnostic = sharing_error(&long, 2);
+        assert!(diagnostic.truncated);
+        assert_eq!(
+            diagnostic.category,
+            UpstreamErrorCategory::SubscriptionSharingUnsupported
+        );
+    }
+
+    #[test]
+    fn ss_正文来自_additional_details同样归类() {
+        let diagnostic = UpstreamError::from_error(
+            "线程",
+            Some("本轮"),
+            UpstreamErrorSource::ErrorNotification,
+            &json!({"message":"普通提示","additionalDetails":SS_UNSUPPORTED_BODY,
+                "codexErrorInfo":"other"}),
+            Some(false),
+            1,
+        );
+        assert_eq!(
+            diagnostic.category,
+            UpstreamErrorCategory::SubscriptionSharingUnsupported
+        );
+    }
+
+    #[test]
+    fn ss_不认的code与畸形正文保持unknown() {
+        for body in [
+            // 别的 subscription_sharing code
+            r#"{"error":{"message":"暂时不可用","code":"subscription_sharing_usage_unavailable"}}"#,
+            // 没有 code
+            r#"{"error":{"message":"额度用完"}}"#,
+            // 普通英文句子包含 code 字符串（证明不是包含匹配）
+            "upstream failed with subscription_sharing_usage_limit_exceeded yesterday",
+            // JSON 但 error 不是对象
+            r#"{"error":"subscription_sharing_usage_limit_exceeded"}"#,
+            // error.code 不是字符串
+            r#"{"error":{"code":400}}"#,
+            // 不是 JSON
+            "plain error text",
+            "",
+        ] {
+            assert_eq!(
+                sharing_error(body, 1).category,
+                UpstreamErrorCategory::Unknown,
+                "{body}"
+            );
+        }
+    }
+
+    #[test]
+    fn ss_已有类别不被正文code覆盖() {
+        let diagnostic = UpstreamError::from_error(
+            "线程",
+            Some("本轮"),
+            UpstreamErrorSource::ErrorNotification,
+            &json!({"message":SS_USAGE_LIMIT_BODY,"codexErrorInfo":"unauthorized"}),
+            Some(true),
+            1,
+        );
+        assert_eq!(diagnostic.category, UpstreamErrorCategory::Authentication);
     }
 
     #[test]

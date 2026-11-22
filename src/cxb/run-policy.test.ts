@@ -100,7 +100,7 @@ describe("运行策略参数与配置", () => {
   test.each(["run", "review"] as const)("%s 帮助解释期限边界、待答暂停和访问错误策略", (command) => {
     const help = renderHelp(command).replace(/\s+/g, "");
     for (const text of ["--stall-timeout", "600秒", "重复的上游报错不算", "等你回答／审批时不计时", "静默命令、MCP工具、深度推理", "请调大或设0", "退出3",
-      "--upstream-error-policy", "observe", "stop-access", "认证、付费、权限三类结构化错误", "不登出、不改账户", "退出4"]) expect(help).toContain(text);
+      "--upstream-error-policy", "observe", "stop-access", "认证、付费、权限、订阅共享额度四类结构化错误", "不登出、不改账户", "退出4"]) expect(help).toContain(text);
   });
 });
 

@@ -7,12 +7,18 @@ import { redactParams } from "./server-requests";
 
 const categories: Record<UpstreamErrorCategory, string> = {
   authentication: "上游认证失败", paymentRequired: "上游要求付费", permissionDenied: "上游拒绝访问",
-  usageLimit: "上游用量已达上限", rateLimit: "上游限流", server: "上游服务器错误", network: "上游连接失败", unknown: "上游报错",
+  usageLimit: "上游用量已达上限", rateLimit: "上游限流", server: "上游服务器错误", network: "上游连接失败",
+  subscriptionSharingUnsupported: "订阅共享登录不支持子代理等能力", subscriptionSharingUsageLimit: "订阅共享额度已用完", unknown: "上游报错",
+};
+const remedies: Record<string, string> = {
+  subscriptionSharingUnsupported: "[cxb] 改法：改用 Codex 自己的登录或 API key；已经出过这个错的线程请新开线程。",
+  subscriptionSharingUsageLimit: "[cxb] 改法：等订阅共享额度重置，或改用 Codex 自己的登录或 API key。",
 };
 for (const [category, label] of Object.entries(categories)) test(`提示逐字：${category}`, () => {
-  expect(upstreamNoticeLines(upstreamError({ category: category as UpstreamErrorCategory }))).toEqual([
-    `[cxb] ${label}（HTTP 401），Codex 正在重试；已观察到 3 次。`, "[cxb] 原因：认证已过期",
-  ]);
+  const fix = remedies[category];
+  expect(upstreamNoticeLines(upstreamError({ category: category as UpstreamErrorCategory }))).toEqual(
+    fix ? [`[cxb] ${label}（HTTP 401），Codex 正在重试；已观察到 3 次。`, "[cxb] 原因：认证已过期", fix]
+      : [`[cxb] ${label}（HTTP 401），Codex 正在重试；已观察到 3 次。`, "[cxb] 原因：认证已过期"]);
 });
 test("HTTP、变体名与无括注，true／false／null 及已结束措辞逐字", () => {
   expect(upstreamNoticeLines(upstreamError({ willRetry: false }))[0]).toBe("[cxb] 上游认证失败（HTTP 401），上游已报告终止错误，等待轮次结束确认。");
@@ -185,4 +191,85 @@ test("runId 未确认的终态快照也必须缓冲，销毁后保持静默", as
   const before = [...o.lines];
   o.emit(2); o.observed.apply(runResult({ upstreamError: upstreamError(), diagnosticRevision: 3 }));
   expect(o.lines).toEqual(before);
+});
+
+test("订阅共享两类：标签、原因与改法行逐字", () => {
+  for (const [category, fix] of Object.entries(remedies)) {
+    const label = categories[category as UpstreamErrorCategory]!;
+    const error = upstreamError({ category: category as UpstreamErrorCategory, message: "正文", additionalDetails: "详情" });
+    expect(upstreamNoticeLines(error)).toEqual([
+      `[cxb] ${label}（HTTP 401），Codex 正在重试；已观察到 3 次。`, "[cxb] 原因：详情", fix,
+    ]);
+    expect(upstreamShowLines(runResult({ upstreamError: error, state: "running" }))).toEqual([
+      `最近上游报错：${label}（HTTP 401）；3 次；首次 1970-01-01T00:00:01.000Z，最近 1970-01-01T00:00:02.000Z；仍在重试`,
+      "原因：详情", fix.replace("[cxb] ", ""),
+    ]);
+  }
+});
+test("子代理订阅共享报错同样带改法且同类只说一遍", () => {
+  const o = observer();
+  try {
+    const child = (category: UpstreamErrorCategory, threadId = "child-1") => ({ threadId, parentThreadId: "parent", upstreamError: upstreamError({ threadId, category }) });
+    o.fake.emit("broker/run/updated", { runId: "run-test", threadId: "thread-test", diagnosticRevision: 1,
+      upstreamError: null, childUpstreamErrors: [child("subscriptionSharingUnsupported")], lastProgressAt: null, state: "running", status: null });
+    expect(o.lines).toEqual([
+      "[cxb] 子代理 child-1 订阅共享登录不支持子代理等能力（HTTP 401），Codex 正在重试；已观察到 3 次。",
+      "[cxb] 原因：认证已过期",
+      remedies.subscriptionSharingUnsupported,
+    ]);
+    // 同一类再说一遍时改法不再重复。
+    o.clock(30_000);
+    o.fake.emit("broker/run/updated", { runId: "run-test", threadId: "thread-test", diagnosticRevision: 2,
+      upstreamError: null, childUpstreamErrors: [child("subscriptionSharingUnsupported", "child-2"), child("subscriptionSharingUsageLimit", "child-3")], lastProgressAt: null, state: "running", status: null });
+    expect(o.lines[o.lines.length - 2]).toBe("[cxb] 原因：认证已过期");
+    expect(o.lines.filter(line => line.includes("改法"))).toEqual([remedies.subscriptionSharingUnsupported, remedies.subscriptionSharingUsageLimit]);
+  } finally { o.dispose(); }
+});
+test("额度用完触发即停句带标签；能力不支持不触发", () => {
+  const o = observer();
+  try {
+    o.fake.emit("broker/run/updated", { runId: "run-test", threadId: "thread-test", diagnosticRevision: 1,
+      upstreamError: upstreamError({ category: "subscriptionSharingUsageLimit" }), interruptReason: "upstreamAccessError",
+      lastProgressAt: null, state: "running", status: null });
+    expect(o.lines).toContain("[cxb] 已按 --upstream-error-policy stop-access 停止本次运行：订阅共享额度已用完（HTTP 401）。");
+    o.fake.emit("broker/run/updated", { runId: "run-test", threadId: "thread-test", diagnosticRevision: 2,
+      upstreamError: upstreamError({ category: "subscriptionSharingUnsupported" }), interruptReason: null,
+      lastProgressAt: null, state: "running", status: null });
+    expect(o.lines.filter(line => line.includes("stop-access"))).toHaveLength(1);
+  } finally { o.dispose(); }
+});
+test("失败摘要补一次改法行且不重复", () => {
+  const o = observer();
+  try {
+    const run = o.observed.apply(runResult({ status: "failed", diagnosticRevision: 1,
+      upstreamError: upstreamError({ category: "subscriptionSharingUsageLimit", willRetry: false }),
+      turns: [{ ...runResult().turns[0]!, status: "failed", error: { message: "共享额度已用完", codexErrorInfo: "other" } }] }));
+    o.observed.failure(run); o.observed.failure(run);
+    expect(o.lines.filter(line => line.includes("改法"))).toEqual([remedies.subscriptionSharingUsageLimit]);
+  } finally { o.dispose(); }
+});
+test("订阅共享两类：真实形状无 HTTP 状态码逐字", () => {
+  // 上游真实报错是 HTTP 400、codexErrorInfo 为 "other"，broker 不带状态码。
+  const shape = { httpStatusCode: null, codexErrorInfo: "other" as const };
+  expect(upstreamNoticeLines(upstreamError({ category: "subscriptionSharingUnsupported", ...shape }))).toEqual([
+    "[cxb] 订阅共享登录不支持子代理等能力，Codex 正在重试；已观察到 3 次。", "[cxb] 原因：认证已过期",
+    remedies.subscriptionSharingUnsupported,
+  ]);
+  expect(upstreamNoticeLines(upstreamError({ category: "subscriptionSharingUsageLimit", ...shape }))).toEqual([
+    "[cxb] 订阅共享额度已用完，Codex 正在重试；已观察到 3 次。", "[cxb] 原因：认证已过期",
+    remedies.subscriptionSharingUsageLimit,
+  ]);
+  expect(upstreamShowLines(runResult({ upstreamError: upstreamError({ category: "subscriptionSharingUsageLimit", ...shape }), state: "running" }))).toEqual([
+    "最近上游报错：订阅共享额度已用完；3 次；首次 1970-01-01T00:00:01.000Z，最近 1970-01-01T00:00:02.000Z；仍在重试",
+    "原因：认证已过期", remedies.subscriptionSharingUsageLimit.replace("[cxb] ", ""),
+  ]);
+});
+test("额度用完真实形状触发即停句", () => {
+  const o = observer();
+  try {
+    o.fake.emit("broker/run/updated", { runId: "run-test", threadId: "thread-test", diagnosticRevision: 1,
+      upstreamError: upstreamError({ category: "subscriptionSharingUsageLimit", httpStatusCode: null, codexErrorInfo: "other" }),
+      interruptReason: "upstreamAccessError", lastProgressAt: null, state: "running", status: null });
+    expect(o.lines).toContain("[cxb] 已按 --upstream-error-policy stop-access 停止本次运行：订阅共享额度已用完。");
+  } finally { o.dispose(); }
 });

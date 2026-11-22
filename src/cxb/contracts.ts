@@ -336,7 +336,7 @@ export interface RunModelSummary {
 export type ModelRun = RunResult | RunModelSummary;
 
 export type UpstreamErrorCategory = "authentication" | "paymentRequired" | "permissionDenied" | "usageLimit"
-  | "rateLimit" | "server" | "network" | "unknown";
+  | "rateLimit" | "server" | "network" | "subscriptionSharingUnsupported" | "subscriptionSharingUsageLimit" | "unknown";
 export type UpstreamErrorSource = "errorNotification" | "turnCompleted" | "rpcResponse";
 /** broker 已脱敏的最近一组上游诊断；CLI 展示前仍会再次脱敏。 */
 export interface UpstreamError {
