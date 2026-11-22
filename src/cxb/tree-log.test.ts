@@ -48,7 +48,8 @@ describe("树日志解析与静态保留窗口", () => {
   test("新标志的损坏 JSON 或缺失字段严格报错，不能回退成正文", () => {
     const { itemId: _missing, ...incomplete } = payload();
     for (const bad of ["\t@cxb2", "\t@cxb2 {", "\t@cxb2\t{", `\t@cxb2 ${JSON.stringify({ ...payload(), truncated: "false" })}`,
-      `\t@cxb2 ${JSON.stringify({ ...payload(), threadId: "" })}`, `\t@cxb2 ${JSON.stringify(incomplete)}`]) {
+      `\t@cxb2 ${JSON.stringify({ ...payload(), threadId: "" })}`, `\t@cxb2 ${JSON.stringify({ ...payload(), summaryId: "" })}`,
+      `\t@cxb2 ${JSON.stringify({ ...payload(), summaryId: 7 })}`, `\t@cxb2 ${JSON.stringify(incomplete)}`]) {
       write(`${ts} run-test 轮次开始 ${bad}\n`);
       expect(() => readRunLog(dir, "abcd1234")).toThrow("损坏的 @cxb2 行");
       expect(() => readRunLogSnapshot(dir, "abcd1234")).toThrow("损坏的 @cxb2 行");
@@ -416,5 +417,75 @@ describe("show 静态树日志离线接口", () => {
       await show(t.ctx);
       expect(t.json[0].runs[0].items).toEqual([{ ts, kind: "轮次开始", text: "轮次开始 根" }]);
     }
+  });
+});
+
+describe("同一摘要迟到确认的读取合并", () => {
+  const t1 = "2026-11-02T00:00:01.000Z";
+  const t2 = "2026-11-02T00:00:02.000Z";
+  const t3 = "2026-11-02T00:00:03.000Z";
+  const row = (id: string, runId: string, extra: Partial<TreeLogPayload>, stamp: string) =>
+    line({ eventId: id, summaryId: "42:s3", threadId: "乙", parentThreadId: "thread-test", shortId: null,
+      sourceRole: "subagent", turnId: "目标", itemId: "same-item", summary: "同毫秒同正文", ...extra },
+      "条目完成", stamp, runId);
+  const runs = () => [runResult({ runId: "run-a" }), runResult({ runId: "run-b", startedAt: 1100 })];
+
+  test("同一运行先未确认后确认时只显示确认版，其他运行的副本保留", async () => {
+    ledger(dir, runs());
+    write(row("42:7", "run-a", { attribution: "unconfirmed" }, t1)
+      + row("42:8", "run-b", { attribution: "unconfirmed" }, t2)
+      + row("42:12", "run-a", { late: true }, t3));
+    const tree = treeTimeline("thread-test", readRunLog(dir, "abcd1234")!, runs());
+    expect(tree.items.map((item) => [item.eventId, item.runId])).toEqual([["42:8", "run-b"], ["42:12", "run-a"]]);
+    expect(tree.items[0]).toMatchObject({ attribution: "unconfirmed" });
+    expect("late" in tree.items[0]!).toBe(false);
+    expect(tree.items[1]).toMatchObject({ runId: "run-a", late: true });
+    expect("attribution" in tree.items[1]!).toBe(false);
+    expect(tree.items.every((item) => !("summaryId" in item))).toBe(true);
+    const run = async (...args: string[]) => {
+      const t = context(dir, ["show", "abcd", ...args]);
+      expect(await show(t.ctx)).toBe(0);
+      return t;
+    };
+    const json = (await run("--log", "--tree", "--json")).json[0];
+    expect(json.items.map((item: { eventId: string }) => item.eventId)).toEqual(["42:8"]);
+    const folded = (await run("--log", "--tree")).texts.join("");
+    expect(folded).toContain("1 条摘要归属未确认");
+    expect(folded).not.toContain("同毫秒同正文");
+    const full = (await run("--log", "--tree", "--full")).texts.join("");
+    expect(full.match(/同毫秒同正文/g)).toHaveLength(2);
+    expect(full).toContain("[run-b][子 乙 ← abcd1234] [归属未确认] 条目完成 同毫秒同正文");
+    expect(full).toContain("[run-a][子 乙 ← abcd1234] 条目完成 同毫秒同正文");
+    const fullJson = (await run("--log", "--tree", "--full", "--json")).json[0];
+    expect(fullJson.items.map((item: { eventId: string }) => item.eventId)).toEqual(["42:8", "42:12"]);
+    expect(fullJson.items[1]).toMatchObject({ runId: "run-a", late: true });
+    expect("attribution" in fullJson.items[1]).toBe(false);
+    expect(fullJson.items.every((item: object) => !("summaryId" in item))).toBe(true);
+    const tail = (await run("--tail", "--tree", "--json")).json[0];
+    expect(tail.items.map((item: { eventId: string }) => item.eventId)).toEqual(["42:8", "42:12"]);
+  });
+
+  test("轮转备份的未确认版与活动文件的确认版同样合并", () => {
+    ledger(dir, runs());
+    write(row("42:7", "run-a", { attribution: "unconfirmed" }, t1), ".1");
+    write(row("42:12", "run-a", { late: true }, t2));
+    const snapshot = readRunLogSnapshot(dir, "abcd1234");
+    expect(snapshot.issues).toEqual([{ code: "rotationWindow" }]);
+    const tree = treeTimeline("thread-test", snapshot.lines!, runs());
+    expect(tree.items.map((item) => item.eventId)).toEqual(["42:12"]);
+    expect(tree.items[0]).toMatchObject({ runId: "run-a", late: true });
+    expect("attribution" in tree.items[0]!).toBe(false);
+  });
+
+  test("同一运行全是未确认版时保留第一条，没有 summaryId 的行照旧", () => {
+    ledger(dir, runs());
+    write(row("42:7", "run-a", { attribution: "unconfirmed" }, t1)
+      + row("42:9", "run-a", { attribution: "unconfirmed" }, t2)
+      + line({ eventId: "42:10", threadId: "乙", parentThreadId: "thread-test", shortId: null,
+        sourceRole: "subagent", turnId: "目标", itemId: "same-item", summary: "同毫秒同正文",
+        attribution: "unconfirmed" }, "条目完成", t3, "run-a"));
+    const tree = treeTimeline("thread-test", readRunLog(dir, "abcd1234")!, runs());
+    expect(tree.items.map((item) => item.eventId)).toEqual(["42:7", "42:10"]);
+    expect(tree.items.every((item) => item.attribution === "unconfirmed")).toBe(true);
   });
 });

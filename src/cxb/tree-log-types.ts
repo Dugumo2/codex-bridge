@@ -10,6 +10,8 @@ export interface TreeLogPayload {
   itemId: string | null;
   summary: string;
   truncated: boolean;
+  /** 暂存摘要的稳定身份：同一摘要在各候选运行的副本和迟到确认补写共用同一个值；直接写入的行没有此字段。 */
+  summaryId?: string;
   late?: boolean;
   attribution?: "unconfirmed";
   coverageIssue?: "beforeBindingUnknown" | "discoveryIncomplete";
