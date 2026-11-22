@@ -35,7 +35,7 @@ fn candidate(m: &mut Machine, mock: &mut SubagentMock, thread: &str) {
     mock.inject(m, started);
 }
 
-fn history(m: &mut Machine, thread: &str) {
+pub(super) fn history(m: &mut Machine, thread: &str) {
     m.runs.index.child_history.remember(
         "历史运行",
         P,
