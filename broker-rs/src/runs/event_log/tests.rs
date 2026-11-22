@@ -1061,6 +1061,7 @@ fn gap_wu_文件和派生等待只保护对应运行的历史候选() {
                         call: None,
                         deadline_ms: 50_000,
                         wall_ms: 1000,
+                        lost_at_arrival: false,
                         child: "乙".into(),
                         child_turns: vec![],
                         events: vec![],

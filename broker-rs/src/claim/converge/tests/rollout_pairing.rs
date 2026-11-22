@@ -87,7 +87,7 @@ pub(super) fn poll_for(m: &mut Machine, mock: &SubagentMock, ms: u64) -> Vec<Act
     all
 }
 
-fn awaiting(m: &Machine, id: &str) -> bool {
+pub(super) fn awaiting(m: &Machine, id: &str) -> bool {
     m.relations
         .aux
         .rollout

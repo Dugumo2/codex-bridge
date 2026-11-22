@@ -87,6 +87,9 @@ pub struct RolloutWait {
     pub deadline_ms: u64,
     /// Interacted 到达时的墙钟毫秒，用来给末尾窗口里的旧消息定下限。
     pub wall_ms: u64,
+    /// 建等待那一刻父线程带着有效的失记标志；等到期仍没拿到调用时按它判未证明，
+    /// 不按到期那一刻再查标志（标志可能在等到期之前已失效）。
+    pub lost_at_arrival: bool,
     pub child: String,
     /// Interacted 到达时接收方已观察到的轮次：退回宽松时据此还原旧版当时会配的那一轮。
     pub child_turns: Vec<String>,
@@ -282,6 +285,7 @@ impl Machine {
             call: cached,
             deadline_ms: self.clock.mono_ms.saturating_add(ROLLOUT_WAIT_MS),
             wall_ms: self.clock.now_ms,
+            lost_at_arrival: self.rollout_lost_marked(&key.parent_thread_id),
             child: child.into(),
             child_turns,
             events: vec![(item.clone(), completed)],
@@ -397,6 +401,18 @@ impl Machine {
             })
     }
 
+    /// 父线程此刻带着本代际未失效的失记标志（写满的缓存丢下过它的调用）。
+    fn rollout_lost_marked(&self, parent: &str) -> bool {
+        self.relations
+            .aux
+            .rollout
+            .lost_calls
+            .get(parent)
+            .is_some_and(|(epoch, until)| {
+                *epoch == self.relations.conn_epoch && self.clock.mono_ms < *until
+            })
+    }
+
     fn rollout_decision(&self, key: &EvidenceKey, wait: &RolloutWait) -> Option<Decision> {
         let Some(op) = self.relations.operations.get(key) else {
             return Some(Decision::Fallback(V2FallbackReason::RolloutCancelled));
@@ -456,17 +472,9 @@ impl Machine {
         }
         // 这个父线程读到过调用但被写满的缓存丢下：等到期仍没拿到自己的调用时
         // 不是「缺调用」，宽松回退会错绑接收方的轮次，置为未证明。
-        if expired
-            && self
-                .relations
-                .aux
-                .rollout
-                .lost_calls
-                .get(&key.parent_thread_id)
-                .is_some_and(|(epoch, until)| {
-                    *epoch == self.relations.conn_epoch && self.clock.mono_ms < *until
-                })
-        {
+        // 标志按等待建立那一刻登记，也查此刻的实时判断：标志可能在等到期之前失效，
+        // 也可能在建等待之后才出现（等待先建、父文件之后才因缓存写满丢下调用）。
+        if expired && (wait.lost_at_arrival || self.rollout_lost_marked(&key.parent_thread_id)) {
             return Some(Decision::Unproven);
         }
         expired.then_some(Decision::Fallback(V2FallbackReason::RolloutCallMissing))
