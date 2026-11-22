@@ -1749,7 +1749,9 @@ fn 核对未绑定候选(m: &Machine) {
             .operations
             .values()
             .any(|o| o.receivers.contains(C)
-                && (o.outcome == EvidenceOutcome::Pending || o.proof_expired)),
+                && (o.outcome == EvidenceOutcome::Pending
+                    || (o.outcome == EvidenceOutcome::Unproven
+                        && m.clock.mono_ms >= o.expires_at_ms))),
         "前置：没有在途或过期的归属证据"
     );
     assert!(!m.relations.aux.rollout.waits.values().any(|w| w.child == C));
@@ -2956,6 +2958,34 @@ fn gap_wu_预读满丢下的留言等到期判未证明而不宽松绑定() {
     assert!(
         op(&m, "留言").proven_turns.is_empty(),
         "之后开始的轮不被这次操作绑定"
+    );
+    // 接缝：失记操作仍先计入 pending，按登记时的证据期限移出，不等收敛总期限。
+    let key = op(&m, "留言").key.clone();
+    let ledger = &m.convergences.ledgers[R];
+    assert!(
+        ledger.pending.contains(&key),
+        "未证明的失记操作先计入 pending"
+    );
+    assert_eq!(
+        ledger.unproven_deadlines.get(&key),
+        Some(&op(&m, "留言").expires_at_ms),
+        "结算期限登记为证据期限"
+    );
+    m.clock.mono_ms = op(&m, "留言").expires_at_ms;
+    m.convergence_sync_facts(R);
+    assert!(
+        !m.convergences.ledgers[R].pending.contains(&key),
+        "证据期限一到失记操作移出 pending"
+    );
+    assert!(!m.convergences.ledgers[R]
+        .unproven_deadlines
+        .contains_key(&key));
+    assert!(
+        m.convergences.ledgers[R]
+            .placeholder_operations
+            .values()
+            .all(|reasons| !reasons.contains(&key)),
+        "占位一并清掉"
     );
 }
 

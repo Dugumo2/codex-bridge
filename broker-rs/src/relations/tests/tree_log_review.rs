@@ -223,7 +223,7 @@ fn gap_wu_祖先未绑定的孙摘要超限与到期均保留() {
             .values()
             .any(|op| op.receivers.contains(G)
                 && op.outcome == EvidenceOutcome::Unproven
-                && op.proof_expired),
+                && m.clock.mono_ms >= op.expires_at_ms),
         "前置：孙的派生证据到期转未证明"
     );
     let expired = mock.inject(
