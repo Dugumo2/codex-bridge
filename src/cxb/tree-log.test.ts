@@ -489,3 +489,28 @@ describe("同一摘要迟到确认的读取合并", () => {
     expect(tree.items.every((item) => item.attribution === "unconfirmed")).toBe(true);
   });
 });
+
+// 以下四行从 Rust 用例 `gap_wu_迟到确认沿用同一身份补写确认版` 实际写出的 AppendLog 行原样复制，不得手改。
+const RUST_LINES = [
+  "1970-01-01T00:00:01.000Z run-a 条目完成 \t@cxb2 {\"attribution\":\"unconfirmed\",\"eventId\":\"42:3\",\"itemId\":\"第一条\",\"parentThreadId\":\"root\",\"rootThreadId\":\"root\",\"shortId\":null,\"sourceRole\":\"subagent\",\"summary\":\"第一条\",\"summaryId\":\"42:s1\",\"threadId\":\"乙\",\"truncated\":false,\"turnId\":\"目标\"}",
+  "1970-01-01T00:00:01.000Z run-b 条目完成 \t@cxb2 {\"attribution\":\"unconfirmed\",\"eventId\":\"42:4\",\"itemId\":\"第一条\",\"parentThreadId\":\"root\",\"rootThreadId\":\"root\",\"shortId\":null,\"sourceRole\":\"subagent\",\"summary\":\"第一条\",\"summaryId\":\"42:s1\",\"threadId\":\"乙\",\"truncated\":false,\"turnId\":\"目标\"}",
+  "1970-01-01T00:00:01.000Z run-a 条目完成 \t@cxb2 {\"eventId\":\"42:5\",\"itemId\":\"第一条\",\"late\":true,\"parentThreadId\":\"root\",\"rootThreadId\":\"root\",\"shortId\":null,\"sourceRole\":\"subagent\",\"summary\":\"第一条\",\"summaryId\":\"42:s1\",\"threadId\":\"乙\",\"truncated\":false,\"turnId\":\"目标\"}",
+  "1970-01-01T00:00:01.000Z run-a 条目完成 \t@cxb2 {\"eventId\":\"42:6\",\"itemId\":\"第二条\",\"late\":true,\"parentThreadId\":\"root\",\"rootThreadId\":\"root\",\"shortId\":null,\"sourceRole\":\"subagent\",\"summary\":\"第二条\",\"summaryId\":\"42:s2\",\"threadId\":\"乙\",\"truncated\":false,\"turnId\":\"目标\"}",
+];
+
+describe("写入端实写行经读取端合并", () => {
+  test("同一运行恰一条确认版，其他候选运行的未确认副本保留", () => {
+    writeFileSync(join(dir, "runs", "00000000.log"), RUST_LINES.map((row) => row + "\n").join(""));
+    const snapshot = readRunLogSnapshot(dir, "00000000");
+    expect(snapshot.lines).toHaveLength(4);
+    const tree = treeTimeline("root", snapshot.lines!, [runResult({ runId: "run-a" }), runResult({ runId: "run-b" })], snapshot.issues);
+    const first = tree.items.filter((item) => item.itemId === "第一条");
+    const mine = first.filter((item) => item.runId === "run-a");
+    expect(mine).toHaveLength(1);
+    expect(mine[0]).toMatchObject({ eventId: "42:5", late: true });
+    expect("attribution" in mine[0]!).toBe(false);
+    expect(first.filter((item) => item.runId === "run-b")).toEqual([expect.objectContaining({ eventId: "42:4", attribution: "unconfirmed" })]);
+    const second = tree.items.filter((item) => item.itemId === "第二条");
+    expect(second).toEqual([expect.objectContaining({ runId: "run-a", eventId: "42:6", late: true })]);
+  });
+});
