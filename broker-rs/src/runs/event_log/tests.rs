@@ -484,7 +484,6 @@ fn evidence_to(
     receiver: &str,
     kind: EvidenceKind,
     outcome: EvidenceOutcome,
-    proof_expired: bool,
     rejected: bool,
 ) {
     let id = "条目";
@@ -517,7 +516,6 @@ fn evidence_to(
             v2_source: V2EvidenceSource::None,
             v2_fallback: None,
             rollout_arrival: None,
-            proof_expired,
             lenient_floor: None,
             first_seen_ms: 0,
             expires_at_ms: 1,
@@ -529,13 +527,12 @@ fn evidence_to(
 #[test]
 fn gap_wu_历史线程无论证据状态都按未确认保存() {
     use EvidenceOutcome::{Failed, Unproven};
-    // 结算不再排除历史子代理：五种证据状态都保存一行归属未确认。
-    for (kind, outcome, expired, rejected) in [
-        (EvidenceKind::V2Interacted, Unproven, true, false),
-        (EvidenceKind::V2Interacted, Unproven, true, true),
-        (EvidenceKind::V2Interacted, Unproven, false, false),
-        (EvidenceKind::V2Completed, Unproven, false, false),
-        (EvidenceKind::V1ResumeAgent, Failed, true, false),
+    // 结算不再排除历史子代理：几种证据状态都保存一行归属未确认。
+    for (kind, outcome, rejected) in [
+        (EvidenceKind::V2Interacted, Unproven, false),
+        (EvidenceKind::V2Interacted, Unproven, true),
+        (EvidenceKind::V2Completed, Unproven, false),
+        (EvidenceKind::V1ResumeAgent, Failed, false),
     ] {
         let mut m = setup();
         candidate(&mut m, "历史线程", "root");
@@ -544,7 +541,7 @@ fn gap_wu_历史线程无论证据状态都按未确认保存() {
             "entries":{"历史线程":{"run-old":{"rootThreadId":"root","observedAt":1}}}
         }))
         .unwrap();
-        evidence_to(&mut m, "历史线程", kind, outcome, expired, rejected);
+        evidence_to(&mut m, "历史线程", kind, outcome, rejected);
         assert!(m.historical_subagent_for_run("run-a", "历史线程"), "前置");
         let mut a = vec![];
         m.buffer_child_event_log(
@@ -560,11 +557,7 @@ fn gap_wu_历史线程无论证据状态都按未确认保存() {
         m.sweep_event_log(generation);
         m.settle_event_log_step(&mut a);
         let rows = logs(&a);
-        assert_eq!(
-            rows.len(),
-            1,
-            "{kind:?}/{outcome:?}/过期{expired}/被拒{rejected}"
-        );
+        assert_eq!(rows.len(), 1, "{kind:?}/{outcome:?}/被拒{rejected}");
         assert!(rows.iter().all(|l| l.2 == "条目完成"
             && l.3["attribution"] == "unconfirmed"
             && l.3["summary"] == "同毫秒同正文"
@@ -776,7 +769,6 @@ fn gap_wu_在途配对续期有独立上限() {
         EvidenceKind::V2Interacted,
         EvidenceOutcome::Pending,
         false,
-        false,
     );
     let op = m.relations.operations.values_mut().next().unwrap();
     op.run_id = "run-a".into();
@@ -807,7 +799,6 @@ fn gap_wu_候选运行定案并淘汰前保存() {
         "乙",
         EvidenceKind::V2Interacted,
         EvidenceOutcome::Pending,
-        false,
         false,
     );
     let mut actions = vec![];
@@ -851,7 +842,6 @@ fn gap_wu_证据过期后按接纳顺序取回两条摘要() {
         EvidenceKind::V2Interacted,
         EvidenceOutcome::Pending,
         false,
-        false,
     );
     let mut actions = vec![];
     for id in ["第一条", "第二条"] {
@@ -864,7 +854,9 @@ fn gap_wu_证据过期后按接纳顺序取回两条摘要() {
     m.settle_event_log_step(&mut actions);
     assert!(logs(&actions).is_empty());
     m.facts_expire(&mut actions);
-    assert!(m.relations.operations.values().any(|op| op.proof_expired));
+    assert!(m.relations.operations.values().any(|op| {
+        op.outcome == EvidenceOutcome::Unproven && m.clock.mono_ms >= op.expires_at_ms
+    }));
     m.clock.mono_ms += PENDING_MS;
     m.settle_event_log_step(&mut actions);
     let rows = logs(&actions);
@@ -983,7 +975,6 @@ fn gap_wu_证据实际到期并淘汰后历史摘要仍按未确认保存() {
         EvidenceKind::V1ResumeAgent,
         EvidenceOutcome::Pending,
         false,
-        false,
     );
     let key = m.relations.operations.keys().next().unwrap().clone();
     let mut actions = vec![];
@@ -998,13 +989,16 @@ fn gap_wu_证据实际到期并淘汰后历史摘要仍按未确认保存() {
     assert_eq!(m.runs.event_log.pending.len(), 2);
     m.clock.mono_ms = 2;
     m.facts_expire(&mut actions);
-    assert!(m.relations.operations[&key].proof_expired);
+    assert_eq!(
+        m.relations.operations[&key].outcome,
+        EvidenceOutcome::Unproven,
+        "证据已实际到期转未证明"
+    );
     for i in 1..MAX_OPERATIONS {
         let mut other = m.relations.operations[&key].clone();
         other.key.item_id = format!("旧条目{i}");
         other.first_seen_ms = 1;
         other.receivers.clear();
-        other.proof_expired = false;
         m.relations.operations.insert(other.key.clone(), other);
     }
     m.on_relation_notification(
@@ -1052,7 +1046,6 @@ fn gap_wu_文件和派生等待只保护对应运行的历史候选() {
                 "乙",
                 EvidenceKind::V2Interacted,
                 EvidenceOutcome::Pending,
-                false,
                 false,
             );
             let op = m.relations.operations.values_mut().next().unwrap();
@@ -1197,7 +1190,6 @@ async fn gap_wu_历史线程淘汰后才到的摘要按未确认保存并可取�
         EvidenceKind::V1ResumeAgent,
         EvidenceOutcome::Pending,
         false,
-        false,
     );
     let key = m.relations.operations.keys().next().unwrap().clone();
     let mut actions = vec![];
@@ -1212,13 +1204,16 @@ async fn gap_wu_历史线程淘汰后才到的摘要按未确认保存并可取�
     // 证据实际到期并把操作表填满到上限，新通知真正淘汰掉它。
     m.clock.mono_ms = 2;
     m.facts_expire(&mut actions);
-    assert!(m.relations.operations[&key].proof_expired);
+    assert_eq!(
+        m.relations.operations[&key].outcome,
+        EvidenceOutcome::Unproven,
+        "证据已实际到期转未证明"
+    );
     for i in 1..MAX_OPERATIONS {
         let mut other = m.relations.operations[&key].clone();
         other.key.item_id = format!("旧条目{i}");
         other.first_seen_ms = 1;
         other.receivers.clear();
-        other.proof_expired = false;
         m.relations.operations.insert(other.key.clone(), other);
     }
     m.on_relation_notification(
@@ -1309,7 +1304,6 @@ fn gap_wu_淘汰前后的明确失败都保存且不授予管理权() {
             EvidenceKind::V1ResumeAgent,
             EvidenceOutcome::Pending,
             false,
-            false,
         );
         let key = m.relations.operations.keys().next().unwrap().clone();
         let failed = Some(
@@ -1323,13 +1317,16 @@ fn gap_wu_淘汰前后的明确失败都保存且不授予管理权() {
         // 证据到期并把操作表填满，新通知真正淘汰它。
         m.clock.mono_ms = 2;
         m.facts_expire(&mut actions);
-        assert!(m.relations.operations[&key].proof_expired);
+        assert_eq!(
+            m.relations.operations[&key].outcome,
+            EvidenceOutcome::Unproven,
+            "证据已实际到期转未证明"
+        );
         for i in 1..MAX_OPERATIONS {
             let mut other = m.relations.operations[&key].clone();
             other.key.item_id = format!("旧条目{i}");
             other.first_seen_ms = 1;
             other.receivers.clear();
-            other.proof_expired = false;
             m.relations.operations.insert(other.key.clone(), other);
         }
         m.on_relation_notification(
@@ -1419,6 +1416,55 @@ fn gap_wu_迟到确认沿用同一身份补写确认版() {
         .iter()
         .all(|l| l.1 == "run-a" && l.3["late"] == true && l.3.get("attribution").is_none()));
     assert_eq!(confirmed[0].3["summaryId"], summary_id);
+    // 接缝：写出行经读取端合并（同一运行同一摘要只留一条，确认版取代未确认版）。
+    // 第一条：run-a 恰一条确认版，run-b 恰一条未确认版；第二条：run-a 恰一条确认版。
+    let mut merged: Vec<(String, serde_json::Value)> = vec![];
+    for (run, row) in unconfirmed
+        .iter()
+        .chain(confirmed.iter())
+        .map(|l| (l.1.clone(), l.3.clone()))
+    {
+        let pos = merged
+            .iter()
+            .position(|(r, m)| *r == run && m["summaryId"] == row["summaryId"]);
+        match pos {
+            Some(i)
+                if merged[i].1["attribution"] == "unconfirmed"
+                    && row["attribution"] != "unconfirmed" =>
+            {
+                merged[i] = (run, row);
+            }
+            Some(_) => {}
+            None => merged.push((run, row)),
+        }
+    }
+    for (item_id, count) in [("第一条", 2), ("第二条", 1)] {
+        let rows: Vec<_> = merged
+            .iter()
+            .filter(|(_, r)| r["itemId"] == item_id)
+            .collect();
+        assert_eq!(rows.len(), count, "{item_id} 合并后 {count} 条");
+    }
+    let first: Vec<_> = merged
+        .iter()
+        .filter(|(_, r)| r["itemId"] == "第一条")
+        .collect();
+    assert_eq!(first.len(), 2);
+    let run_a: Vec<_> = first
+        .iter()
+        .filter(|(r, _)| r.as_str() == "run-a")
+        .collect();
+    assert_eq!(run_a.len(), 1);
+    assert!(
+        run_a[0].1["late"] == true && run_a[0].1.get("attribution").is_none(),
+        "run-a 合并后恰一条且为确认版"
+    );
+    let run_b: Vec<_> = first
+        .iter()
+        .filter(|(r, _)| r.as_str() == "run-b")
+        .collect();
+    assert_eq!(run_b.len(), 1);
+    assert_eq!(run_b[0].1["attribution"], "unconfirmed");
     // 重复补写不再写。
     actions.clear();
     m.flush_bound_event_log("run-a", "乙", "目标", "root", &mut actions);

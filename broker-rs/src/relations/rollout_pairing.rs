@@ -502,6 +502,15 @@ impl Machine {
                     // 失记不是缺证据：仍记调用缺失的原因，结果置未证明，不宽松配对轮次。
                     op.v2_fallback = Some(V2FallbackReason::RolloutCallMissing);
                     op.outcome = EvidenceOutcome::Unproven;
+                    // 与登记时已未证明的失记跟进同口径：按证据期限移出 pending，不等收敛总期限。
+                    if !op.run_id.is_empty() {
+                        self.convergences
+                            .ledgers
+                            .entry(op.run_id.clone())
+                            .or_default()
+                            .unproven_deadlines
+                            .insert(key.clone(), op.expires_at_ms);
+                    }
                 }
             }
         }

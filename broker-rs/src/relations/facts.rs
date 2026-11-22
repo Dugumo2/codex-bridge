@@ -755,7 +755,6 @@ impl Machine {
                     },
                     v2_fallback,
                     rollout_arrival: None,
-                    proof_expired: false,
                     lenient_floor: None,
                     first_seen_ms: begin.as_ref().map_or(now, |start| start.at),
                     expires_at_ms: begin
@@ -1740,7 +1739,6 @@ impl Machine {
                 self.relations.aux.parent_waits.remove(&key);
                 if let Some(op) = self.relations.operations.get_mut(&key) {
                     op.outcome = EvidenceOutcome::Unproven;
-                    op.proof_expired = true;
                     op.proven_turns.clear();
                 }
             }
@@ -1762,8 +1760,7 @@ impl Machine {
             }
             if let Some(op) = self.relations.operations.get_mut(&key) {
                 if op.outcome == EvidenceOutcome::Pending {
-                    op.proof_expired = op.proven_turns.is_empty();
-                    op.outcome = if op.proof_expired {
+                    op.outcome = if op.proven_turns.is_empty() {
                         EvidenceOutcome::Unproven
                     } else {
                         EvidenceOutcome::Proven

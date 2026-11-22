@@ -17,8 +17,9 @@ pub struct ConvergenceLedger {
     pub result_versions: BTreeMap<(String, u64), u64>,
     pub overflow: bool,
     /// 「身份失记」操作的结算期限（登记时的证据期限）：期限内仍计入 pending，
-    /// 到期移出并清占位，不等收敛总期限。只覆盖登记时已未证明的失记跟进，
-    /// 其他来源的 Unproven（证据到期、定案不是自己的）不进这张表。
+    /// 到期移出并清占位，不等收敛总期限。覆盖登记时已未证明的失记跟进，
+    /// 以及预读缓存丢下调用、等到期判未证明的跟进；其他来源的 Unproven
+    /// （证据到期、定案不是自己的）不进这张表。
     pub unproven_deadlines: BTreeMap<EvidenceKey, u64>,
 }
 

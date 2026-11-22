@@ -196,9 +196,6 @@ pub struct EvidenceOperation {
     /// 按会话文件定为严格时，接收方和它在 Interacted 到达时已观察到的轮次。
     /// 之后文件丢失、降为宽松时，据此还原旧版当时会配的那一轮（`rollout_fallback_baseline`）。
     pub rollout_arrival: Option<(String, Vec<String>)>,
-    /// 等证据到期仍未证明归属；该候选须保留未确认摘要。
-    /// 只记事实的条目（如 completed）、定案不是自己的，也是未证明，但不算这种。
-    pub proof_expired: bool,
     /// 宽松配对只接受这个观察序号之后真实开始的轮（`live_turn_starts`）。当时会配哪一轮还原不了时设置：
     /// 之后读到的历史轮不是新轮，不能凭「不在基线里」获得资格。
     pub lenient_floor: Option<u64>,
