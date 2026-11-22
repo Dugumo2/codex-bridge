@@ -107,6 +107,8 @@ pub struct RolloutState {
     pub rollout_reads: BTreeMap<u64, ReadTicket>,
     pub next_read_id: u64,
     pub files: BTreeMap<String, RolloutFile>,
+    /// 被淘汰的冷却文件保留的失败截止：线程 →（连接代际, 冷却截止的单调毫秒, 原因）。上限同 `files`。
+    pub evicted_cooldowns: BTreeMap<String, (u64, u64, V2FallbackReason)>,
     pub waits: BTreeMap<EvidenceKey, RolloutWait>,
     /// (父线程, call_id) → 调用。读到时对应的 Interacted 可能还没来。
     pub calls: BTreeMap<(String, String), RolloutCall>,
@@ -197,16 +199,25 @@ impl Machine {
     }
 
     fn rollout_file_failed(&self, thread: &str) -> Option<V2FallbackReason> {
-        self.relations
-            .aux
-            .rollout
+        let state = &self.relations.aux.rollout;
+        let from_file = state
             .files
             .get(thread)
             .filter(|f| f.epoch == self.relations.conn_epoch)
             .and_then(|f| match f.path {
                 RolloutPathState::Failed(reason) if self.clock.mono_ms < f.next_at => Some(reason),
                 _ => None,
-            })
+            });
+        // 文件表里没有本代际未到期的失败时，查淘汰时保留的冷却。
+        from_file.or_else(|| {
+            state
+                .evicted_cooldowns
+                .get(thread)
+                .filter(|(e, until, _)| {
+                    *e == self.relations.conn_epoch && self.clock.mono_ms < *until
+                })
+                .map(|(_, _, reason)| *reason)
+        })
     }
 
     /// Interacted 首次到达、父线程没送过 raw、也没有开始记录：能用会话文件时进入「等文件」。
@@ -729,16 +740,45 @@ impl Machine {
             match file.map(|f| &f.path) {
                 None => {
                     if self.relations.aux.rollout.files.len() >= MAX_ROLLOUT_FILES {
-                        let idle = self
-                            .relations
+                        // 量保留表容量前，先删掉表里已到期或换代作废的项。
+                        self.relations
                             .aux
                             .rollout
-                            .files
+                            .evicted_cooldowns
+                            .retain(|_, (e, until, _)| *e == epoch && now < *until);
+                        let files = &self.relations.aux.rollout.files;
+                        let idle = |(t, f): &(&String, &RolloutFile)| {
+                            !needed.contains(*t) && f.reading.is_none()
+                        };
+                        let cooling = |f: &RolloutFile| {
+                            matches!(f.path, RolloutPathState::Failed(_)) && now < f.next_at
+                        };
+                        // 先选不在冷却中的空闲项；没有才选冷却中的，且保留表须有空位。
+                        let evict = files
                             .iter()
-                            .find(|(t, f)| !needed.contains(*t) && f.reading.is_none())
+                            .find(|e| idle(e) && !cooling(e.1))
+                            .or_else(|| {
+                                if self.relations.aux.rollout.evicted_cooldowns.len()
+                                    >= MAX_ROLLOUT_FILES
+                                {
+                                    None
+                                } else {
+                                    files.iter().find(|e| idle(e) && cooling(e.1))
+                                }
+                            })
                             .map(|(t, _)| t.clone());
-                        match idle {
+                        match evict {
                             Some(t) => {
+                                // 淘汰冷却文件时保留它的失败截止：截止前原线程不提前重取路径。
+                                if let Some(f) = self.relations.aux.rollout.files.get(&t) {
+                                    if let RolloutPathState::Failed(reason) = f.path {
+                                        self.relations
+                                            .aux
+                                            .rollout
+                                            .evicted_cooldowns
+                                            .insert(t.clone(), (epoch, f.next_at, reason));
+                                    }
+                                }
                                 self.relations.aux.rollout.files.remove(&t);
                             }
                             None => continue,
@@ -879,6 +919,7 @@ impl Machine {
         let state = &mut self.relations.aux.rollout;
         state.waits.clear();
         state.files.clear();
+        state.evicted_cooldowns.clear();
         state.calls.clear();
         if state.timer.take().is_some() {
             actions.push(Action::Unschedule {

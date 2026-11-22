@@ -12,6 +12,7 @@ const R: &str = "run-convergence";
 
 mod causal_pairing;
 mod lineage;
+mod pe_files;
 mod placeholder;
 mod rollout_pairing;
 mod unbound_turn;

@@ -2917,7 +2917,7 @@ fn 归属误报行数(all: &[Action]) -> usize {
 }
 
 /// 接收方登记为 P 的子代理：跟上跟平级检查之后的拒绝分支才走得进。
-fn child_edge(m: &mut Machine, child: &str) {
+pub(super) fn child_edge(m: &mut Machine, child: &str) {
     m.relations.edges.insert(
         child.into(),
         crate::relations::RelationEdge {
