@@ -97,6 +97,9 @@ fn error_event(thread: &str, turn: &str, message: &str, info: Value) -> Event {
     )
 }
 
+/// 样本 2 原文：订阅共享额度用完的 WebSocket 形状正文。
+const SS_USAGE_LIMIT_BODY: &str = r#"{"type":"error","status":400,"error":{"message":"The ChatGPT user has reached their Subscription Sharing usage limit. Ask the user to try again after their usage limit resets or use an API key instead.","type":"invalid_request_error","param":null,"code":"subscription_sharing_usage_limit_exceeded"}}"#;
+
 fn unauthorized(thread: &str, turn: &str) -> Event {
     error_event(thread, turn, "认证失败", json!("unauthorized"))
 }
@@ -501,4 +504,25 @@ fn 重启后子线程报错数组可读() {
     let wire = serde_json::to_value(&restored.runs.runs[R]).unwrap();
     assert_eq!(wire["childUpstreamErrors"][0]["threadId"], C);
     assert_eq!(wire["childUpstreamErrors"][0]["parentThreadId"], P);
+}
+
+#[test]
+fn ss_子线程报错进_child_upstream_errors按code归类() {
+    let (mut m, mut mock) = setup(false);
+    spawn(&mut m, &mut mock, C, "派生1", CT);
+    let actions = apply(
+        &mut m,
+        error_event(C, CT, SS_USAGE_LIMIT_BODY, json!("other")),
+    );
+    assert_eq!(
+        entry(&m, C).category,
+        UpstreamErrorCategory::SubscriptionSharingUsageLimit
+    );
+    assert_eq!(
+        run_updates(&actions)[0]["childUpstreamError"]["upstreamError"]["category"],
+        "subscriptionSharingUsageLimit"
+    );
+    // 已有类别的正文 code 不覆盖归类。
+    apply(&mut m, unauthorized(C, CT));
+    assert_eq!(entry(&m, C).category, UpstreamErrorCategory::Authentication);
 }

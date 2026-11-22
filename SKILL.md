@@ -43,7 +43,7 @@ cxb 是 Claude 与 Codex 之间的桥：每个工作区（git 顶层目录或当
 - `--continue`：只能配 `--resume`；补充说明只能写在命令行，不能用 `-f` 或标准输入；不能与 `--goal`、`--template` 同用；**沙箱与审批不继承原运行**，需要的话重新给 `-s`、`--approval`；`--run <runId>` 指定接哪次运行。cxb 会生成续跑提示（原始要求、已完成步骤、观察到的改动、未确认操作、目标原文），让 Codex 先核验工作区再继续。
 - goal：服务器会一轮接一轮自动续跑。broker 保留连续 3 轮无动作刹车，并累计同一运行的 goal 与汇总自动父轮（上限 50，不随 goal 变化重置）；`--budget` 覆盖父轮及已归属后代，汇总继续使用原额度。额度最后一轮可完成核实，仍需新工作才异常收尾。完成条件要写成可核验的状态。
 - **无进展期限** `--stall-timeout <秒>`（run、review；`cxb config stall-timeout <秒>`；默认 600，`0` 关闭）：broker 在期限内没观察到进展（输出、命令输出、计划、文件改动、token 增长等；重复的上游报错不算）就先核实一次，仍无进展才停止本次运行，退出 3。等回答审批／提问时不计时，detach 后照常计时。**期限的边界**：静默命令、MCP 工具、压缩、hook、深度推理都可能长时间没有可见事件，`InProgress` 只证明轮没结束、不证明卡死；预计会长时间静默的任务（大编译、长测试、长 MCP 调用）调大或设 0。
-- **访问报错即停** `--upstream-error-policy stop-access`（默认 `observe`；`cxb config upstream-error-policy …`）：只对认证、付费、权限三类结构化上游错误（HTTP 401／402／403，含子代理线程上的）停止本次运行，退出 4；不登出、不改账户、不重试。无人值守、怕空转烧时间的任务可以加。
+- **访问报错即停** `--upstream-error-policy stop-access`（默认 `observe`；`cxb config upstream-error-policy …`）：只对认证、付费、权限、订阅共享额度四类结构化上游错误（HTTP 401／402／403 与 `subscription_sharing_usage_limit_exceeded`，含子代理线程上的）停止本次运行，退出 4；不登出、不改账户、不重试。无人值守、怕空转烧时间的任务可以加。
 - **按线程关闭 MCP**（run、review）：Codex 每个线程各起一整套 MCP 服务（实测默认约 491 MB：backlog 约 253、serena 约 96、context7 约 44、sequential-thinking 约 32），子代理线程也各起一套。
   - 持久配置：`cxb config mcp-disabled backlog,serena`（逗号分隔，默认空 = 不改动）；`cxb config mcp-when-never off` 让审批为 never 时关闭全部 MCP（never 下需要审批的 MCP 工具调用会被拒；默认 `keep`）。`cxb doctor` 分别显示配置名单、预计有效关闭名单与无法核实或无效的名字。
   - 单次运行：`--mcp <名,...>` 豁免本次 cxb 的关闭策略（优先于上面两项），仍按 Codex 有效配置，不会启用 Codex 里已停用的服务；`--no-mcp <名,...>` 额外关闭；同一名字不能两边都写。

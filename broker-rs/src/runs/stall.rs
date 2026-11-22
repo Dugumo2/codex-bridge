@@ -710,6 +710,7 @@ impl Machine {
                 UpstreamErrorCategory::Authentication
                     | UpstreamErrorCategory::PaymentRequired
                     | UpstreamErrorCategory::PermissionDenied
+                    | UpstreamErrorCategory::SubscriptionSharingUsageLimit
             )
             || self.runs.access_stopped.contains(run)
             || self.closing

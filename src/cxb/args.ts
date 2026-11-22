@@ -201,7 +201,7 @@ const stallTimeout = value("stall-timeout", ["--stall-timeout"], "秒",
   "默认 600 秒内未观察到进展（输出、命令输出、token 增长等；重复的上游报错不算）会核实后停止本次运行，退出 3；等你回答／审批时不计时；静默命令、MCP 工具、深度推理等也可能长时间无可见事件，请调大或设 0。",
   (value) => CONFIG_SCHEMA["stall-timeout"].parse(value), 600);
 const upstreamErrorPolicy = value("upstream-error-policy", ["--upstream-error-policy"], "策略",
-  "observe（默认）只提示；stop-access 只对认证、付费、权限三类结构化错误停止本次运行，不登出、不改账户，退出 4。",
+  "observe（默认）只提示；stop-access 只对认证、付费、权限、订阅共享额度四类结构化错误停止本次运行，不登出、不改账户，退出 4。",
   (value) => CONFIG_SCHEMA["upstream-error-policy"].parse(value), "observe");
 const mcpOn = value("mcp", ["--mcp"], "名单",
   "豁免本次 cxb 关闭策略的 MCP 服务（逗号分隔）；仍按 Codex 有效配置，不会启用 Codex 里已停用的服务。", mcpList);
