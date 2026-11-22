@@ -1009,7 +1009,9 @@ fn 历史兄弟收到平级消息不算冲突_兄弟新轮在跑时仍阻塞收�
                 for line in lines {
                     let fields: Vec<_> = line.splitn(4, ' ').collect();
                     if fields[1] == R2 {
-                        let row: serde_json::Value = serde_json::from_str(fields[3].strip_prefix("\t@cxb2 ").unwrap()).unwrap();
+                        let row: serde_json::Value =
+                            serde_json::from_str(fields[3].strip_prefix("\t@cxb2 ").unwrap())
+                                .unwrap();
                         assert!(!(row["threadId"] == S && row["turnId"] == "兄弟新轮"));
                     }
                 }

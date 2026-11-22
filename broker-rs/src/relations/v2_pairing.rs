@@ -392,13 +392,16 @@ impl Machine {
         let now = self.clock.mono_ms;
         self.prune_followup_starts();
         if self.relations.aux.followup_starts.len() >= MAX_OPERATIONS {
-            if source == EvidenceSource::Raw && !call.trigger
+            if source == EvidenceSource::Raw
+                && !call.trigger
                 && !self.relations.aux.followup_starts.contains_key(&key)
             {
                 let epoch = self.relations.conn_epoch;
                 let until = now.saturating_add(EVIDENCE_TTL_MS);
                 let aux = &mut self.relations.aux;
-                if aux.raw_queue_receipts.len() < MAX_OPERATIONS || aux.raw_queue_receipts.contains_key(&key) {
+                if aux.raw_queue_receipts.len() < MAX_OPERATIONS
+                    || aux.raw_queue_receipts.contains_key(&key)
+                {
                     aux.raw_queue_receipts.insert(key, (epoch, until));
                 } else {
                     // 连身份也放不下时，仅在这批证据的有效期内禁止用缺开始记录猜测管理权。
@@ -978,8 +981,12 @@ impl Machine {
             .map(|op| op.key.clone())
             .collect();
         let aux = &mut self.relations.aux;
-        aux.raw_queue_receipts.retain(|_, (e, end)| *e == epoch && now < *end);
-        if aux.raw_queue_receipts_full.is_some_and(|(e, end)| e != epoch || now >= end) {
+        aux.raw_queue_receipts
+            .retain(|_, (e, end)| *e == epoch && now < *end);
+        if aux
+            .raw_queue_receipts_full
+            .is_some_and(|(e, end)| e != epoch || now >= end)
+        {
             aux.raw_queue_receipts_full = None;
         }
         let before = aux.followup_starts.len();

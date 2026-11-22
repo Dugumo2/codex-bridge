@@ -1167,17 +1167,39 @@ fn gap_wu_血缘回查的新鲜卸载退休旧票据() {
         mock.inject(&mut m, started);
         let (_, ev) = mock.request(C, Some("子轮"), None, APPROVAL);
         let actions = mock.inject(&mut m, ev);
-        let context = app_requests(&actions, "thread/read").into_iter().find(|ctx|
-            matches!(ctx.operation, Operation::RelationLookup { .. })).unwrap();
-        m.relations.aux.rollout.rollout_reads.insert(1, ReadTicket {
-            id:1, thread:C.into(), conn_epoch:m.relations.conn_epoch,
-            deadline:m.clock.mono_ms + 30_000, state:ReadTicketState::Active,
-        });
-        if stale { m.candidate_changed(C); }
+        let context = app_requests(&actions, "thread/read")
+            .into_iter()
+            .find(|ctx| matches!(ctx.operation, Operation::RelationLookup { .. }))
+            .unwrap();
+        m.relations.aux.rollout.rollout_reads.insert(
+            1,
+            ReadTicket {
+                id: 1,
+                thread: C.into(),
+                conn_epoch: m.relations.conn_epoch,
+                deadline: m.clock.mono_ms + 30_000,
+                state: ReadTicketState::Active,
+            },
+        );
+        if stale {
+            m.candidate_changed(C);
+        }
         let mut info = mock.thread_info(C).unwrap();
         info["status"] = json!({"type":"notLoaded"});
-        mock.inject(&mut m, Event::Reply { context:context.clone(), result:Ok(json!({"thread":info})) });
-        assert_eq!(m.relations.aux.rollout.rollout_reads[&1].state,
-            if stale { ReadTicketState::Active } else { ReadTicketState::Retired });
+        mock.inject(
+            &mut m,
+            Event::Reply {
+                context: context.clone(),
+                result: Ok(json!({"thread":info})),
+            },
+        );
+        assert_eq!(
+            m.relations.aux.rollout.rollout_reads[&1].state,
+            if stale {
+                ReadTicketState::Active
+            } else {
+                ReadTicketState::Retired
+            }
+        );
     }
 }

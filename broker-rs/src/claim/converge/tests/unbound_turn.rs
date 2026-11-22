@@ -149,7 +149,8 @@ fn gap_wu_未归属轮无论消息方向均保存原摘要() {
                 for line in lines {
                     let fields: Vec<_> = line.splitn(4, ' ').collect();
                     assert_ne!(fields[2], "记录缺口");
-                    let row: serde_json::Value = serde_json::from_str(fields[3].strip_prefix("\t@cxb2 ").unwrap()).unwrap();
+                    let row: serde_json::Value =
+                        serde_json::from_str(fields[3].strip_prefix("\t@cxb2 ").unwrap()).unwrap();
                     if row["itemId"] == "条目一" {
                         saved.push(row);
                     }

@@ -477,7 +477,10 @@ async fn gap_wu_摘要部分写失败重试一次取回且最终放弃有文件�
         disk.fail_after_log_bytes = Some(5);
         assert!(disk.append_log("runs/retry.log", line.as_bytes()).is_err());
         disk.append_log("runs/retry.log", line.as_bytes()).unwrap();
-        assert_eq!(fs::read_to_string(temp.dir().join("runs/retry.log")).unwrap(), line);
+        assert_eq!(
+            fs::read_to_string(temp.dir().join("runs/retry.log")).unwrap(),
+            line
+        );
     }
     let (store, _) = open(temp.config()).await.unwrap();
     let recovered = temp.dir().join("runs/recovered.log");
@@ -496,7 +499,10 @@ async fn gap_wu_摘要部分写失败重试一次取回且最终放弃有文件�
         lines: vec![line.trim_end().into()],
     });
     wait_for(|| store.status() == StorageStatus::Degraded).await;
-    assert_eq!(store.drain(Duration::from_secs(2)).await.abandoned, ["runs/failed.log"]);
+    assert_eq!(
+        store.drain(Duration::from_secs(2)).await.abandoned,
+        ["runs/failed.log"]
+    );
 }
 
 #[test]

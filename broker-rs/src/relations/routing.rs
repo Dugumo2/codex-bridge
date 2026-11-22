@@ -1227,7 +1227,12 @@ impl Machine {
         }
         match result {
             Ok(value) => {
-                let lookup = self.relations.aux.lookups.remove(thread).expect("回查身份已核对");
+                let lookup = self
+                    .relations
+                    .aux
+                    .lookups
+                    .remove(thread)
+                    .expect("回查身份已核对");
                 let info = value.get("thread").cloned().unwrap_or(Value::Null);
                 self.observe_metadata_unload(thread, &info, lookup.read_stamp);
                 match edge_from_thread_checked(&info, thread) {

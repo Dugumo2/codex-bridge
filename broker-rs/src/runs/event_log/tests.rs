@@ -178,7 +178,13 @@ fn gap_wu_无候选且发现失败只写运行级缺口() {
         state.version = 1;
         state.incomplete_reasons.push("listFailed".into());
         let mut actions = vec![];
-        m.buffer_child_event_log("未知", "item/completed", &item("未知", "虚构轮"), false, &mut actions);
+        m.buffer_child_event_log(
+            "未知",
+            "item/completed",
+            &item("未知", "虚构轮"),
+            false,
+            &mut actions,
+        );
         assert!(m.runs.event_log.pending.is_empty());
         if shutdown {
             m.shutdown_runs(&mut actions);
@@ -504,7 +510,8 @@ fn gap_wu_历史线程的过期疑点保留原文() {
         m.settle_event_log_step(&mut a);
         let rows = logs(&a);
         assert_eq!(rows.len(), usize::from(expect_saved));
-        assert!(rows.iter().all(|l| l.2 == "条目完成" && l.3["attribution"] == "unconfirmed"
+        assert!(rows.iter().all(|l| l.2 == "条目完成"
+            && l.3["attribution"] == "unconfirmed"
             && l.3["summary"] == "同毫秒同正文"));
     }
 }
@@ -593,7 +600,6 @@ impl Machine {
     }
 }
 
-
 fn 暂存(m: &mut Machine, turn: &str, actions: &mut Vec<Action>) {
     m.buffer_child_event_log("乙", "item/completed", &item("乙", turn), false, actions);
 }
@@ -606,9 +612,14 @@ fn 核对保存(actions: &[Action], turn: &str) {
     let row = selected[0];
     assert_eq!(row.1, "run-a");
     assert_eq!(row.2, "条目完成");
-    for (key, value) in [("summary", "同毫秒同正文"), ("itemId", "same-item"),
-        ("threadId", "乙"), ("parentThreadId", "root"), ("sourceRole", "subagent"),
-        ("attribution", "unconfirmed")] {
+    for (key, value) in [
+        ("summary", "同毫秒同正文"),
+        ("itemId", "same-item"),
+        ("threadId", "乙"),
+        ("parentThreadId", "root"),
+        ("sourceRole", "subagent"),
+        ("attribution", "unconfirmed"),
+    ] {
         assert_eq!(row.3[key], value);
     }
     assert_eq!(row.3["truncated"], false);
@@ -631,9 +642,11 @@ fn gap_wu_到期与关闭各自保存原摘要() {
             m.settle_event_log_step(&mut actions);
         }
         核对保存(&actions, "目标");
-        assert!(actions.iter().any(|a| matches!(a, Action::Store(StoreOp::AppendLog { lines, .. })
+        assert!(actions.iter().any(
+            |a| matches!(a, Action::Store(StoreOp::AppendLog { lines, .. })
             if lines.iter().any(|line| line.starts_with(&super::super::utc_timestamp(1000))
-                && line.contains("same-item")))));
+                && line.contains("same-item")))
+        ));
         assert_eq!(m.event_log_pending_stats("乙", "目标"), (0, 0, 0));
         assert!(m.runs.event_log.timer.is_none());
     }
@@ -674,12 +687,22 @@ fn gap_wu_同刻绑定先补写目标轮再清扫() {
     bind(&mut m, "run-a", "乙", "目标", "root");
     m.flush_bound_event_log("run-a", "乙", "目标", "root", &mut actions);
     let bound = logs(&actions);
-    assert_eq!(bound.iter().map(|r| r.3["itemId"].as_str().unwrap()).collect::<Vec<_>>(), ["目标一", "目标二"]);
+    assert_eq!(
+        bound
+            .iter()
+            .map(|r| r.3["itemId"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["目标一", "目标二"]
+    );
     assert_eq!(m.runs.event_log.pending.len(), 1);
     m.settle_event_log_step(&mut actions);
     let rows = logs(&actions);
-    assert_eq!(rows.iter().map(|r| r.3["turnId"].as_str().unwrap()).collect::<Vec<_>>(),
-        ["目标", "目标", "先到"]);
+    assert_eq!(
+        rows.iter()
+            .map(|r| r.3["turnId"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["目标", "目标", "先到"]
+    );
     assert!(rows[..2].iter().all(|r| r.3.get("attribution").is_none()));
     核对保存(&actions, "先到");
 }
@@ -688,7 +711,14 @@ fn gap_wu_同刻绑定先补写目标轮再清扫() {
 fn gap_wu_在途配对续期有独立上限() {
     let mut m = setup();
     candidate(&mut m, "乙", "root");
-    evidence_to(&mut m, "乙", EvidenceKind::V2Interacted, EvidenceOutcome::Pending, false, false);
+    evidence_to(
+        &mut m,
+        "乙",
+        EvidenceKind::V2Interacted,
+        EvidenceOutcome::Pending,
+        false,
+        false,
+    );
     let op = m.relations.operations.values_mut().next().unwrap();
     op.run_id = "run-a".into();
     op.authority_gen = 1;
@@ -713,7 +743,14 @@ fn gap_wu_在途配对续期有独立上限() {
 fn gap_wu_候选运行定案并淘汰前保存() {
     let mut m = setup();
     candidate(&mut m, "乙", "root");
-    evidence_to(&mut m, "乙", EvidenceKind::V2Interacted, EvidenceOutcome::Pending, false, false);
+    evidence_to(
+        &mut m,
+        "乙",
+        EvidenceKind::V2Interacted,
+        EvidenceOutcome::Pending,
+        false,
+        false,
+    );
     let mut actions = vec![];
     暂存(&mut m, "目标", &mut actions);
     m.run_released("run-a", crate::runs::ReleaseKind::Natural, &mut actions);
@@ -734,7 +771,10 @@ fn gap_wu_候选结束遇到已登记的绑定按已确认补写() {
     暂存(&mut m, "目标", &mut actions);
     bind(&mut m, "run-a", "乙", "目标", "root");
     m.run_released("run-a", crate::runs::ReleaseKind::Natural, &mut actions);
-    let saved: Vec<_> = logs(&actions).into_iter().filter(|l| l.3["turnId"] == "目标").collect();
+    let saved: Vec<_> = logs(&actions)
+        .into_iter()
+        .filter(|l| l.3["turnId"] == "目标")
+        .collect();
     assert_eq!(saved.len(), 1);
     assert_eq!(saved[0].2, "条目完成");
     assert_eq!(saved[0].3["summary"], "同毫秒同正文");
@@ -746,7 +786,14 @@ fn gap_wu_候选结束遇到已登记的绑定按已确认补写() {
 fn gap_wu_证据过期后按接纳顺序取回两条摘要() {
     let mut m = setup();
     candidate(&mut m, "乙", "root");
-    evidence_to(&mut m, "乙", EvidenceKind::V2Interacted, EvidenceOutcome::Pending, false, false);
+    evidence_to(
+        &mut m,
+        "乙",
+        EvidenceKind::V2Interacted,
+        EvidenceOutcome::Pending,
+        false,
+        false,
+    );
     let mut actions = vec![];
     for id in ["第一条", "第二条"] {
         let params = Some(json!({"threadId":"乙","turnId":"目标","item":{
@@ -763,8 +810,11 @@ fn gap_wu_证据过期后按接纳顺序取回两条摘要() {
     m.settle_event_log_step(&mut actions);
     let rows = logs(&actions);
     assert!(rows.iter().all(|l| l.2 != "记录缺口"));
-    let saved: Vec<_> = rows.iter().filter(|l| l.3["attribution"] == "unconfirmed")
-        .map(|l| l.3["summary"].as_str().unwrap()).collect();
+    let saved: Vec<_> = rows
+        .iter()
+        .filter(|l| l.3["attribution"] == "unconfirmed")
+        .map(|l| l.3["summary"].as_str().unwrap())
+        .collect();
     assert_eq!(saved, ["第一条", "第二条"]);
 }
 
@@ -780,9 +830,17 @@ fn gap_wu_一份摘要分别在两个候选的结束和关闭时保存() {
     核对保存(&actions, "目标");
     assert_eq!(m.runs.event_log.pending.len(), 1);
     m.clear_pending_event_log(&mut actions);
-    let saved: Vec<_> = logs(&actions).into_iter().filter(|l| l.3["turnId"] == "目标").collect();
-    assert_eq!(saved.iter().map(|l| l.1.as_str()).collect::<Vec<_>>(), ["run-a", "run-b"]);
-    assert!(saved.iter().all(|l| l.3["attribution"] == "unconfirmed" && l.3["summary"] == "同毫秒同正文"));
+    let saved: Vec<_> = logs(&actions)
+        .into_iter()
+        .filter(|l| l.3["turnId"] == "目标")
+        .collect();
+    assert_eq!(
+        saved.iter().map(|l| l.1.as_str()).collect::<Vec<_>>(),
+        ["run-a", "run-b"]
+    );
+    assert!(saved
+        .iter()
+        .all(|l| l.3["attribution"] == "unconfirmed" && l.3["summary"] == "同毫秒同正文"));
     assert_eq!(m.runs.event_log.bytes, 0);
 }
 
@@ -796,15 +854,28 @@ async fn gap_wu_暂存原摘要提交后排空并从文件取回() {
     暂存(&mut m, "目标", &mut actions);
     m.clear_pending_event_log(&mut actions);
     核对保存(&actions, "目标");
-    let expected = actions.iter().find_map(|action| match action {
-        Action::Store(StoreOp::AppendLog { lines, .. }) => Some(format!("{}\n", lines.join("\n"))),
-        _ => None,
-    }).unwrap();
+    let expected = actions
+        .iter()
+        .find_map(|action| match action {
+            Action::Store(StoreOp::AppendLog { lines, .. }) => {
+                Some(format!("{}\n", lines.join("\n")))
+            }
+            _ => None,
+        })
+        .unwrap();
     for action in actions {
-        if let Action::Store(op) = action { store.submit(op); }
+        if let Action::Store(op) = action {
+            store.submit(op);
+        }
     }
-    assert!(store.drain(std::time::Duration::from_secs(2)).await.abandoned.is_empty());
-    let path = temp.dir().join(format!("runs/{}.log", m.runs.runs["run-a"].short_id));
+    assert!(store
+        .drain(std::time::Duration::from_secs(2))
+        .await
+        .abandoned
+        .is_empty());
+    let path = temp
+        .dir()
+        .join(format!("runs/{}.log", m.runs.runs["run-a"].short_id));
     assert_eq!(std::fs::read_to_string(path).unwrap(), expected);
 }
 
@@ -816,7 +887,8 @@ fn gap_wu_同一摘要逐个判断历史候选() {
     m.runs.index.child_history = serde_json::from_value(json!({
         "coverage":"verified","retainedAfter":0,
         "entries":{"乙":{"run-b":{"rootThreadId":"root","observedAt":1}}}
-    })).unwrap();
+    }))
+    .unwrap();
     assert!(m.historical_subagent_for_run("run-a", "乙"));
     assert!(!m.historical_subagent_for_run("run-b", "乙"));
     let mut actions = vec![];
@@ -833,16 +905,32 @@ fn gap_wu_同一摘要逐个判断历史候选() {
 #[test]
 fn gap_wu_证据实际到期并淘汰后仍保存有疑点的历史摘要() {
     let mut m = setup();
-    for thread in ["乙", "对照"] { candidate(&mut m, thread, "root"); }
+    for thread in ["乙", "对照"] {
+        candidate(&mut m, thread, "root");
+    }
     let old = json!({"旧运行":{"rootThreadId":"root","observedAt":1}});
     m.runs.index.child_history = serde_json::from_value(json!({
         "coverage":"verified","retainedAfter":0,"entries":{"乙":old.clone(),"对照":old}
-    })).unwrap();
-    evidence_to(&mut m, "乙", EvidenceKind::V1ResumeAgent, EvidenceOutcome::Pending, false, false);
+    }))
+    .unwrap();
+    evidence_to(
+        &mut m,
+        "乙",
+        EvidenceKind::V1ResumeAgent,
+        EvidenceOutcome::Pending,
+        false,
+        false,
+    );
     let key = m.relations.operations.keys().next().unwrap().clone();
     let mut actions = vec![];
     暂存(&mut m, "目标", &mut actions);
-    m.buffer_child_event_log("对照", "item/completed", &item("对照", "另一轮"), false, &mut actions);
+    m.buffer_child_event_log(
+        "对照",
+        "item/completed",
+        &item("对照", "另一轮"),
+        false,
+        &mut actions,
+    );
     assert_eq!(m.runs.event_log.pending.len(), 2);
     m.clock.mono_ms = 2;
     m.facts_expire(&mut actions);
@@ -855,12 +943,16 @@ fn gap_wu_证据实际到期并淘汰后仍保存有疑点的历史摘要() {
         other.proof_expired = false;
         m.relations.operations.insert(other.key.clone(), other);
     }
-    m.on_relation_notification(&crate::claim::HeldNotification {
-        method: "item/completed".into(), committed: false,
-        params: Some(json!({"threadId":"root","turnId":"父轮","item":{
-            "id":"新操作","type":"subAgentActivity","kind":"completed","agentThreadId":"其他"
-        }})),
-    }, &mut actions);
+    m.on_relation_notification(
+        &crate::claim::HeldNotification {
+            method: "item/completed".into(),
+            committed: false,
+            params: Some(json!({"threadId":"root","turnId":"父轮","item":{
+                "id":"新操作","type":"subAgentActivity","kind":"completed","agentThreadId":"其他"
+            }})),
+        },
+        &mut actions,
+    );
     assert!(!m.relations.operations.contains_key(&key));
     assert_eq!(m.relations.operations.len(), MAX_OPERATIONS);
     assert_eq!(m.runs.event_log.pending.len(), 2);
@@ -882,8 +974,16 @@ fn gap_wu_文件和派生等待只保护对应运行的历史候选() {
             m.runs.index.child_history = serde_json::from_value(json!({
                 "coverage":"verified","retainedAfter":0,
                 "entries":{"乙":{"旧运行":{"rootThreadId":"root","observedAt":1}}}
-            })).unwrap();
-            evidence_to(&mut m, "乙", EvidenceKind::V2Interacted, EvidenceOutcome::Pending, false, false);
+            }))
+            .unwrap();
+            evidence_to(
+                &mut m,
+                "乙",
+                EvidenceKind::V2Interacted,
+                EvidenceOutcome::Pending,
+                false,
+                false,
+            );
             let op = m.relations.operations.values_mut().next().unwrap();
             op.run_id = owner.into();
             op.receivers.clear();
@@ -891,22 +991,43 @@ fn gap_wu_文件和派生等待只保护对应运行的历史候选() {
             if spawn {
                 m.relations.aux.spawn_waits.insert("乙".into(), key);
             } else {
-                m.relations.aux.rollout.waits.insert(key, RolloutWait {
-                    call: None, deadline_ms: 50_000, wall_ms: 1000, child: "乙".into(), child_turns: vec![], events: vec![],
-                });
+                m.relations.aux.rollout.waits.insert(
+                    key,
+                    RolloutWait {
+                        call: None,
+                        deadline_ms: 50_000,
+                        wall_ms: 1000,
+                        child: "乙".into(),
+                        child_turns: vec![],
+                        events: vec![],
+                    },
+                );
             }
             let mut actions = vec![];
             暂存(&mut m, "目标", &mut actions);
             assert_eq!(m.runs.event_log.pending[0].candidates.len(), 2);
             m.clock.mono_ms = 30_000;
             m.settle_event_log_step(&mut actions);
-            let waiting: Vec<_> = m.runs.event_log.pending[0].candidates.iter().map(|c| c.run.as_str()).collect();
-            let expected = if owner.is_empty() { vec!["run-a", "run-b"] } else { vec!["run-b"] };
+            let waiting: Vec<_> = m.runs.event_log.pending[0]
+                .candidates
+                .iter()
+                .map(|c| c.run.as_str())
+                .collect();
+            let expected = if owner.is_empty() {
+                vec!["run-a", "run-b"]
+            } else {
+                vec!["run-b"]
+            };
             assert_eq!(waiting, expected);
             m.clear_pending_event_log(&mut actions);
             let rows = logs(&actions);
-            assert!(rows.iter().all(|r| r.3["attribution"] == "unconfirmed" && r.3["summary"] == "同毫秒同正文"));
-            assert_eq!(rows.iter().map(|r| r.1.as_str()).collect::<Vec<_>>(), expected);
+            assert!(rows
+                .iter()
+                .all(|r| r.3["attribution"] == "unconfirmed" && r.3["summary"] == "同毫秒同正文"));
+            assert_eq!(
+                rows.iter().map(|r| r.1.as_str()).collect::<Vec<_>>(),
+                expected
+            );
         }
     }
 }
@@ -920,8 +1041,14 @@ fn gap_wu_树停止提交当步结算未到期候选() {
     暂存(&mut m, "目标", &mut actions);
     assert_eq!(m.runs.event_log.pending.len(), 1);
     let snapshot = ReleaseSnapshot {
-        identity: m.manage_context("run-a").unwrap().identity.clone(), gen: 1, token: None,
-        owner: None, parent_turn_id: None, parent_status: None, goal_status: None, loop_guard: false,
+        identity: m.manage_context("run-a").unwrap().identity.clone(),
+        gen: 1,
+        token: None,
+        owner: None,
+        parent_turn_id: None,
+        parent_status: None,
+        goal_status: None,
+        loop_guard: false,
     };
     let children = serde_json::from_value(json!({
         "trigger":"userStop","phase":"unconfirmed","version":1,
@@ -929,11 +1056,25 @@ fn gap_wu_树停止提交当步结算未到期候选() {
         "stopped":[],"unconfirmed":["root"],"failed":[],"conflicts":[],"capabilityLimited":[],
         "discovery":{"missing":{},"complete":true,"version":1,"incompleteReasons":[]},"unsettledSpawns":0
     })).unwrap();
-    m.commit_tree_finish(TreeFinishCommit {
-        snapshot, status: crate::runs::RunStatus::Interrupted, interrupt_reason: None,
-        report: TreeStopReport { tree_op: 1, run_id: "run-a".into(), generation: 1,
-            round: 1, children, first_delivery_deadline_ms: 20_000, committed: false, cancelled: false, barrier: true },
-    }, &mut actions);
+    m.commit_tree_finish(
+        TreeFinishCommit {
+            snapshot,
+            status: crate::runs::RunStatus::Interrupted,
+            interrupt_reason: None,
+            report: TreeStopReport {
+                tree_op: 1,
+                run_id: "run-a".into(),
+                generation: 1,
+                round: 1,
+                children,
+                first_delivery_deadline_ms: 20_000,
+                committed: false,
+                cancelled: false,
+                barrier: true,
+            },
+        },
+        &mut actions,
+    );
     assert_eq!(m.runs.runs["run-a"].state, RunState::Ended);
     核对保存(&actions, "目标");
     assert!(m.runs.event_log.pending.is_empty());

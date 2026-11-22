@@ -431,8 +431,10 @@ impl Machine {
             self.relations.aux.released.get_mut(thread).unwrap().probe = None;
             // 0.160.0 read_thread_view：只读存储/get_thread，不调用 resume；此精确错误表示存储与运行时均不存在。
             let unloaded = match result {
-                Some(Ok(value)) => value["thread"]["id"].as_str() == Some(thread)
-                    && value["thread"]["status"]["type"] == "notLoaded",
+                Some(Ok(value)) => {
+                    value["thread"]["id"].as_str() == Some(thread)
+                        && value["thread"]["status"]["type"] == "notLoaded"
+                }
                 Some(Err(error)) => {
                     error["message"].as_str() == Some(&format!("thread not loaded: {thread}"))
                 }

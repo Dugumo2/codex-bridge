@@ -11,10 +11,16 @@ use crate::relations::rollout_pairing::{ReadTicket, ReadTicketState};
 
 fn 登记在途读取(h: &mut Harness) {
     let machine = &mut h.core.machine;
-    machine.relations.aux.rollout.rollout_reads.insert(1, ReadTicket {
-        id: 1, thread: "线程".into(), conn_epoch: machine.relations.conn_epoch,
-        deadline: machine.clock.mono_ms + 30_000, state: ReadTicketState::Active,
-    });
+    machine.relations.aux.rollout.rollout_reads.insert(
+        1,
+        ReadTicket {
+            id: 1,
+            thread: "线程".into(),
+            conn_epoch: machine.relations.conn_epoch,
+            deadline: machine.clock.mono_ms + 30_000,
+            state: ReadTicketState::Active,
+        },
+    );
 }
 
 #[tokio::test]
@@ -24,11 +30,19 @@ async fn gap_wu_真实传输断档先于完成通知使旧读取失效() {
     h.app_input.send("{bad".into()).unwrap();
     h.app_input.send(r#"{"method":"turn/completed","params":{"threadId":"线程","turn":{"id":"轮","status":"completed"}}}"#.into()).unwrap();
     let gap = h.inbox.recv().await.unwrap();
-    assert!(matches!(&gap, CoreMsg::App(AppEvent::ObservationGap { .. })));
+    assert!(matches!(
+        &gap,
+        CoreMsg::App(AppEvent::ObservationGap { .. })
+    ));
     h.core.handle(gap);
-    assert_eq!(h.core.machine.relations.aux.rollout.rollout_reads[&1].state, ReadTicketState::Retired);
+    assert_eq!(
+        h.core.machine.relations.aux.rollout.rollout_reads[&1].state,
+        ReadTicketState::Retired
+    );
     let completed = h.inbox.recv().await.unwrap();
-    assert!(matches!(completed, CoreMsg::App(AppEvent::Notification { method, .. }) if method == "turn/completed"));
+    assert!(
+        matches!(completed, CoreMsg::App(AppEvent::Notification { method, .. }) if method == "turn/completed")
+    );
     h.core.app.close().await;
 }
 
@@ -36,14 +50,25 @@ async fn gap_wu_真实传输断档先于完成通知使旧读取失效() {
 async fn gap_wu_客户端重连保留票据而上游断开使之失效() {
     let mut h = Harness::new(false);
     登记在途读取(&mut h);
-    h.core.handle(CoreMsg::Conn(ConnEvent::Closed { conn: 1, reason: CloseReason::Eof }));
+    h.core.handle(CoreMsg::Conn(ConnEvent::Closed {
+        conn: 1,
+        reason: CloseReason::Eof,
+    }));
     let (writer, _output) = mpsc::unbounded_channel();
-    h.core.handle(CoreMsg::Conn(ConnEvent::Connected { conn: 2, writer }));
-    assert_eq!(h.core.machine.relations.aux.rollout.rollout_reads[&1].state, ReadTicketState::Active);
+    h.core
+        .handle(CoreMsg::Conn(ConnEvent::Connected { conn: 2, writer }));
+    assert_eq!(
+        h.core.machine.relations.aux.rollout.rollout_reads[&1].state,
+        ReadTicketState::Active
+    );
     h.core.app.inner.fail("上游传输断开");
-    h.pump_until(|msg| matches!(msg, CoreMsg::App(AppEvent::Closed { .. }))).await;
+    h.pump_until(|msg| matches!(msg, CoreMsg::App(AppEvent::Closed { .. })))
+        .await;
     assert!(h.core.app_disconnected);
-    assert_eq!(h.core.machine.relations.aux.rollout.rollout_reads[&1].state, ReadTicketState::Retired);
+    assert_eq!(
+        h.core.machine.relations.aux.rollout.rollout_reads[&1].state,
+        ReadTicketState::Retired
+    );
 }
 
 #[tokio::test(start_paused = true)]

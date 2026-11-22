@@ -194,7 +194,15 @@ impl Machine {
             return;
         };
         while self.relations.aux.work[&op_id].reads_in_flight.len() < DISCOVERY_READS {
-            let Some(thread) = self.relations.aux.work.get_mut(&op_id).unwrap().reads_queue.pop_front() else {
+            let Some(thread) = self
+                .relations
+                .aux
+                .work
+                .get_mut(&op_id)
+                .unwrap()
+                .reads_queue
+                .pop_front()
+            else {
                 break;
             };
             let stamp = self.metadata_read_stamp(&thread);
@@ -330,7 +338,10 @@ impl Machine {
             }
             "thread/read" => {
                 let thread = params["threadId"].as_str().unwrap_or_default().to_owned();
-                if !self.relations.aux.work[&op_id].reads_in_flight.contains(&thread) {
+                if !self.relations.aux.work[&op_id]
+                    .reads_in_flight
+                    .contains(&thread)
+                {
                     return;
                 }
                 self.discovery_observe_metadata(op_id, &thread, &result);
@@ -918,8 +929,18 @@ impl Machine {
             }
             let mut params = json!({"threadId": thread});
             if method == "thread/read" {
-                work.read_stamps.insert(thread.clone(), (self.relations.conn_epoch,
-                    self.relations.aux.candidate_versions.get(&thread).copied().unwrap_or(0)));
+                work.read_stamps.insert(
+                    thread.clone(),
+                    (
+                        self.relations.conn_epoch,
+                        self.relations
+                            .aux
+                            .candidate_versions
+                            .get(&thread)
+                            .copied()
+                            .unwrap_or(0),
+                    ),
+                );
                 // 根只核实输入能力；子代理的轮次随后分页读，这里都不带历史。
                 params["includeTurns"] = json!(false);
             }
@@ -1087,21 +1108,41 @@ impl Machine {
         if !self.relations.aux.candidate_versions.contains_key(thread) {
             self.candidate_changed(thread);
         }
-        (self.relations.conn_epoch, self.relations.aux.candidate_versions[thread])
+        (
+            self.relations.conn_epoch,
+            self.relations.aux.candidate_versions[thread],
+        )
     }
 
-    fn discovery_observe_metadata(&mut self, op_id: u64, thread: &str, result: &Result<Value, Value>) {
-        let stamp = self.relations.aux.work.get_mut(&op_id)
+    fn discovery_observe_metadata(
+        &mut self,
+        op_id: u64,
+        thread: &str,
+        result: &Result<Value, Value>,
+    ) {
+        let stamp = self
+            .relations
+            .aux
+            .work
+            .get_mut(&op_id)
             .and_then(|work| work.read_stamps.remove(thread));
         if let (Some(stamp), Ok(value)) = (stamp, result) {
             self.observe_metadata_unload(thread, &value["thread"], stamp);
         }
     }
 
-    pub(super) fn observe_metadata_unload(&mut self, thread: &str, info: &Value, stamp: (u64, u64)) {
+    pub(super) fn observe_metadata_unload(
+        &mut self,
+        thread: &str,
+        info: &Value,
+        stamp: (u64, u64),
+    ) {
         let version = self.relations.aux.candidate_versions.get(thread).copied();
-        if stamp.0 == self.relations.conn_epoch && version == Some(stamp.1) && info["id"].as_str() == Some(thread)
-            && info["status"]["type"] == "notLoaded" {
+        if stamp.0 == self.relations.conn_epoch
+            && version == Some(stamp.1)
+            && info["id"].as_str() == Some(thread)
+            && info["status"]["type"] == "notLoaded"
+        {
             self.invalidate_rollout_reads(Some(thread));
         }
     }
