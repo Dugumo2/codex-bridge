@@ -191,6 +191,11 @@ impl Machine {
                 ticket.state = ReadTicketState::Interrupted;
             }
         }
+        // 断档一并退休在途的路径请求（None 表示全部线程）：线程仍被需要时
+        // 本步驱动会按新代次重发，旧回包到达时因登记缺失或代次不符被拒。
+        self.relations.aux.rollout.files.retain(|t, f| {
+            !(thread.is_none_or(|x| x == t) && matches!(f.path, RolloutPathState::Requested(_)))
+        });
     }
 
     /// 只有确认本连接里没送过 raw 的线程才读会话文件；送过 raw 的、或登记满了能力未知的，一次都不读。

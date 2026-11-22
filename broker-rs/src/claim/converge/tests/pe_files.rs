@@ -19,6 +19,28 @@ fn path_requests(actions: &[Action], thread: &str) -> usize {
         .count()
 }
 
+/// 动作里某线程路径请求的代号。
+fn path_generation(actions: &[Action], thread: &str) -> Option<u64> {
+    actions.iter().find_map(|a| match a {
+        Action::Request(c) => match &c.operation {
+            Operation::RolloutPath {
+                thread: t,
+                generation,
+            } if t.as_str() == thread => Some(*generation),
+            _ => None,
+        },
+        _ => None,
+    })
+}
+
+/// 建等待并截下在途路径请求（不经 service，回包由用例自己喂）。
+fn pending_path(m: &mut Machine, id: &str, child: &str) -> Vec<Action> {
+    let (start, _done) = SubagentMock::v2_activity("interacted", P, T, id, child);
+    let (next, actions) = step(std::mem::take(m), start);
+    *m = next;
+    actions
+}
+
 /// 「子」的路径请求失败：进入冷却（截止 = now + ROLLOUT_RETRY_MS）。
 fn fail_child_path(m: &mut Machine) {
     fx::with(|f| {
@@ -115,4 +137,135 @@ fn gap_pe_冷却保留表满时不淘汰冷却文件() {
     );
     assert!(m.relations.aux.rollout.files.contains_key(C));
     assert!(m.relations.aux.rollout.files.contains_key(P));
+}
+
+#[test]
+fn gap_pe_断档后旧路径成功回包不启动读取() {
+    let (mut m, _) = base();
+    files(&m);
+    call_line(&m, "跟进", "followup_task", C, "任务");
+    let actions = pending_path(&mut m, "跟进", C);
+    let old = path_generation(&actions, C).expect("跟进发出路径请求");
+    let good = Ok(json!({"thread":{"id":C,"path":fx::path(C)}}));
+    // 断档后到的是旧代次的回包：不得标 Ready、不得启动读取。
+    let (next, gap_actions) = step(
+        std::mem::take(&mut m),
+        Event::ObservationGap {
+            thread: Some(C.into()),
+        },
+    );
+    m = next;
+    m.rollout_path_reply(C, old, &good);
+    assert!(
+        !matches!(
+            m.relations.aux.rollout.files[C].path,
+            RolloutPathState::Ready(_)
+        ),
+        "旧代次回包不得让 path 变 Ready"
+    );
+    let mut drain = vec![];
+    m.drive_rollout(&mut drain);
+    assert!(
+        !drain
+            .iter()
+            .any(|a| matches!(a, Action::ReadRollout(r) if r.thread == C)),
+        "不派发读取"
+    );
+    // 断档本步已按新代次重发请求；新回包照常接纳。
+    let new = path_generation(&gap_actions, C).expect("断档后重发路径请求");
+    assert_ne!(old, new);
+    m.rollout_path_reply(C, new, &good);
+    assert!(matches!(
+        m.relations.aux.rollout.files[C].path,
+        RolloutPathState::Ready(_)
+    ));
+}
+
+#[test]
+fn gap_pe_断档后旧路径失败回包不留冷却() {
+    let (mut m, _) = base();
+    files(&m);
+    call_line(&m, "跟进", "followup_task", C, "任务");
+    let actions = pending_path(&mut m, "跟进", C);
+    let old = path_generation(&actions, C).expect("跟进发出路径请求");
+    let (next, gap_actions) = step(
+        std::mem::take(&mut m),
+        Event::ObservationGap {
+            thread: Some(C.into()),
+        },
+    );
+    m = next;
+    m.rollout_path_reply(C, old, &Err(json!({"message": "断档前的失败"})));
+    assert!(
+        !matches!(
+            m.relations.aux.rollout.files[C].path,
+            RolloutPathState::Failed(_)
+        ),
+        "旧代次失败回包不得留下冷却"
+    );
+    // 线程仍被需要：断档本步已按新代次重发请求。
+    let new = path_generation(&gap_actions, C).expect("断档后重发路径请求");
+    assert_ne!(old, new);
+}
+
+#[test]
+fn gap_pe_断档只退休受影响线程的路径请求() {
+    let (mut m, _) = base();
+    files(&m);
+    call_line(&m, "跟进", "followup_task", C, "任务");
+    let actions = pending_path(&mut m, "跟进", C);
+    let old_c = path_generation(&actions, C).expect("跟进发出路径请求");
+    let old_p = path_generation(&actions, P).expect("父线程路径请求");
+    let (next, gap_actions) = step(
+        std::mem::take(&mut m),
+        Event::ObservationGap {
+            thread: Some(C.into()),
+        },
+    );
+    m = next;
+    // 父线程的请求原样：代次不变、不重发、旧回包仍接纳。
+    assert_eq!(
+        m.relations.aux.rollout.files[P].path,
+        RolloutPathState::Requested(old_p)
+    );
+    assert!(path_generation(&gap_actions, P).is_none(), "父线程不重发");
+    m.rollout_path_reply(P, old_p, &Ok(json!({"thread":{"id":P,"path":fx::path(P)}})));
+    assert!(matches!(
+        m.relations.aux.rollout.files[P].path,
+        RolloutPathState::Ready(_)
+    ));
+    // 子线程已按新代次重发。
+    let new_c = path_generation(&gap_actions, C).expect("断档后子线程重发路径请求");
+    assert_ne!(old_c, new_c);
+}
+
+#[test]
+fn gap_pe_传输断档退休全部在途路径请求() {
+    let (mut m, _) = base();
+    files(&m);
+    call_line(&m, "跟进", "followup_task", C, "任务");
+    let actions = pending_path(&mut m, "跟进", C);
+    let old_c = path_generation(&actions, C).expect("跟进发出路径请求");
+    let old_p = path_generation(&actions, P).expect("父线程路径请求");
+    let (next, gap_actions) = step(
+        std::mem::take(&mut m),
+        Event::ObservationGap { thread: None },
+    );
+    m = next;
+    // 两条线程的旧回包一律不认。
+    for (t, old) in [(P, old_p), (C, old_c)] {
+        m.rollout_path_reply(t, old, &Ok(json!({"thread":{"id":t,"path":fx::path(t)}})));
+        assert!(
+            !matches!(
+                m.relations.aux.rollout.files[t].path,
+                RolloutPathState::Ready(_)
+            ),
+            "旧代次回包不得让 {t} 的 path 变 Ready"
+        );
+    }
+    // 两条线程都按新代次重发。
+    for (t, old) in [(P, old_p), (C, old_c)] {
+        let new = path_generation(&gap_actions, t).expect("断档后重发路径请求");
+        assert_ne!(old, new);
+    }
 }
