@@ -1848,8 +1848,8 @@ fn gap_wu_卸载探针必须对应原线程才解除订阅责任() {
 
 #[test]
 fn gap_wu_卸载探针发出后的在线活动作废旧卸载() {
-    for event in ["无活动", "提前开始", "线程开始", "命令开始"] {
-        let (mut m, mock) = released();
+    for event in ["无活动", "提前开始", "线程开始", "轮开始", "命令开始"] {
+        let (mut m, mut mock) = released();
         if event == "提前开始" {
             // 线程首次 thread/started 发生在探针发出之前，不能误伤后来的卸载判定。
             apply(&mut m, mock.thread_started(C));
@@ -1861,6 +1861,9 @@ fn gap_wu_卸载探针发出后的在线活动作废旧卸载() {
         match event {
             "线程开始" => {
                 apply(&mut m, mock.thread_started(C));
+            }
+            "轮开始" => {
+                apply(&mut m, mock.turn_started(C, CT));
             }
             "命令开始" => {
                 apply(
@@ -1879,7 +1882,7 @@ fn gap_wu_卸载探针发出后的在线活动作废旧卸载() {
             Ok(json!({"thread":{"id":C,"status":{"type":"notLoaded"}}})),
         );
         match event {
-            "线程开始" | "命令开始" => {
+            "线程开始" | "轮开始" | "命令开始" => {
                 // 旧回包作废：不解除订阅责任，发新探针重新核实。
                 assert!(m.relations.aux.released.contains_key(C), "{event}");
                 assert!(has_rpc(&actions, "thread/read", C), "{event}");
