@@ -1203,3 +1203,66 @@ fn gap_wu_血缘回查的新鲜卸载退休旧票据() {
         );
     }
 }
+
+#[test]
+fn gap_wu_血缘回查发出后的在线活动作废旧卸载() {
+    use crate::relations::rollout_pairing::{ReadTicket, ReadTicketState};
+    for event in ["无活动", "线程开始", "命令开始"] {
+        let (mut m, mut mock) = setup(false);
+        mock.register(C, Some(P), "v1", false, true);
+        let (started, _) = SubagentMock::v1_spawn(P, T, "派生", C, false);
+        mock.inject(&mut m, started);
+        let (_, ev) = mock.request(C, Some("子轮"), None, APPROVAL);
+        let actions = mock.inject(&mut m, ev);
+        let context = app_requests(&actions, "thread/read")
+            .into_iter()
+            .find(|ctx| matches!(ctx.operation, Operation::RelationLookup { .. }))
+            .unwrap();
+        m.relations.aux.rollout.rollout_reads.insert(
+            1,
+            ReadTicket {
+                id: 1,
+                thread: C.into(),
+                conn_epoch: m.relations.conn_epoch,
+                deadline: m.clock.mono_ms + 30_000,
+                state: ReadTicketState::Active,
+            },
+        );
+        // 回查发出后同线程的在线活动：这条随后到达的 notLoaded 是旧的，作废。
+        match event {
+            "线程开始" => {
+                mock.inject(&mut m, mock.thread_started(C));
+            }
+            "命令开始" => {
+                mock.inject(
+                    &mut m,
+                    Event::Notification {
+                        method: "item/started".into(),
+                        params: Some(
+                            json!({"threadId":C,"turnId":"子轮","item":{"type":"commandExecution","id":"条目","command":"echo"}}),
+                        ),
+                    },
+                );
+            }
+            _ => {}
+        }
+        let mut info = mock.thread_info(C).unwrap();
+        info["status"] = json!({"type":"notLoaded"});
+        mock.inject(
+            &mut m,
+            Event::Reply {
+                context: context.clone(),
+                result: Ok(json!({"thread":info})),
+            },
+        );
+        assert_eq!(
+            m.relations.aux.rollout.rollout_reads[&1].state,
+            if event == "无活动" {
+                ReadTicketState::Retired
+            } else {
+                ReadTicketState::Active
+            },
+            "{event}"
+        );
+    }
+}

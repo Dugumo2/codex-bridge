@@ -1149,7 +1149,7 @@ impl Machine {
         self.relations.aux.lookups.insert(
             target.clone(),
             Lookup {
-                read_stamp: (0, 0),
+                read_stamp: (0, 0, 0),
                 op_id,
                 generation: 0,
                 attempt: 0,

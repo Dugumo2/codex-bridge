@@ -112,6 +112,7 @@ impl Machine {
         if event.method == "thread/started" {
             if let Some(info) = params.and_then(|p| p.get("thread")) {
                 if let Some(id) = info.get("id").and_then(Value::as_str) {
+                    self.online_activity_noted(id);
                     if !self.claims.contains_key(id) {
                         self.attach(id, AttachmentSource::ThreadStarted);
                     }
@@ -156,6 +157,13 @@ impl Machine {
             }
             "item/started" | "item/completed" => {
                 let item = params.and_then(|p| p.get("item"));
+                // 命令开始是卸载口径里的在线活动：作废在途回查的旧 notLoaded 回包。
+                if event.method == "item/started"
+                    && item.and_then(|i| i.get("type")).and_then(Value::as_str)
+                        == Some("commandExecution")
+                {
+                    self.online_activity_noted(&thread);
+                }
                 let relevant = item
                     .and_then(|i| i.get("type"))
                     .and_then(Value::as_str)
@@ -173,6 +181,7 @@ impl Machine {
                 relevant
             }
             "turn/started" => {
+                self.online_activity_noted(&thread);
                 if let (false, Some(turn)) = (claimed, &turn) {
                     self.v2_observe_start(&thread, turn);
                     self.convergence_observe_activity(&thread, turn, "running", false);

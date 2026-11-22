@@ -796,6 +796,10 @@ fn gap_wu_末尾半行保留轮定位补齐后只读取一次() {
     let first = read_chunk(&path, None).unwrap();
     assert!(first.entries.is_empty() && !first.more);
     assert_eq!(first.cursor.offset, marker.len() as u64);
+    // 补齐换行前用同一游标续读：读到半行的字节但没有条目，游标停在行首不动。
+    let mid = read_chunk(&path, Some(&first.cursor)).unwrap();
+    assert!(mid.bytes_read > 0 && mid.entries.is_empty());
+    assert_eq!(mid.cursor, first.cursor);
     append(&file, "\n");
     let next = read_chunk(&path, Some(&first.cursor)).unwrap();
     assert_eq!(next.entries.len(), 1);
