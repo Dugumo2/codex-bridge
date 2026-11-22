@@ -2857,3 +2857,258 @@ fn gap_wu_实时开始表满仍区分留言与跟进() {
         assert_ne!(later.outcome, EvidenceOutcome::Unproven);
     }
 }
+
+// ─── 块 4：会话文件配对补例（P2-3、P2-4、P2-8）───
+
+/// 一条缓存里就能兑现的留言调用；留言不纳管接收方。
+fn cached_message(m: &mut Machine, id: &str, target: &str) {
+    m.relations.aux.rollout.calls.insert(
+        (P.into(), id.into()),
+        crate::relations::rollout_pairing::RolloutCall {
+            epoch: m.relations.conn_epoch,
+            at: m.clock.mono_ms,
+            wall_ms: m.clock.now_ms,
+            trigger: false,
+            target: Some(target.into()),
+            message: Some([7; 32]),
+        },
+    );
+}
+
+/// 归属类误报的行数：「归属冲突」、discoveryIncomplete 类覆盖问题、覆盖提示与告警。
+fn 归属误报行数(all: &[Action]) -> usize {
+    all.iter()
+        .map(|action| match action {
+            Action::Store(crate::store::StoreOp::AppendLog { lines, .. }) => lines
+                .iter()
+                .filter(|line| {
+                    line.contains("归属冲突")
+                        || line.contains("coverageIssue")
+                        || line.contains("覆盖")
+                })
+                .count(),
+            Action::Warn(_) => 1,
+            _ => 0,
+        })
+        .sum()
+}
+
+/// 接收方登记为 P 的子代理：跟上跟平级检查之后的拒绝分支才走得进。
+fn child_edge(m: &mut Machine, child: &str) {
+    m.relations.edges.insert(
+        child.into(),
+        crate::relations::RelationEdge {
+            child_thread_id: child.into(),
+            parent_thread_id: P.into(),
+            kind: crate::relations::RelationKind::Subagent,
+            source_summary: serde_json::Value::Null,
+            can_accept_direct_input: Some(false),
+            agent_version: crate::relations::AgentVersion::V2,
+            discovered_by: crate::relations::DiscoveredBy::Lookup,
+        },
+    );
+}
+
+#[test]
+fn gap_wu_预读满丢下的留言等到期判未证明而不宽松绑定() {
+    let (mut m, mut mock) = base();
+    files(&m);
+    // 预读缓存写满：之后读到的调用放不进 calls。
+    let filler = crate::relations::rollout_pairing::RolloutCall {
+        epoch: m.relations.conn_epoch,
+        at: m.clock.mono_ms,
+        wall_ms: m.clock.now_ms,
+        trigger: true,
+        target: Some(C.into()),
+        message: None,
+    };
+    for n in 0..MAX_OPERATIONS {
+        m.relations
+            .aux
+            .rollout
+            .calls
+            .insert((P.into(), format!("缓存{n}")), filler.clone());
+    }
+    call_line(&m, "留言", "send_message", C, "忙里捎话");
+    // 别的操作先建等待，父文件持续被跟随：读到「留言」时放不下、也没有同键等待认领，留失记标志。
+    let mut all = interacted_to(&mut m, "占位", C);
+    assert!(
+        m.relations.aux.rollout.lost_calls.contains_key(P),
+        "读到时刻应在父线程上留下失记标志"
+    );
+    // 之后到来的留言建等待；到定案时仍没拿到自己的调用且标志有效：置为未证明，不按宽松规则回退。
+    all.extend(interacted_to(&mut m, "留言", C));
+    m.clock.mono_ms += ROLLOUT_WAIT_MS;
+    let mut out = vec![];
+    m.drive_rollout(&mut out);
+    all.extend(out);
+    let operation = op(&m, "留言");
+    assert_eq!(operation.outcome, EvidenceOutcome::Unproven);
+    assert_eq!(
+        operation.v2_fallback,
+        Some(V2FallbackReason::RolloutCallMissing)
+    );
+    assert!(operation.proven_turns.is_empty(), "接收方的活动轮不被绑定");
+    assert!(!awaiting(&m, "留言"));
+    // 之后开始的轮也不被这次操作绑定。
+    let actions = apply(&mut m, mock.turn_started(C, "新轮"));
+    all.extend(replies(&mut m, &mock, actions));
+    assert!(
+        op(&m, "留言").proven_turns.is_empty(),
+        "之后开始的轮不被这次操作绑定"
+    );
+}
+
+#[test]
+fn gap_wu_缓存留言给独立认领的接收方不产生归属冲突() {
+    let (mut m, _mock) = base();
+    files(&m);
+    const 独: &str = "独";
+    child_edge(&mut m, 独);
+    // 接收方核实为 P 的子代理，但自己已是一条运行的认领根。
+    m.claims.insert(
+        独.into(),
+        crate::claim::Claim {
+            stream_id: None,
+            owned_ended: Default::default(),
+            owned_turns: ["独轮".into()].into_iter().collect(),
+            claim_id: 7,
+            state: crate::claim::State::Running {
+                owner: crate::claim::Owner::Client(1),
+                turn_id: "独轮".into(),
+                joined: false,
+            },
+            run_id: Some("自有运行".into()),
+            resume_goal: false,
+            request_pending: false,
+            owner_gone: false,
+            pending_start: None,
+            submitted_input: vec![],
+            held_requests: vec![],
+            held_deltas: 0,
+            held_bytes: 0,
+            held_dropped_items: 0,
+            overflowed: false,
+            settlement_reply: None,
+            pending_detach: None,
+        },
+    );
+    cached_message(&mut m, "留言", 独);
+    let mut all = interacted_to(&mut m, "留言", 独);
+    let mut out = vec![];
+    m.drive_rollout(&mut out);
+    all.extend(out);
+    let operation = op(&m, "留言");
+    assert!(operation.v2_queue_only && operation.v2_strict);
+    assert!(operation.receivers.is_empty() && operation.proven_turns.is_empty());
+    assert!(
+        operation.rejected_receivers.is_empty(),
+        "留言不纳管也不登记接收方拒绝"
+    );
+    assert_eq!(
+        归属误报行数(&all),
+        0,
+        "零归属冲突、零 discoveryIncomplete、零覆盖提示"
+    );
+}
+
+#[test]
+fn gap_wu_缓存留言给他运行绑定的接收方不产生归属冲突() {
+    let (mut m, _mock) = base();
+    files(&m);
+    const 绑: &str = "绑";
+    child_edge(&mut m, 绑);
+    // 接收方核实为 P 的子代理，但它的轮已绑定到别的运行。
+    m.relations.bindings.insert(
+        (绑.into(), "绑轮".into()),
+        crate::relations::ActivityBinding {
+            thread_id: 绑.into(),
+            turn_id: "绑轮".into(),
+            run_id: "他运行".into(),
+            parent_thread_id: "别的父".into(),
+            evidence: crate::relations::BindingEvidence::V1Spawn,
+            operation: crate::relations::EvidenceKey {
+                parent_thread_id: "别的父".into(),
+                parent_turn_id: "轮".into(),
+                item_id: "spawn".into(),
+            },
+            status: crate::relations::BindingStatus::Bound,
+        },
+    );
+    cached_message(&mut m, "留言", 绑);
+    let mut all = interacted_to(&mut m, "留言", 绑);
+    let mut out = vec![];
+    m.drive_rollout(&mut out);
+    all.extend(out);
+    let operation = op(&m, "留言");
+    assert!(operation.v2_queue_only && operation.v2_strict);
+    assert!(operation.receivers.is_empty() && operation.proven_turns.is_empty());
+    assert!(
+        operation.rejected_receivers.is_empty(),
+        "留言不纳管也不登记接收方拒绝"
+    );
+    assert_eq!(
+        归属误报行数(&all),
+        0,
+        "零归属冲突、零 discoveryIncomplete、零覆盖提示"
+    );
+}
+
+#[test]
+fn gap_wu_缺可比正文的跟进先取子侧原因() {
+    use crate::relations::rollout_pairing::{RolloutFile, RolloutPathState};
+    for (mode, reason) in [
+        ("失败", "rolloutUnreadable"),
+        ("未知", "rawUnknown"),
+        ("健康", "rolloutCallMissing"),
+    ] {
+        let (mut m, mut mock) = base();
+        files(&m);
+        // 接收方的旧轮先完成：宽松回退的操作留在待定里，诊断看得见原因。
+        complete(&mut m, &mut mock, C, "旧轮", "completed");
+        // 缓存里命中一条缺可比正文的跟进调用。
+        m.relations.aux.rollout.calls.insert(
+            (P.into(), "跟进".into()),
+            crate::relations::rollout_pairing::RolloutCall {
+                epoch: m.relations.conn_epoch,
+                at: m.clock.mono_ms,
+                wall_ms: m.clock.now_ms,
+                trigger: true,
+                target: Some(C.into()),
+                message: None,
+            },
+        );
+        let epoch = m.relations.conn_epoch;
+        if mode == "失败" {
+            m.relations.aux.rollout.files.insert(
+                C.into(),
+                RolloutFile {
+                    epoch,
+                    path: RolloutPathState::Failed(V2FallbackReason::RolloutUnreadable),
+                    cursor: None,
+                    reading: None,
+                    reads: 0,
+                    next_at: m.clock.mono_ms + 30_000,
+                },
+            );
+        } else if mode == "未知" {
+            m.relations.aux.v2_raw_overflow = Some(epoch);
+        }
+        interacted_to(&mut m, "跟进", C);
+        let expected = match reason {
+            "rolloutUnreadable" => V2FallbackReason::RolloutUnreadable,
+            "rawUnknown" => V2FallbackReason::RawUnknown,
+            _ => V2FallbackReason::RolloutCallMissing,
+        };
+        assert_eq!(op(&m, "跟进").v2_fallback, Some(expected));
+        let diagnostic = m.convergence_diagnostics(R).unwrap();
+        let row = diagnostic["pendingOperations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["kind"] == "v2Interacted" && r["fallbackReason"] != serde_json::Value::Null)
+            .unwrap_or_else(|| panic!("缺带 fallbackReason 的 v2Interacted 行：{diagnostic}"))
+            .clone();
+        assert_eq!(row["fallbackReason"], reason);
+    }
+}
