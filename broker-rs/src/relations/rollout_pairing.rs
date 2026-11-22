@@ -16,6 +16,7 @@
 //! [`Event::RolloutRead`](crate::claim::Event::RolloutRead) 回来；路径用 thread/read 请求拿。
 //! 只在有操作等文件或等文件里的消费记录时才轮询，操作有结果、运行结束、停止、连接或授权换代后立即停止。
 //! 有 raw 的线程一次都不读。不存、不记任何正文，只用摘要与字段名。
+use super::facts::MAX_AGENT_PATH_BYTES;
 use super::v2_pairing::{parse_call, parse_delivery, EvidenceSource, ParsedCall, RawCapability};
 use super::*;
 use crate::rollout::{
@@ -451,6 +452,15 @@ impl Machine {
             // 没有可比的正文摘要：严格配对只会等到收敛期限，不如照原样宽松。
             if call.message.is_none() {
                 return Some(Decision::Fallback(V2FallbackReason::RolloutCallMissing));
+            }
+            // E6：接收方路径超长登记不进 `v2_receiver_paths`，定为严格永远配不出候选；
+            // 直接按宽松结算，不等到期。留言在上面的提前返回里已定案，走不到这里。
+            if wait.events.iter().any(|(item, _)| {
+                item.get("agentPath")
+                    .and_then(Value::as_str)
+                    .is_some_and(|s| s.len() > MAX_AGENT_PATH_BYTES)
+            }) {
+                return Some(Decision::Fallback(V2FallbackReason::ReceiverPathTooLong));
             }
             // 只有接收侧还能提供消费证据时，等待迟到的发起方路径才有意义。
             if self.v2_sender_path(op).is_none() {
