@@ -389,10 +389,26 @@ fn tree_log_全局暂存上限与未知线程不暂存() {
         &mut a,
     );
     assert!(m.runs.event_log.pending.is_empty());
-    for n in 0..25 {
+    // 每个线程都保持在每线程上限之下，只把全局暂存预填到临界；再用独立条目触发全局上限。
+    let mut n = 0;
+    let mut saturated = false;
+    while !saturated {
         let thread = format!("child-{n}");
+        n += 1;
         candidate(&mut m, &thread, "root");
-        for _ in 0..300 {
+        loop {
+            let thread_bytes: usize = m
+                .runs
+                .event_log
+                .pending
+                .iter()
+                .filter(|p| p.thread == thread)
+                .map(|p| p.bytes)
+                .sum();
+            if thread_bytes >= PER_THREAD_BYTES - 512 {
+                break;
+            }
+            let before = m.runs.event_log.pending.len();
             m.buffer_child_event_log(
                 &thread,
                 "item/completed",
@@ -400,13 +416,43 @@ fn tree_log_全局暂存上限与未知线程不暂存() {
                 false,
                 &mut a,
             );
+            if m.runs.event_log.pending.len() == before {
+                saturated = true;
+                break;
+            }
+        }
+        assert!(
+            m.runs
+                .event_log
+                .pending
+                .iter()
+                .filter(|p| p.thread == thread)
+                .map(|p| p.bytes)
+                .sum::<usize>()
+                < PER_THREAD_BYTES,
+            "每线程都低于上限：{thread}"
+        );
+        if saturated {
+            break;
         }
     }
-    assert!(m.runs.event_log.bytes <= GLOBAL_BYTES);
-    assert!(m.runs.event_log.bytes > GLOBAL_BYTES - 1024);
-    assert!(logs(&a)
-        .iter()
-        .any(|l| l.3["attribution"] == "unconfirmed" && l.3["summary"] == "同毫秒同正文"));
+    let queued = m.runs.event_log.pending.clone();
+    let queued_bytes = m.runs.event_log.bytes;
+    assert!(queued_bytes > GLOBAL_BYTES - PER_THREAD_BYTES);
+    let mut params = item("溢出线程", "溢出轮").unwrap();
+    params["item"]["id"] = json!("独立条目");
+    candidate(&mut m, "溢出线程", "root");
+    m.buffer_child_event_log("溢出线程", "item/completed", &Some(params), false, &mut a);
+    // 触发的是全局上限：该摘要立即以归属未确认保存，原暂存队列不变。
+    assert_eq!(m.runs.event_log.pending, queued);
+    assert_eq!(m.runs.event_log.bytes, queued_bytes);
+    let rows: Vec<_> = logs(&a)
+        .into_iter()
+        .filter(|l| l.3["itemId"] == "独立条目")
+        .collect();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].3["attribution"], "unconfirmed");
+    assert!(rows[0].3.get("late").is_none());
 }
 
 #[test]
@@ -477,14 +523,15 @@ fn evidence_to(
     );
 }
 #[test]
-fn gap_wu_历史线程的过期疑点保留原文() {
+fn gap_wu_历史线程无论证据状态都按未确认保存() {
     use EvidenceOutcome::{Failed, Unproven};
-    for (kind, outcome, expired, rejected, expect_saved) in [
-        (EvidenceKind::V2Interacted, Unproven, true, false, true),
-        (EvidenceKind::V2Interacted, Unproven, true, true, false),
-        (EvidenceKind::V2Interacted, Unproven, false, false, false),
-        (EvidenceKind::V2Completed, Unproven, false, false, false),
-        (EvidenceKind::V1ResumeAgent, Failed, true, false, false),
+    // 结算不再排除历史子代理：五种证据状态都保存一行归属未确认。
+    for (kind, outcome, expired, rejected) in [
+        (EvidenceKind::V2Interacted, Unproven, true, false),
+        (EvidenceKind::V2Interacted, Unproven, true, true),
+        (EvidenceKind::V2Interacted, Unproven, false, false),
+        (EvidenceKind::V2Completed, Unproven, false, false),
+        (EvidenceKind::V1ResumeAgent, Failed, true, false),
     ] {
         let mut m = setup();
         candidate(&mut m, "历史线程", "root");
@@ -509,15 +556,20 @@ fn gap_wu_历史线程的过期疑点保留原文() {
         m.sweep_event_log(generation);
         m.settle_event_log_step(&mut a);
         let rows = logs(&a);
-        assert_eq!(rows.len(), usize::from(expect_saved));
+        assert_eq!(
+            rows.len(),
+            1,
+            "{kind:?}/{outcome:?}/过期{expired}/被拒{rejected}"
+        );
         assert!(rows.iter().all(|l| l.2 == "条目完成"
             && l.3["attribution"] == "unconfirmed"
-            && l.3["summary"] == "同毫秒同正文"));
+            && l.3["summary"] == "同毫秒同正文"
+            && l.3.get("late").is_none()));
     }
 }
 
 #[test]
-fn tree_log_明确不归本运行的历史兄弟暂存超限不写缺口() {
+fn tree_log_历史兄弟暂存超限也按未确认保存不写缺口() {
     let mut m = setup();
     candidate(&mut m, "sibling", "root");
     candidate(&mut m, "unknown", "root");
@@ -526,6 +578,7 @@ fn tree_log_明确不归本运行的历史兄弟暂存超限不写缺口() {
         "entries":{"sibling":{"run-old":{"rootThreadId":"root","observedAt":1}}}
     }))
     .unwrap();
+    assert!(m.historical_subagent_for_run("run-a", "sibling"), "前置");
     let mut a = vec![];
     for _ in 0..1000 {
         for thread in ["sibling", "unknown"] {
@@ -534,14 +587,14 @@ fn tree_log_明确不归本运行的历史兄弟暂存超限不写缺口() {
     }
     let saved: std::collections::BTreeSet<String> = logs(&a)
         .into_iter()
-        .filter(|l| l.3["sourceRole"] == "subagent")
+        .filter(|l| l.3["sourceRole"] == "subagent" && l.3["attribution"] == "unconfirmed")
         .map(|l| l.3["threadId"].as_str().unwrap().to_owned())
         .collect();
-    assert_eq!(saved, ["unknown".to_owned()].into());
+    assert_eq!(saved, ["sibling".to_owned(), "unknown".to_owned()].into());
 }
 
 #[test]
-fn tree_log_明确不归本运行的历史兄弟暂存到期与关闭清理都不写缺口() {
+fn tree_log_历史兄弟暂存到期与关闭清理都按未确认保存不写缺口() {
     for close in [false, true] {
         let mut m = setup();
         candidate(&mut m, "sibling", "root");
@@ -575,7 +628,7 @@ fn tree_log_明确不归本运行的历史兄弟暂存到期与关闭清理都�
             .filter(|l| l.3["sourceRole"] == "subagent")
             .map(|l| l.3["threadId"].as_str().unwrap().to_owned())
             .collect();
-        assert_eq!(saved, ["unknown"], "关闭：{close}");
+        assert_eq!(saved, ["sibling", "unknown"], "关闭：{close}");
     }
 }
 impl Machine {
@@ -657,14 +710,10 @@ fn gap_wu_超限直接保存新摘要且不挤掉旧暂存() {
     let mut m = setup();
     candidate(&mut m, "乙", "root");
     let mut actions = vec![];
-    暂存(&mut m, "已有", &mut actions);
-    let size = m.runs.event_log.pending[0].bytes;
-    for _ in 1..PER_THREAD_BYTES / size {
+    // 接纳序号位数不同使每条暂存的字节数略有差异：填到出现第一条超限结算为止。
+    while logs(&actions).is_empty() {
         暂存(&mut m, "已有", &mut actions);
     }
-    assert_eq!(m.runs.event_log.bytes, PER_THREAD_BYTES / size * size);
-    assert!(m.runs.event_log.bytes + size > PER_THREAD_BYTES);
-    assert!(logs(&actions).is_empty());
     let old = m.runs.event_log.pending.clone();
     actions.clear();
     暂存(&mut m, "目标", &mut actions);
@@ -896,14 +945,19 @@ fn gap_wu_同一摘要逐个判断历史候选() {
     assert_eq!(m.runs.event_log.pending[0].candidates.len(), 2);
     m.clear_pending_event_log(&mut actions);
     let rows = logs(&actions);
-    assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].1, "run-b");
-    assert_eq!(rows[0].2, "条目完成");
-    assert_eq!(rows[0].3["attribution"], "unconfirmed");
+    // 历史候选同样保存：两个候选运行各一行归属未确认。
+    assert_eq!(rows.len(), 2);
+    assert_eq!(
+        rows.iter().map(|l| l.1.as_str()).collect::<Vec<_>>(),
+        ["run-a", "run-b"]
+    );
+    assert!(rows
+        .iter()
+        .all(|l| l.2 == "条目完成" && l.3["attribution"] == "unconfirmed"));
 }
 
 #[test]
-fn gap_wu_证据实际到期并淘汰后仍保存有疑点的历史摘要() {
+fn gap_wu_证据实际到期并淘汰后历史摘要仍按未确认保存() {
     let mut m = setup();
     for thread in ["乙", "对照"] {
         candidate(&mut m, thread, "root");
@@ -959,7 +1013,14 @@ fn gap_wu_证据实际到期并淘汰后仍保存有疑点的历史摘要() {
     m.clock.mono_ms = 30_000;
     m.settle_event_log_step(&mut actions);
     核对保存(&actions, "目标");
-    assert!(logs(&actions).iter().all(|l| l.3["threadId"] != "对照"));
+    // 对照线程（同样只有历史血缘）的摘要也按归属未确认保存。
+    let other: Vec<_> = logs(&actions)
+        .into_iter()
+        .filter(|l| l.3["threadId"] == "对照")
+        .collect();
+    assert_eq!(other.len(), 1);
+    assert_eq!(other[0].3["attribution"], "unconfirmed");
+    assert_eq!(other[0].3["summary"], "同毫秒同正文");
     assert!(m.runs.event_log.pending.is_empty());
 }
 
@@ -1024,9 +1085,10 @@ fn gap_wu_文件和派生等待只保护对应运行的历史候选() {
             assert!(rows
                 .iter()
                 .all(|r| r.3["attribution"] == "unconfirmed" && r.3["summary"] == "同毫秒同正文"));
+            // 不在等待的历史候选在到期时也已保存：两个运行各留一行。
             assert_eq!(
                 rows.iter().map(|r| r.1.as_str()).collect::<Vec<_>>(),
-                expected
+                ["run-a", "run-b"]
             );
         }
     }
@@ -1104,4 +1166,322 @@ fn gap_wu_接纳和计时器让同一步的绑定优先() {
         assert_eq!(rows[0].3["summary"], "同毫秒同正文");
         assert!(rows[0].3.get("attribution").is_none());
     }
+}
+
+/// P1-1：历史线程的摘要——开始在证据淘汰前暂存、正文与完成在淘汰后到达——
+/// 全部按归属未确认保存并落盘可取回。
+#[tokio::test]
+async fn gap_wu_历史线程淘汰后才到的摘要按未确认保存并可取回() {
+    let temp = crate::store::tests::Temp::new();
+    let (store, _) = crate::store::open(temp.config()).await.unwrap();
+    let mut m = setup();
+    candidate(&mut m, "历史线程", "root");
+    m.runs.index.child_history = serde_json::from_value(json!({
+        "coverage":"verified","retainedAfter":0,
+        "entries":{"历史线程":{"旧运行":{"rootThreadId":"root","observedAt":1}}}
+    }))
+    .unwrap();
+    evidence_to(
+        &mut m,
+        "历史线程",
+        EvidenceKind::V1ResumeAgent,
+        EvidenceOutcome::Pending,
+        false,
+        false,
+    );
+    let key = m.relations.operations.keys().next().unwrap().clone();
+    let mut actions = vec![];
+    m.buffer_child_event_log(
+        "历史线程",
+        "turn/started",
+        &Some(json!({"threadId":"历史线程","turn":{"id":"轮","status":"inProgress","items":[]}})),
+        false,
+        &mut actions,
+    );
+    assert_eq!(m.runs.event_log.pending.len(), 1);
+    // 证据实际到期并把操作表填满到上限，新通知真正淘汰掉它。
+    m.clock.mono_ms = 2;
+    m.facts_expire(&mut actions);
+    assert!(m.relations.operations[&key].proof_expired);
+    for i in 1..MAX_OPERATIONS {
+        let mut other = m.relations.operations[&key].clone();
+        other.key.item_id = format!("旧条目{i}");
+        other.first_seen_ms = 1;
+        other.receivers.clear();
+        other.proof_expired = false;
+        m.relations.operations.insert(other.key.clone(), other);
+    }
+    m.on_relation_notification(
+        &crate::claim::HeldNotification {
+            method: "item/completed".into(),
+            committed: false,
+            params: Some(json!({"threadId":"root","turnId":"父轮","item":{
+                "id":"新操作","type":"subAgentActivity","kind":"completed","agentThreadId":"其他"
+            }})),
+        },
+        &mut actions,
+    );
+    assert!(!m.relations.operations.contains_key(&key));
+    // 淘汰后才到的正文与完成摘要。
+    m.buffer_child_event_log(
+        "历史线程",
+        "item/completed",
+        &item("历史线程", "轮"),
+        false,
+        &mut actions,
+    );
+    m.buffer_child_event_log(
+        "历史线程",
+        "turn/completed",
+        &Some(
+            json!({"threadId":"历史线程","turn":{"id":"轮","status":"completed",
+            "items":[{"id":"same-item","type":"agentMessage","text":"同毫秒同正文"}]}}),
+        ),
+        false,
+        &mut actions,
+    );
+    assert_eq!(m.runs.event_log.pending.len(), 3);
+    m.clock.mono_ms += PENDING_MS;
+    m.settle_event_log_step(&mut actions);
+    let rows: Vec<_> = logs(&actions)
+        .into_iter()
+        .filter(|l| l.3["turnId"] == "轮")
+        .collect();
+    assert_eq!(
+        rows.iter().map(|l| l.2.as_str()).collect::<Vec<_>>(),
+        ["轮次开始", "条目完成", "轮次完成"]
+    );
+    assert!(rows.iter().all(|l| l.1 == "run-a"
+        && l.3["attribution"] == "unconfirmed"
+        && l.3.get("late").is_none()
+        && l.3["summaryId"].is_string()));
+    let expected = format!(
+        "{}\n",
+        actions
+            .iter()
+            .flat_map(|a| match a {
+                Action::Store(StoreOp::AppendLog { lines, .. }) => lines.clone(),
+                _ => vec![],
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    for action in actions {
+        if let Action::Store(op) = action {
+            store.submit(op);
+        }
+    }
+    assert!(store
+        .drain(std::time::Duration::from_secs(2))
+        .await
+        .abandoned
+        .is_empty());
+    let path = temp
+        .dir()
+        .join(format!("runs/{}.log", m.runs.runs["run-a"].short_id));
+    assert_eq!(std::fs::read_to_string(path).unwrap(), expected);
+}
+
+/// P2-2：淘汰前后的明确失败通知都保存摘要；仍不授予管理权（无绑定、不成为成员）。
+#[test]
+fn gap_wu_淘汰前后的明确失败都保存且不授予管理权() {
+    for after in [false, true] {
+        let mut m = setup();
+        candidate(&mut m, "历史线程", "root");
+        m.runs.index.child_history = serde_json::from_value(json!({
+            "coverage":"verified","retainedAfter":0,
+            "entries":{"历史线程":{"旧运行":{"rootThreadId":"root","observedAt":1}}}
+        }))
+        .unwrap();
+        evidence_to(
+            &mut m,
+            "历史线程",
+            EvidenceKind::V1ResumeAgent,
+            EvidenceOutcome::Pending,
+            false,
+            false,
+        );
+        let key = m.relations.operations.keys().next().unwrap().clone();
+        let failed = Some(
+            json!({"threadId":"历史线程","turn":{"id":"轮","status":"failed",
+                "error":{"message":"boom"},"items":[]}}),
+        );
+        let mut actions = vec![];
+        if !after {
+            m.buffer_child_event_log("历史线程", "turn/completed", &failed, false, &mut actions);
+        }
+        // 证据到期并把操作表填满，新通知真正淘汰它。
+        m.clock.mono_ms = 2;
+        m.facts_expire(&mut actions);
+        assert!(m.relations.operations[&key].proof_expired);
+        for i in 1..MAX_OPERATIONS {
+            let mut other = m.relations.operations[&key].clone();
+            other.key.item_id = format!("旧条目{i}");
+            other.first_seen_ms = 1;
+            other.receivers.clear();
+            other.proof_expired = false;
+            m.relations.operations.insert(other.key.clone(), other);
+        }
+        m.on_relation_notification(
+            &crate::claim::HeldNotification {
+                method: "item/completed".into(),
+                committed: false,
+                params: Some(json!({"threadId":"root","turnId":"父轮","item":{
+                    "id":"新操作","type":"subAgentActivity","kind":"completed","agentThreadId":"其他"
+                }})),
+            },
+            &mut actions,
+        );
+        assert!(!m.relations.operations.contains_key(&key));
+        if after {
+            m.buffer_child_event_log("历史线程", "turn/completed", &failed, false, &mut actions);
+        }
+        m.clock.mono_ms += PENDING_MS;
+        m.settle_event_log_step(&mut actions);
+        let rows: Vec<_> = logs(&actions)
+            .into_iter()
+            .filter(|l| l.3["threadId"] == "历史线程")
+            .collect();
+        assert!(
+            rows.iter().any(|l| l.2 == "轮次完成"
+                && l.3["attribution"] == "unconfirmed"
+                && l.3.get("late").is_none()),
+            "淘汰后={after}：{rows:?}"
+        );
+        assert!(m.binding("历史线程", "轮").is_none());
+        assert!(!m.relations.contexts["run-a"]
+            .members
+            .contains_key("历史线程"));
+    }
+}
+
+/// P2-1 写入端：到期按未确认结算、留下备忘；迟到确认补写确认版——同一身份、
+/// late 标记、不带归属字段、原观察时间；重复补写与另一运行副本不受影响。
+#[test]
+fn gap_wu_迟到确认沿用同一身份补写确认版() {
+    let mut m = setup();
+    open(&mut m, "run-b", "root");
+    candidate(&mut m, "乙", "root");
+    let mut actions = vec![];
+    // 同轮两条摘要：第一条到期结算留备忘，第二条仍在暂存。
+    for id in ["第一条", "第二条"] {
+        let mut params = item("乙", "目标").unwrap();
+        params["item"]["id"] = json!(id);
+        params["item"]["text"] = json!(id);
+        m.buffer_child_event_log("乙", "item/completed", &Some(params), false, &mut actions);
+    }
+    m.runs.event_log.pending[0].expires = 0;
+    m.settle_event_log_step(&mut actions);
+    assert_eq!(m.runs.event_log.pending.len(), 1, "第二条仍暂存");
+    let unconfirmed: Vec<_> = logs(&actions)
+        .into_iter()
+        .filter(|l| l.3["itemId"] == "第一条")
+        .collect();
+    // 两个候选运行各一行归属未确认，同一身份，不带 late。
+    assert_eq!(unconfirmed.len(), 2);
+    let summary_id = unconfirmed[0].3["summaryId"].clone();
+    assert!(summary_id.is_string());
+    assert!(unconfirmed.iter().all(|l| l.3["summaryId"] == summary_id
+        && l.3["attribution"] == "unconfirmed"
+        && l.3.get("late").is_none()));
+    assert_ne!(
+        unconfirmed[0].3["eventId"], unconfirmed[1].3["eventId"],
+        "同一身份的各行 eventId 仍不同"
+    );
+    // 迟到确认：暂存的第二条与结算备忘的第一条按接纳序号合并补写。
+    actions.clear();
+    bind(&mut m, "run-a", "乙", "目标", "root");
+    m.flush_bound_event_log("run-a", "乙", "目标", "root", &mut actions);
+    let confirmed: Vec<_> = logs(&actions)
+        .into_iter()
+        .filter(|l| l.3["turnId"] == "目标")
+        .collect();
+    assert_eq!(confirmed.len(), 2);
+    assert_eq!(
+        confirmed
+            .iter()
+            .map(|l| l.3["itemId"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["第一条", "第二条"],
+        "按接纳序号合并"
+    );
+    assert!(confirmed
+        .iter()
+        .all(|l| l.1 == "run-a" && l.3["late"] == true && l.3.get("attribution").is_none()));
+    assert_eq!(confirmed[0].3["summaryId"], summary_id);
+    // 重复补写不再写。
+    actions.clear();
+    m.flush_bound_event_log("run-a", "乙", "目标", "root", &mut actions);
+    assert!(logs(&actions).is_empty());
+}
+
+/// 已结算备忘有界：总字节不超过全局上限（超限淘汰最旧）；兜底时长到期不再补写。
+#[test]
+fn gap_wu_已结算备忘有界超限淘汰最旧且超期不补写() {
+    let mut m = setup();
+    let mut actions = vec![];
+    // 逐条到期结算：每条暂存摘要留下一份备忘。单调时钟不动，备忘不会到期。
+    // 累积到字节上限触发淘汰为止；最旧的备忘-0 应被淘汰。
+    let mut n = 0;
+    while n == 0
+        || m.runs
+            .event_log
+            .settled
+            .iter()
+            .any(|memo| memo.thread == "备忘-0")
+    {
+        let thread = format!("备忘-{n}");
+        candidate(&mut m, &thread, "root");
+        m.buffer_child_event_log(
+            &thread,
+            "item/completed",
+            &item(&thread, "轮"),
+            false,
+            &mut actions,
+        );
+        m.runs.event_log.pending.back_mut().unwrap().expires = 0;
+        m.settle_event_log_step(&mut actions);
+        n += 1;
+        assert!(n < 100_000, "备忘字节上限未触发淘汰");
+    }
+    assert!(m.runs.event_log.settled_bytes <= GLOBAL_BYTES);
+    // 超限淘汰最旧：最早的备忘不再补写。
+    actions.clear();
+    bind(&mut m, "run-a", "备忘-0", "轮", "root");
+    m.flush_bound_event_log("run-a", "备忘-0", "轮", "root", &mut actions);
+    assert!(
+        logs(&actions).iter().all(|l| l.3["threadId"] != "备忘-0"),
+        "被淘汰的备忘不再补写"
+    );
+    // 仍保留的备忘能补写。
+    let retained = m.runs.event_log.settled.back().unwrap().thread.clone();
+    bind(&mut m, "run-a", &retained, "轮", "root");
+    m.flush_bound_event_log("run-a", &retained, "轮", "root", &mut actions);
+    assert!(
+        logs(&actions)
+            .iter()
+            .any(|l| l.3["threadId"] == retained && l.3["late"] == true),
+        "保留的备忘仍补写"
+    );
+    // 兜底时长：到期后不再补写。
+    let mut m = setup();
+    candidate(&mut m, "超期线程", "root");
+    let mut actions = vec![];
+    m.buffer_child_event_log(
+        "超期线程",
+        "item/completed",
+        &item("超期线程", "轮"),
+        false,
+        &mut actions,
+    );
+    m.runs.event_log.pending.back_mut().unwrap().expires = 0;
+    m.settle_event_log_step(&mut actions);
+    m.clock.mono_ms = 600_001;
+    actions.clear();
+    bind(&mut m, "run-a", "超期线程", "轮", "root");
+    m.flush_bound_event_log("run-a", "超期线程", "轮", "root", &mut actions);
+    assert!(
+        logs(&actions).iter().all(|l| l.3["threadId"] != "超期线程"),
+        "超期备忘不再补写"
+    );
 }

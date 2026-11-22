@@ -1004,6 +1004,8 @@ fn 历史兄弟收到平级消息不算冲突_兄弟新轮在跑时仍阻塞收�
         } else {
             all.extend(sweep_pending_event_log(&mut m, &all));
         }
+        // 历史兄弟的摘要也保存：归属未确认、不带 late，但不授予管理权。
+        let mut saved = 0;
         for action in &all {
             if let Action::Store(crate::store::StoreOp::AppendLog { lines, .. }) = action {
                 for line in lines {
@@ -1012,11 +1014,29 @@ fn 历史兄弟收到平级消息不算冲突_兄弟新轮在跑时仍阻塞收�
                         let row: serde_json::Value =
                             serde_json::from_str(fields[3].strip_prefix("\t@cxb2 ").unwrap())
                                 .unwrap();
-                        assert!(!(row["threadId"] == S && row["turnId"] == "兄弟新轮"));
+                        if row["threadId"] == S && row["turnId"] == "兄弟新轮" {
+                            saved += 1;
+                            assert_eq!(row["attribution"], "unconfirmed");
+                            assert!(row.get("late").is_none());
+                        }
                     }
                 }
             }
         }
+        assert!(saved >= 1, "R2 按未确认保存兄弟新轮：{close}");
+        assert!(
+            m.relations
+                .aux
+                .classifications
+                .get(&(R2.into(), S.into()))
+                .is_some_and(|c| c.membership == Membership::Historical),
+            "仍是历史子代理：{close}"
+        );
+        assert!(
+            m.manage_context(R2)
+                .is_none_or(|c| !c.members.contains_key(S)),
+            "不授予管理权：{close}"
+        );
         assert_no_alarm(&all);
     }
 }

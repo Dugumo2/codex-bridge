@@ -14,18 +14,25 @@ const GLOBAL_BYTES: usize = 1024 * 1024;
 const PENDING_MS: u64 = 30_000;
 /// 单调时钟限定每条摘要的总等待时间，归属证据不会延长此期限。
 const MAX_PENDING_MS: u64 = 120_000;
+/// 已结算备忘的兜底时长：超出后不再补写确认版；已落盘的未确认版不受影响。
+const SETTLED_MS: u64 = 600_000;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(super) struct EventLog {
     sequence: u64,
+    /// 每条暂存摘要的稳定身份序号；summaryId 为 "{epoch}:s{n}"，补写确认版沿用同一个号。
+    accepted: u64,
     last_timestamp: u64,
     pending: VecDeque<Pending>,
     bytes: usize,
+    /// 已按未确认结算、仍等迟到确认的备忘；与暂存队列分开记账，有界。
+    settled: VecDeque<SettledMemo>,
+    settled_bytes: usize,
     timer: Option<u64>,
     timer_deadline: Option<u64>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LogNote {
     Unconfirmed,
     DiscoveryIncomplete,
@@ -46,15 +53,39 @@ struct Pending {
     now: u64,
     expires: u64,
     summary: Summary,
+    /// 接纳序号；summaryId 的稳定部分，补写确认版沿用。
+    seq: u64,
     candidates: Vec<Candidate>,
     bytes: usize,
     deadline: u64,
 }
 
+/// 已按归属未确认结算的摘要备忘：迟到确认绑定到某个运行时，按它补写确认版。
+/// 有界：总字节不超过 GLOBAL_BYTES（超限淘汰最旧），且每条只留 SETTLED_MS。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct SettledMemo {
+    thread: String,
+    turn: String,
+    seq: u64,
+    /// 原观察时间；补写行沿用。
+    now: u64,
+    summary: Summary,
+    /// 收到未确认副本且结算时仍在跑的候选运行；只剩已结束的运行时不留备忘。
+    runs: Vec<String>,
+    bytes: usize,
+    /// 单调时钟的兜底期限。
+    expires: u64,
+}
+
 #[derive(Clone, Copy)]
 enum Settlement<'a> {
+    /// 超限接纳：结算后留下备忘等迟到确认。
+    Limit,
+    /// 关闭清理：结算但不留备忘。
     All,
+    /// 运行结束：结算但不留备忘。
     Ending(&'a str),
+    /// 暂存到期：结算后留下备忘等迟到确认。
     Expired,
 }
 
@@ -62,7 +93,6 @@ enum Settlement<'a> {
 struct Candidate {
     run: String,
     parent: String,
-    expired_proof_evicted: bool,
 }
 
 fn clean(text: &str, max: usize) -> (String, bool) {
@@ -128,6 +158,7 @@ impl Runs {
             truncated,
             false,
             None,
+            None,
             actions,
         );
     }
@@ -147,6 +178,7 @@ impl Runs {
         truncated: bool,
         late: bool,
         note: Option<LogNote>,
+        summary_seq: Option<u64>,
         actions: &mut Vec<Action>,
     ) {
         if self.phase != Phase::Open {
@@ -173,7 +205,11 @@ impl Runs {
             "parentThreadId": parent, "shortId": short, "sourceRole": role,
             "turnId": turn, "itemId": item, "summary": summary, "truncated": truncated || capped,
         });
-        if late || now < self.event_log.last_timestamp {
+        if let Some(seq) = summary_seq {
+            payload["summaryId"] = json!(format!("{}:s{seq}", self.epoch));
+        }
+        // 归属未确认的行永不标 late：它按原观察时间结算，不表示迟到写入。
+        if note != Some(LogNote::Unconfirmed) && (late || now < self.event_log.last_timestamp) {
             payload["late"] = json!(true);
         }
         match note {
@@ -320,6 +356,7 @@ impl Machine {
                 &summary,
                 false,
                 None,
+                None,
                 actions,
             );
         }
@@ -336,6 +373,7 @@ impl Machine {
         summary: &Summary,
         late: bool,
         note: Option<LogNote>,
+        summary_seq: Option<u64>,
         actions: &mut Vec<Action>,
     ) {
         self.runs.log_source(
@@ -351,6 +389,7 @@ impl Machine {
             summary.truncated,
             late,
             note,
+            summary_seq,
             actions,
         );
     }
@@ -411,12 +450,20 @@ impl Machine {
             return;
         }
         for summary in summaries(thread, turn, method, params, self.clock.now_ms) {
+            let seq = self
+                .runs
+                .event_log
+                .accepted
+                .checked_add(1)
+                .expect("摘要序号已耗尽");
+            self.runs.event_log.accepted = seq;
             let mut pending = Pending {
                 thread: thread.into(),
                 turn: turn.into(),
                 now: self.clock.now_ms,
                 expires: self.clock.mono_ms.saturating_add(PENDING_MS),
                 summary,
+                seq,
                 candidates: candidates.clone(),
                 bytes: 0,
                 deadline: self.clock.mono_ms.saturating_add(MAX_PENDING_MS),
@@ -433,7 +480,7 @@ impl Machine {
             if pending.bytes + thread_bytes > PER_THREAD_BYTES
                 || pending.bytes + self.runs.event_log.bytes > GLOBAL_BYTES
             {
-                self.settle_pending_candidates(&mut pending, Settlement::All, actions);
+                self.settle_pending_candidates(&mut pending, Settlement::Limit, actions);
                 continue;
             }
             self.runs.event_log.bytes += pending.bytes;
@@ -505,11 +552,7 @@ impl Machine {
                     )
                 })
             })
-            .map(|(run, parent)| Candidate {
-                run,
-                parent,
-                expired_proof_evicted: false,
-            })
+            .map(|(run, parent)| Candidate { run, parent })
             .collect()
     }
 
@@ -527,24 +570,46 @@ impl Machine {
         }) {
             return;
         }
-        let pending = std::mem::take(&mut self.runs.event_log.pending);
-        for event in pending {
+        let mut hits: Vec<(u64, u64, Summary)> = vec![];
+        for event in std::mem::take(&mut self.runs.event_log.pending) {
             if event.thread == thread && event.turn == turn {
                 self.runs.event_log.bytes -= event.bytes;
-                self.write_child_summary(
-                    run,
-                    thread,
-                    parent,
-                    turn,
-                    event.now,
-                    &event.summary,
-                    true,
-                    None,
-                    actions,
-                );
+                hits.push((event.seq, event.now, event.summary));
             } else {
                 self.runs.event_log.pending.push_back(event);
             }
+        }
+        // 已结算备忘：超期的丢掉，匹配的摘出来与暂存一起按接纳序号补写。
+        let mut settled_bytes = self.runs.event_log.settled_bytes;
+        let mut settled = std::mem::take(&mut self.runs.event_log.settled);
+        settled.retain(|memo| {
+            if memo.expires <= self.clock.mono_ms {
+                settled_bytes -= memo.bytes;
+                return false;
+            }
+            if memo.thread == thread && memo.turn == turn {
+                settled_bytes -= memo.bytes;
+                hits.push((memo.seq, memo.now, memo.summary.clone()));
+                return false;
+            }
+            true
+        });
+        self.runs.event_log.settled = settled;
+        self.runs.event_log.settled_bytes = settled_bytes;
+        hits.sort_by_key(|(seq, ..)| *seq);
+        for (seq, now, summary) in hits {
+            self.write_child_summary(
+                run,
+                thread,
+                parent,
+                turn,
+                now,
+                &summary,
+                true,
+                None,
+                Some(seq),
+                actions,
+            );
         }
     }
 
@@ -568,17 +633,15 @@ impl Machine {
                 &event.summary,
                 true,
                 None,
+                Some(event.seq),
                 actions,
             );
             event.candidates.clear();
             return;
         }
+        let mut written: Vec<String> = vec![];
         event.candidates.retain(|candidate| {
-            let Candidate {
-                run,
-                parent,
-                expired_proof_evicted,
-            } = candidate;
+            let Candidate { run, parent } = candidate;
             match when {
                 Settlement::Ending(ending) if ending != run => return true,
                 Settlement::Expired => {
@@ -594,21 +657,59 @@ impl Machine {
                 }
                 _ => {}
             }
-            if *expired_proof_evicted || !self.event_log_disowned(run, &event.thread) {
-                self.write_child_summary(
-                    run,
-                    &event.thread,
-                    parent,
-                    &event.turn,
-                    event.now,
-                    &event.summary,
-                    event.now != self.clock.now_ms,
-                    Some(LogNote::Unconfirmed),
-                    actions,
-                );
-            }
+            // 历史子代理同样按归属未确认保存；归属排除已移除，结算只负责落盘。
+            self.write_child_summary(
+                run,
+                &event.thread,
+                parent,
+                &event.turn,
+                event.now,
+                &event.summary,
+                false,
+                Some(LogNote::Unconfirmed),
+                Some(event.seq),
+                actions,
+            );
+            written.push(run.clone());
             false
         });
+        // 到期或超限结算的摘要留下备忘，迟到确认时补写确认版；运行结束或关闭不留。
+        if event.candidates.is_empty() && matches!(when, Settlement::Expired | Settlement::Limit) {
+            let live: Vec<String> = written
+                .into_iter()
+                .filter(|run| {
+                    self.runs.runs.get(run).is_some_and(|r| {
+                        matches!(
+                            r.state,
+                            super::RunState::Running | super::RunState::Stopping
+                        )
+                    })
+                })
+                .collect();
+            if !live.is_empty() {
+                let mut memo = SettledMemo {
+                    thread: event.thread.clone(),
+                    turn: event.turn.clone(),
+                    seq: event.seq,
+                    now: event.now,
+                    summary: event.summary.clone(),
+                    runs: live,
+                    bytes: 0,
+                    expires: self.clock.mono_ms.saturating_add(SETTLED_MS),
+                };
+                memo.bytes = serde_json::to_vec(&memo).expect("备忘可序列化").len();
+                while memo.bytes + self.runs.event_log.settled_bytes > GLOBAL_BYTES {
+                    match self.runs.event_log.settled.pop_front() {
+                        Some(oldest) => self.runs.event_log.settled_bytes -= oldest.bytes,
+                        None => break,
+                    }
+                }
+                if memo.bytes <= GLOBAL_BYTES {
+                    self.runs.event_log.settled_bytes += memo.bytes;
+                    self.runs.event_log.settled.push_back(memo);
+                }
+            }
+        }
     }
 
     /// 其他候选仍能在之后绑定。字节数按最初接纳的大小保守记账，直到最后一个候选结算。
@@ -627,39 +728,18 @@ impl Machine {
                 self.runs.event_log.pending.push_back(event);
             }
         }
-        self.schedule_event_log(actions);
-    }
-
-    /// 操作缓存与摘要独立限容。只把尚未解决的疑点交给受影响的候选，随摘要一起释放。
-    pub(crate) fn remember_evicted_log_proof(&mut self, op: &EvidenceOperation) {
-        if !op.proof_expired || op.outcome != EvidenceOutcome::Unproven {
-            return;
-        }
-        for pending in &mut self.runs.event_log.pending {
-            if op.receivers.contains(&pending.thread)
-                && !op.rejected_receivers.contains_key(&pending.thread)
-            {
-                for candidate in &mut pending.candidates {
-                    if op.run_id.is_empty() || op.run_id == candidate.run {
-                        candidate.expired_proof_evicted = true;
-                    }
-                }
+        // 已结束的运行不会再确认：只属于它的备忘丢掉。
+        let mut kept = VecDeque::new();
+        for mut memo in std::mem::take(&mut self.runs.event_log.settled) {
+            memo.runs.retain(|run_id| *run_id != run);
+            if memo.runs.is_empty() {
+                self.runs.event_log.settled_bytes -= memo.bytes;
+            } else {
+                kept.push_back(memo);
             }
         }
-    }
-
-    fn event_log_disowned(&self, run: &str, thread: &str) -> bool {
-        if self.event_log_evidence_in_flight(run, thread) {
-            return false;
-        }
-        let expired = self.relations.operations.values().any(|op| {
-            op.outcome == EvidenceOutcome::Unproven
-                && op.proof_expired
-                && (op.run_id == run || op.run_id.is_empty())
-                && op.receivers.contains(thread)
-                && !op.rejected_receivers.contains_key(thread)
-        });
-        !expired && self.historical_subagent_for_run(run, thread)
+        self.runs.event_log.settled = kept;
+        self.schedule_event_log(actions);
     }
 
     /// 还在进行、可能把这个线程的轮次归给该运行的证据：等配对或等发起方绑定的跟进、
@@ -706,6 +786,17 @@ impl Machine {
             }
             self.runs.event_log.pending.push_back(event);
         }
+        // 备忘兜底期限到了就不再等确认。
+        let mut settled_bytes = self.runs.event_log.settled_bytes;
+        self.runs.event_log.settled.retain(|memo| {
+            if memo.expires <= self.clock.mono_ms {
+                settled_bytes -= memo.bytes;
+                false
+            } else {
+                true
+            }
+        });
+        self.runs.event_log.settled_bytes = settled_bytes;
     }
 
     pub(crate) fn settle_event_log_step(&mut self, actions: &mut Vec<Action>) {
@@ -744,6 +835,9 @@ impl Machine {
             self.settle_pending_candidates(&mut pending, Settlement::All, actions);
         }
         self.runs.event_log.bytes = 0;
+        // 关闭清理不留备忘。
+        self.runs.event_log.settled.clear();
+        self.runs.event_log.settled_bytes = 0;
         self.cancel_event_log_timer(actions);
     }
 
@@ -784,6 +878,7 @@ impl Machine {
                 false,
                 false,
                 None,
+                None,
                 actions,
             );
         }
@@ -816,6 +911,7 @@ impl Machine {
             false,
             false,
             Some(LogNote::DiscoveryIncomplete),
+            None,
             actions,
         );
     }

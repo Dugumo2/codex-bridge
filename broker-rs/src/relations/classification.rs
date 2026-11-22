@@ -299,7 +299,7 @@ impl Machine {
                 // Pending 是可被后续核实消除的分类诊断，不能持久化为覆盖缺口。
                 self.runs.log_source(run, thread, None, "subagent", None, None, self.clock.now_ms,
                     "候选分类", &format!("runId={run} source={source} generation={gen} workEpoch={epoch} classification={membership:?}"),
-                    false, false, None, actions);
+                    false, false, None, None, actions);
             }
         }
         membership
