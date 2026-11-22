@@ -249,10 +249,16 @@ fn 核对发现分页(status: &str) {
     add_child(&mut m, &mut mock);
     let (op, mut queue) = begin(&mut m);
     let id = 1;
-    m.relations.aux.rollout.rollout_reads.insert(id, ReadTicket {
-        id, thread: C.into(), conn_epoch: m.relations.conn_epoch,
-        deadline: m.clock.mono_ms + 30_000, state: ReadTicketState::Active,
-    });
+    m.relations.aux.rollout.rollout_reads.insert(
+        id,
+        ReadTicket {
+            id,
+            thread: C.into(),
+            conn_epoch: m.relations.conn_epoch,
+            deadline: m.clock.mono_ms + 30_000,
+            state: ReadTicketState::Active,
+        },
+    );
     let mut list = None;
     while let Some(action) = queue.pop_front() {
         let Action::Request(context) = action else {
@@ -293,8 +299,14 @@ fn 核对发现分页(status: &str) {
         ));
     }
     let list = list.expect("应走到轮次分页");
-    assert_eq!(m.relations.aux.rollout.rollout_reads[&id].state,
-        if status == "notLoaded" { ReadTicketState::Retired } else { ReadTicketState::Active });
+    assert_eq!(
+        m.relations.aux.rollout.rollout_reads[&id].state,
+        if status == "notLoaded" {
+            ReadTicketState::Retired
+        } else {
+            ReadTicketState::Active
+        }
+    );
     m.candidate_changed(C);
     let next = mock.inject(
         &mut m,
@@ -341,43 +353,89 @@ fn 核对元数据卸载(loaded_read: bool) {
         let (op, mut queue) = begin(&mut m);
         let ctx = loop {
             let action = queue.pop_front().expect("发现应派出指定元数据读取");
-            let Action::Request(ctx) = action else { continue };
-            if !matches!(ctx.operation, crate::claim::Operation::Discovery { .. }) { continue; }
-            if ctx.method == "thread/read" && params(&ctx)["threadId"] == target { break ctx; }
+            let Action::Request(ctx) = action else {
+                continue;
+            };
+            if !matches!(ctx.operation, crate::claim::Operation::Discovery { .. }) {
+                continue;
+            }
+            if ctx.method == "thread/read" && params(&ctx)["threadId"] == target {
+                break ctx;
+            }
             let value = match ctx.method.as_str() {
-                "thread/list" if !loaded_read && params(&ctx)["archived"] == false =>
-                    json!({"data":[mock.thread_info(C).unwrap()],"nextCursor":null}),
+                "thread/list" if !loaded_read && params(&ctx)["archived"] == false => {
+                    json!({"data":[mock.thread_info(C).unwrap()],"nextCursor":null})
+                }
                 "thread/loaded/list" if loaded_read => json!({"data":[C],"nextCursor":null}),
-                "thread/list" | "thread/loaded/list" | "thread/turns/list" => json!({"data":[],"nextCursor":null}),
+                "thread/list" | "thread/loaded/list" | "thread/turns/list" => {
+                    json!({"data":[],"nextCursor":null})
+                }
                 "thread/goal/get" => json!({"goal":null}),
                 "thread/read" => json!({"thread":mock.thread_info(C).unwrap()}),
                 other => panic!("未预期请求 {other}"),
             };
-            queue.extend(mock.inject(&mut m, Event::Reply { context: ctx, result: Ok(value) }));
+            queue.extend(mock.inject(
+                &mut m,
+                Event::Reply {
+                    context: ctx,
+                    result: Ok(value),
+                },
+            ));
         };
         let work = &m.relations.aux.work[&op];
         assert_eq!(work.reads_in_flight.contains(target), loaded_read);
         assert!(work.read_stamps.contains_key(target));
         let epoch = m.relations.conn_epoch;
-        m.relations.aux.rollout.rollout_reads.insert(1, ReadTicket {
-            id:1, thread:target.into(), conn_epoch:epoch, deadline:m.clock.mono_ms + 30_000,
-            state:ReadTicketState::Active,
-        });
-        if case == "活动已变" { m.candidate_changed(target); }
-        if case == "版本已淘汰" { m.relations.aux.candidate_versions.remove(target); }
+        m.relations.aux.rollout.rollout_reads.insert(
+            1,
+            ReadTicket {
+                id: 1,
+                thread: target.into(),
+                conn_epoch: epoch,
+                deadline: m.clock.mono_ms + 30_000,
+                state: ReadTicketState::Active,
+            },
+        );
+        if case == "活动已变" {
+            m.candidate_changed(target);
+        }
+        if case == "版本已淘汰" {
+            m.relations.aux.candidate_versions.remove(target);
+        }
         let info = json!({"id":if case == "身份不符" { "别的线程" } else { target },
             "status":{"type":if case == "仍在线" { "idle" } else { "notLoaded" }}, "canAcceptDirectInput":true});
-        mock.inject(&mut m, Event::Reply { context:ctx, result:Ok(json!({"thread":info})) });
-        assert_eq!(m.relations.aux.rollout.rollout_reads[&1].state,
-            if case == "卸载" { ReadTicketState::Retired } else { ReadTicketState::Active }, "{case}");
+        mock.inject(
+            &mut m,
+            Event::Reply {
+                context: ctx,
+                result: Ok(json!({"thread":info})),
+            },
+        );
+        assert_eq!(
+            m.relations.aux.rollout.rollout_reads[&1].state,
+            if case == "卸载" {
+                ReadTicketState::Retired
+            } else {
+                ReadTicketState::Active
+            },
+            "{case}"
+        );
         if !loaded_read && case == "活动已变" {
-            assert_eq!(m.thread_capability(P), Some(true), "活动变化只影响卸载取样的时效");
+            assert_eq!(
+                m.thread_capability(P),
+                Some(true),
+                "活动变化只影响卸载取样的时效"
+            );
         }
     }
 }
 
 #[test]
-fn gap_wu_根能力回查只凭当前同线程卸载退休读取() { 核对元数据卸载(false); }
+fn gap_wu_根能力回查只凭当前同线程卸载退休读取() {
+    核对元数据卸载(false);
+}
 
 #[test]
-fn gap_wu_已加载列表定向回查只凭当前同线程卸载退休读取() { 核对元数据卸载(true); }
+fn gap_wu_已加载列表定向回查只凭当前同线程卸载退休读取() {
+    核对元数据卸载(true);
+}

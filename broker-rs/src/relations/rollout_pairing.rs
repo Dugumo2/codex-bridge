@@ -179,7 +179,8 @@ impl Machine {
     /// 退订或传输断档前派发的读取不能参与后续配对。
     pub(crate) fn invalidate_rollout_reads(&mut self, thread: Option<&str>) {
         for ticket in self.relations.aux.rollout.rollout_reads.values_mut() {
-            if ticket.state == ReadTicketState::Active && thread.is_none_or(|t| t == ticket.thread) {
+            if ticket.state == ReadTicketState::Active && thread.is_none_or(|t| t == ticket.thread)
+            {
                 ticket.state = ReadTicketState::Interrupted;
             }
         }
@@ -359,9 +360,15 @@ impl Machine {
     }
 
     pub(super) fn rollout_call(&self, key: &EvidenceKey) -> Option<&RolloutCall> {
-        self.relations.aux.rollout.calls.get(&(key.parent_thread_id.clone(), key.item_id.clone()))
-            .filter(|c| c.epoch == self.relations.conn_epoch
-                && self.clock.mono_ms < c.at.saturating_add(EVIDENCE_TTL_MS))
+        self.relations
+            .aux
+            .rollout
+            .calls
+            .get(&(key.parent_thread_id.clone(), key.item_id.clone()))
+            .filter(|c| {
+                c.epoch == self.relations.conn_epoch
+                    && self.clock.mono_ms < c.at.saturating_add(EVIDENCE_TTL_MS)
+            })
     }
 
     fn rollout_decision(&self, key: &EvidenceKey, wait: &RolloutWait) -> Option<Decision> {
@@ -637,7 +644,9 @@ impl Machine {
         let state = &mut self.relations.aux.rollout;
         let tickets = &mut state.rollout_reads;
         state.files.retain(|thread, file| {
-            if file.epoch != epoch || (matches!(file.path, RolloutPathState::Failed(_)) && now >= file.next_at) {
+            if file.epoch != epoch
+                || (matches!(file.path, RolloutPathState::Failed(_)) && now >= file.next_at)
+            {
                 return false;
             }
             if needed.contains(thread) {
@@ -769,7 +778,12 @@ impl Machine {
     fn rollout_needed(&self) -> BTreeSet<String> {
         let mut needed = BTreeSet::new();
         for (key, wait) in &self.relations.aux.rollout.waits {
-            if !self.relations.operations.get(key).is_some_and(|op| self.rollout_wait_live(op)) {
+            if !self
+                .relations
+                .operations
+                .get(key)
+                .is_some_and(|op| self.rollout_wait_live(op))
+            {
                 continue;
             }
             needed.insert(key.parent_thread_id.clone());
@@ -869,7 +883,13 @@ impl Machine {
             .and_then(Value::as_str)
             .filter(|p| crate::rollout::validate_path(p, thread));
         let now = self.clock.mono_ms;
-        let file = self.relations.aux.rollout.files.get_mut(thread).expect("路径请求仍有效");
+        let file = self
+            .relations
+            .aux
+            .rollout
+            .files
+            .get_mut(thread)
+            .expect("路径请求仍有效");
         (file.path, file.next_at) = match path {
             Some(path) => (RolloutPathState::Ready(path.into()), now),
             None => (
@@ -950,8 +970,12 @@ impl Machine {
                     let state = &mut self.relations.aux.rollout;
                     let key = (thread.to_owned(), call.call_id);
                     let observed = RolloutCall {
-                        epoch, at: now, wall_ms: entry.wall_ms, trigger: call.trigger,
-                        target: call.target, message: call.message,
+                        epoch,
+                        at: now,
+                        wall_ms: entry.wall_ms,
+                        trigger: call.trigger,
+                        target: call.target,
+                        message: call.message,
                     };
                     if !state.calls.contains_key(&key) && state.calls.len() < MAX_OPERATIONS {
                         state.calls.insert(key, observed);

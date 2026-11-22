@@ -2047,7 +2047,12 @@ fn gap_wu_首读在途遇真实断档仍退休物理票据() {
     interacted_to(&mut m, "被扣住", C);
     let request = fx::with(|f| f.held.iter().find(|r| r.thread == C).unwrap().clone());
     assert_eq!(m.relations.aux.rollout.files[C].reading, Some(request.id));
-    apply(&mut m, Event::ObservationGap { thread: Some(C.into()) });
+    apply(
+        &mut m,
+        Event::ObservationGap {
+            thread: Some(C.into()),
+        },
+    );
     assert_eq!(
         m.relations.aux.rollout.rollout_reads[&request.id].state,
         crate::relations::rollout_pairing::ReadTicketState::Retired
@@ -2070,14 +2075,26 @@ fn gap_wu_卸载关闭及附着淘汰使旧读取失效() {
             }
             assert!(!m.relations.attachments.contains_key(C));
         } else {
-            let status = if event == "关闭" { "shutdown" } else { "notLoaded" };
-            m.convergence_agent_states(P, T, &json!({
-                "tool":"closeAgent","status":"completed","agentsStates":{C:{"status":status}}
-            }), &mut vec![]);
+            let status = if event == "关闭" {
+                "shutdown"
+            } else {
+                "notLoaded"
+            };
+            m.convergence_agent_states(
+                P,
+                T,
+                &json!({
+                    "tool":"closeAgent","status":"completed","agentsStates":{C:{"status":status}}
+                }),
+                &mut vec![],
+            );
         }
         m.drive_rollout(&mut vec![]);
-        assert_eq!(m.relations.aux.rollout.rollout_reads[&id].state,
-            crate::relations::rollout_pairing::ReadTicketState::Retired, "{event}");
+        assert_eq!(
+            m.relations.aux.rollout.rollout_reads[&id].state,
+            crate::relations::rollout_pairing::ReadTicketState::Retired,
+            "{event}"
+        );
     }
 }
 
@@ -2097,21 +2114,32 @@ fn gap_wu_无原始调用的兄弟跟进不触发文件等待() {
 fn gap_fix4_文件跟进没有正文摘要按调用缺失回退() {
     let (mut m, _) = base();
     files(&m);
-    fx::append_line(P, m.clock.now_ms, "response_item",
-        json!({"type":"function_call","name":"followup_task","call_id":"无正文"}));
+    fx::append_line(
+        P,
+        m.clock.now_ms,
+        "response_item",
+        json!({"type":"function_call","name":"followup_task","call_id":"无正文"}),
+    );
     assert!(!m.relations.aux.v2_raw_threads.contains_key(P));
     interacted_to(&mut m, "无正文", C);
     let operation = op(&m, "无正文");
     assert!(!operation.v2_strict && !operation.v2_queue_only);
-    assert_eq!(operation.v2_fallback, Some(V2FallbackReason::RolloutCallMissing));
+    assert_eq!(
+        operation.v2_fallback,
+        Some(V2FallbackReason::RolloutCallMissing)
+    );
     assert!(!awaiting(&m, "无正文"));
 }
 
 fn 上一轮父侧快照(m: &mut Machine, id: &str) -> Vec<Action> {
-    notify(m, "item/completed", json!({"threadId":P,"turnId":T,"item":{
-        "type":"collabAgentToolCall","tool":"wait","status":"completed",
-        "id":format!("等待-{id}"),"agentsStates":{"乙":{"status":"completed"}}
-    }}))
+    notify(
+        m,
+        "item/completed",
+        json!({"threadId":P,"turnId":T,"item":{
+            "type":"collabAgentToolCall","tool":"wait","status":"completed",
+            "id":format!("等待-{id}"),"agentsStates":{"乙":{"status":"completed"}}
+        }}),
+    )
 }
 
 fn 兄弟唤醒两轮(快照位置: usize) {
@@ -2123,22 +2151,37 @@ fn 兄弟唤醒两轮(快照位置: usize) {
         all.extend(apply(&mut m, started));
         all.extend(apply(&mut m, done));
         all.extend(apply(&mut m, mock.turn_started(child, turn)));
-        all.extend(notify(&mut m, "thread/goal/cleared", json!({"threadId":child})));
+        all.extend(notify(
+            &mut m,
+            "thread/goal/cleared",
+            json!({"threadId":child}),
+        ));
         assert_eq!(m.binding(child, turn).unwrap().status, BindingStatus::Bound);
     }
     for role in ["developer", "user"] {
-        all.extend(notify(&mut m, "rawResponseItem/completed", json!({
-            "threadId":"乙","turnId":"首轮","item":{"type":"message","role":role}
-        })));
+        all.extend(notify(
+            &mut m,
+            "rawResponseItem/completed",
+            json!({
+                "threadId":"乙","turnId":"首轮","item":{"type":"message","role":role}
+            }),
+        ));
     }
     all.extend(complete(&mut m, &mut mock, "乙", "首轮", "completed"));
     for (turn, id) in [("第二轮", "跟进一"), ("第三轮", "跟进二")] {
-        all.extend(notify(&mut m, "rawResponseItem/completed",
+        all.extend(notify(
+            &mut m,
+            "rawResponseItem/completed",
             json!({"threadId":"甲","turnId":"甲轮","item":{
                 "type":"function_call","name":"followup_task","call_id":id,
                 "arguments":json!({"target":"乙","message":id}).to_string()
-            }})));
-        let key = EvidenceKey { parent_thread_id: "甲".into(), parent_turn_id: "甲轮".into(), item_id: id.into() };
+            }}),
+        ));
+        let key = EvidenceKey {
+            parent_thread_id: "甲".into(),
+            parent_turn_id: "甲轮".into(),
+            item_id: id.into(),
+        };
         let start = &m.relations.aux.followup_starts[&key];
         assert_eq!(start.source, EvidenceSource::Raw);
         assert!(start.trigger);
@@ -2147,20 +2190,41 @@ fn 兄弟唤醒两轮(快照位置: usize) {
         all.extend(apply(&mut m, started));
         all.extend(apply(&mut m, done));
         assert!(op(&m, id).rejected_receivers.contains_key("乙"));
-        if 快照位置 == 0 { all.extend(上一轮父侧快照(&mut m, id)); }
+        if 快照位置 == 0 {
+            all.extend(上一轮父侧快照(&mut m, id));
+        }
         all.extend(apply(&mut m, mock.turn_started("乙", turn)));
-        if 快照位置 == 1 { all.extend(上一轮父侧快照(&mut m, id)); }
-        let text = format!("Message Type: NEW_TASK\nTask name: /root/乙\nSender: /root/甲\nPayload:\n{id}");
+        if 快照位置 == 1 {
+            all.extend(上一轮父侧快照(&mut m, id));
+        }
+        let text = format!(
+            "Message Type: NEW_TASK\nTask name: /root/乙\nSender: /root/甲\nPayload:\n{id}"
+        );
         all.extend(notify(&mut m, "rawResponseItem/completed",
             json!({"threadId":"乙","turnId":turn,"item":{"type":"agent_message","id":id,
                 "author":"/root/甲","recipient":"/root/乙","content":[{"type":"input_text","text":text}]}})));
-        let fact = m.relations.aux.v2_deliveries.iter().find(|d| d.id == id).unwrap();
+        let fact = m
+            .relations
+            .aux
+            .v2_deliveries
+            .iter()
+            .find(|d| d.id == id)
+            .unwrap();
         assert!(fact.trigger);
-        assert_eq!((&*fact.thread, &*fact.author, &*fact.turn), ("乙", "/root/甲", turn));
-        all.extend(notify(&mut m, "item/completed", json!({"threadId":"乙","turnId":turn,
-            "item":{"type":"agentMessage","id":id,"text":format!("答复-{id}")}})));
+        assert_eq!(
+            (&*fact.thread, &*fact.author, &*fact.turn),
+            ("乙", "/root/甲", turn)
+        );
+        all.extend(notify(
+            &mut m,
+            "item/completed",
+            json!({"threadId":"乙","turnId":turn,
+            "item":{"type":"agentMessage","id":id,"text":format!("答复-{id}")}}),
+        ));
         all.extend(complete(&mut m, &mut mock, "乙", turn, "completed"));
-        if 快照位置 == 2 { all.extend(上一轮父侧快照(&mut m, id)); }
+        if 快照位置 == 2 {
+            all.extend(上一轮父侧快照(&mut m, id));
+        }
         assert!(m.binding("乙", turn).is_none());
         assert_eq!(m.event_log_pending_stats("乙", turn).0, 3);
         暂存到期(&mut m, &mut all);
@@ -2168,32 +2232,58 @@ fn 兄弟唤醒两轮(快照位置: usize) {
     }
     all.extend(complete(&mut m, &mut mock, "甲", "甲轮", "completed"));
     all.extend(finish(&mut m, &mut mock));
-    let rows: Vec<_> = all.iter().filter_map(|a| match a {
-        Action::Store(crate::store::StoreOp::AppendLog { lines, .. }) => Some(lines),
-        _ => None,
-    }).flatten().map(|line| {
-        let fields: Vec<_> = line.splitn(4, ' ').collect();
-        let payload: serde_json::Value = serde_json::from_str(fields[3].strip_prefix("\t@cxb2 ").unwrap()).unwrap();
-        (fields[2], payload)
-    }).collect();
+    let rows: Vec<_> = all
+        .iter()
+        .filter_map(|a| match a {
+            Action::Store(crate::store::StoreOp::AppendLog { lines, .. }) => Some(lines),
+            _ => None,
+        })
+        .flatten()
+        .map(|line| {
+            let fields: Vec<_> = line.splitn(4, ' ').collect();
+            let payload: serde_json::Value =
+                serde_json::from_str(fields[3].strip_prefix("\t@cxb2 ").unwrap()).unwrap();
+            (fields[2], payload)
+        })
+        .collect();
     assert!(rows.iter().any(|(k, _)| *k == "运行开始"));
     assert!(rows.iter().any(|(k, _)| *k == "运行结束"));
     assert_eq!(rows.iter().filter(|(k, _)| *k == "记录缺口").count(), 0);
     for (turn, answer) in [("第二轮", "答复-跟进一"), ("第三轮", "答复-跟进二")] {
         assert!(m.binding("乙", turn).is_none());
-        let saved: Vec<_> = rows.iter().filter(|(_, p)| p["threadId"] == "乙" && p["turnId"] == turn).collect();
-        assert!(saved.iter().all(|(_, p)| p["attribution"] == "unconfirmed" && p.get("coverageIssue").is_none()));
-        assert_eq!(saved.iter().map(|(k,p)| (*k,p["summary"].as_str().unwrap())).collect::<Vec<_>>(),
-            [("轮次开始", turn), ("条目完成", answer), ("轮次完成", "completed")]);
+        let saved: Vec<_> = rows
+            .iter()
+            .filter(|(_, p)| p["threadId"] == "乙" && p["turnId"] == turn)
+            .collect();
+        assert!(saved
+            .iter()
+            .all(|(_, p)| p["attribution"] == "unconfirmed" && p.get("coverageIssue").is_none()));
+        assert_eq!(
+            saved
+                .iter()
+                .map(|(k, p)| (*k, p["summary"].as_str().unwrap()))
+                .collect::<Vec<_>>(),
+            [
+                ("轮次开始", turn),
+                ("条目完成", answer),
+                ("轮次完成", "completed")
+            ]
+        );
     }
 }
 
 #[test]
-fn gap_wu_兄弟双唤醒上一轮快照在开始前到达() { 兄弟唤醒两轮(0); }
+fn gap_wu_兄弟双唤醒上一轮快照在开始前到达() {
+    兄弟唤醒两轮(0);
+}
 #[test]
-fn gap_wu_兄弟双唤醒上一轮快照在开始后到达() { 兄弟唤醒两轮(1); }
+fn gap_wu_兄弟双唤醒上一轮快照在开始后到达() {
+    兄弟唤醒两轮(1);
+}
 #[test]
-fn gap_wu_兄弟双唤醒上一轮快照在完成后到达() { 兄弟唤醒两轮(2); }
+fn gap_wu_兄弟双唤醒上一轮快照在完成后到达() {
+    兄弟唤醒两轮(2);
+}
 
 #[test]
 fn gap_wu_首次线程开始不退休在途读取且正常严格配对() {
@@ -2225,8 +2315,18 @@ fn gap_wu_连接换代后旧首读不能登记消费() {
         crate::rollout::RolloutRecord::Message { item, .. } if item["id"] == "旧连接消费")));
     m.relations.conn_epoch += 1;
     m.rollout_read_done(request.id, C, request.conn_epoch, Ok(chunk), &mut vec![]);
-    assert!(!m.relations.aux.rollout.rollout_reads.contains_key(&request.id));
-    assert!(m.relations.aux.v2_deliveries.iter().all(|d| d.id != "旧连接消费"));
+    assert!(!m
+        .relations
+        .aux
+        .rollout
+        .rollout_reads
+        .contains_key(&request.id));
+    assert!(m
+        .relations
+        .aux
+        .v2_deliveries
+        .iter()
+        .all(|d| d.id != "旧连接消费"));
     assert!(m.relations.aux.rollout.files[C].reading.is_none());
 }
 
@@ -2244,21 +2344,39 @@ fn gap_wu_续读登记消失被替换或改走实时后不接纳旧文件消息(
         let request = fx::with(|f| f.held.iter().find(|r| r.thread == C).unwrap().clone());
         assert!(request.cursor.is_some());
         match change {
-            "登记消失" => { m.relations.aux.rollout.files.remove(C); }
-            "读取替换" => m.relations.aux.rollout.files.get_mut(C).unwrap().reading = Some(u64::MAX),
+            "登记消失" => {
+                m.relations.aux.rollout.files.remove(C);
+            }
+            "读取替换" => {
+                m.relations.aux.rollout.files.get_mut(C).unwrap().reading = Some(u64::MAX)
+            }
             _ => {
-                notify(&mut m, "rawResponseItem/completed", json!({
-                    "threadId":C,"turnId":"旧轮","item":{"type":"reasoning"}
-                }));
+                notify(
+                    &mut m,
+                    "rawResponseItem/completed",
+                    json!({
+                        "threadId":C,"turnId":"旧轮","item":{"type":"reasoning"}
+                    }),
+                );
             }
         }
         let chunk = crate::rollout::read_chunk(&request.path, request.cursor.as_ref()).unwrap();
         assert!(chunk.entries.iter().any(|e| matches!(&e.record,
             crate::rollout::RolloutRecord::Message { item, .. } if item["id"] == "旧文件消息")));
         m.rollout_read_done(request.id, C, request.conn_epoch, Ok(chunk), &mut vec![]);
-        assert!(m.relations.aux.v2_deliveries.iter().all(|d| d.id != "旧文件消息"));
-        assert!(m.relations.aux.rollout.files.get(C).is_none_or(|f|
-            f.cursor.is_none() || f.cursor == request.cursor));
+        assert!(m
+            .relations
+            .aux
+            .v2_deliveries
+            .iter()
+            .all(|d| d.id != "旧文件消息"));
+        assert!(m
+            .relations
+            .aux
+            .rollout
+            .files
+            .get(C)
+            .is_none_or(|f| f.cursor.is_none() || f.cursor == request.cursor));
     }
 }
 
@@ -2271,17 +2389,38 @@ fn gap_wu_子文件冷却与能力未知均先判父调用类型() {
             files(&m);
             call_line(&m, "预读", "send_message", C, "");
             call_line(&m, "目标", tool, C, "任务");
-            if cached { interacted_to(&mut m, "预读", C); }
-            assert_eq!(m.relations.aux.rollout.calls.contains_key(&(P.into(), "目标".into())), cached);
+            if cached {
+                interacted_to(&mut m, "预读", C);
+            }
+            assert_eq!(
+                m.relations
+                    .aux
+                    .rollout
+                    .calls
+                    .contains_key(&(P.into(), "目标".into())),
+                cached
+            );
             let reads = m.relations.aux.rollout.reads_issued;
             let epoch = m.relations.conn_epoch;
-            m.relations.aux.rollout.files.insert(C.into(), RolloutFile {
-                epoch, path: RolloutPathState::Failed(V2FallbackReason::RolloutUnreadable),
-                cursor: None, reading: None, reads: 0, next_at: m.clock.mono_ms + 30_000,
-            });
-            if unknown { m.relations.aux.v2_raw_overflow = Some(epoch); }
+            m.relations.aux.rollout.files.insert(
+                C.into(),
+                RolloutFile {
+                    epoch,
+                    path: RolloutPathState::Failed(V2FallbackReason::RolloutUnreadable),
+                    cursor: None,
+                    reading: None,
+                    reads: 0,
+                    next_at: m.clock.mono_ms + 30_000,
+                },
+            );
+            if unknown {
+                m.relations.aux.v2_raw_overflow = Some(epoch);
+            }
             interacted_to(&mut m, "目标", C);
-            assert_eq!(m.relations.aux.rollout.reads_issued, reads + u64::from(!cached));
+            assert_eq!(
+                m.relations.aux.rollout.reads_issued,
+                reads + u64::from(!cached)
+            );
             let operation = op(&m, "目标");
             assert_eq!(operation.v2_queue_only, queue_only);
             if queue_only {
@@ -2289,8 +2428,14 @@ fn gap_wu_子文件冷却与能力未知均先判父调用类型() {
                 assert!(operation.v2_strict);
             } else {
                 assert!(!operation.v2_strict);
-                assert_eq!(operation.v2_fallback, Some(if unknown { V2FallbackReason::RawUnknown }
-                    else { V2FallbackReason::RolloutUnreadable }));
+                assert_eq!(
+                    operation.v2_fallback,
+                    Some(if unknown {
+                        V2FallbackReason::RawUnknown
+                    } else {
+                        V2FallbackReason::RolloutUnreadable
+                    })
+                );
             }
         }
     }
@@ -2311,9 +2456,13 @@ fn gap_wu_截止时同一文件回包确认两轮后才清扫() {
     let start = m.clock.mono_ms;
     for turn in ["甲轮", "乙轮"] {
         apply(&mut m, mock.turn_started(C, turn));
-        notify(&mut m, "item/completed", json!({"threadId":C,"turnId":turn,"item":{
-            "id":turn,"type":"agentMessage","text":format!("答复-{turn}")
-        }}));
+        notify(
+            &mut m,
+            "item/completed",
+            json!({"threadId":C,"turnId":turn,"item":{
+                "id":turn,"type":"agentMessage","text":format!("答复-{turn}")
+            }}),
+        );
         complete(&mut m, &mut mock, C, turn, "completed");
         assert!(m.binding(C, turn).is_none());
         assert_eq!(m.event_log_pending_stats(C, turn).0, 3);
@@ -2324,22 +2473,26 @@ fn gap_wu_截止时同一文件回包确认两轮后才清扫() {
     fx::with(|f| f.hold = true);
     fx::poll(&mut m);
     assert_eq!(m.clock.mono_ms, start + 119_999);
-    assert_eq!(fx::with(|f| f.held.iter().filter(|r| r.thread == C).count()), 1);
-    for (turn, id) in [("甲轮","跟进甲"), ("乙轮","跟进乙")] {
+    assert_eq!(
+        fx::with(|f| f.held.iter().filter(|r| r.thread == C).count()),
+        1
+    );
+    for (turn, id) in [("甲轮", "跟进甲"), ("乙轮", "跟进乙")] {
         turn_marker(C, turn, m.clock.now_ms);
         message_line(&m, C, id, "NEW_TASK", id);
     }
     m.clock.mono_ms += 1;
     let actions = fx::release_held(&mut m);
-    for (turn, id) in [("甲轮","跟进甲"), ("乙轮","跟进乙")] {
-        assert_eq!(op(&m,id).proven_turns[C], [turn.to_owned()].into());
+    for (turn, id) in [("甲轮", "跟进甲"), ("乙轮", "跟进乙")] {
+        assert_eq!(op(&m, id).proven_turns[C], [turn.to_owned()].into());
         assert_eq!(m.binding(C, turn).unwrap().status, BindingStatus::Bound);
         let mut saved = vec![];
         for action in &actions {
             if let Action::Store(crate::store::StoreOp::AppendLog { lines, .. }) = action {
                 for line in lines {
                     let fields: Vec<_> = line.splitn(4, ' ').collect();
-                    let row: serde_json::Value = serde_json::from_str(fields[3].strip_prefix("\t@cxb2 ").unwrap()).unwrap();
+                    let row: serde_json::Value =
+                        serde_json::from_str(fields[3].strip_prefix("\t@cxb2 ").unwrap()).unwrap();
                     if row["threadId"] == C && row["turnId"] == turn && row["late"] == true {
                         assert!(row.get("attribution").is_none());
                         saved.push(row["summary"].as_str().unwrap().to_owned());
@@ -2347,8 +2500,11 @@ fn gap_wu_截止时同一文件回包确认两轮后才清扫() {
                 }
             }
         }
-        assert_eq!(saved, [turn.to_owned(), format!("答复-{turn}"), "completed".into()]);
-        assert_eq!(m.event_log_pending_stats(C, turn), (0,0,0));
+        assert_eq!(
+            saved,
+            [turn.to_owned(), format!("答复-{turn}"), "completed".into()]
+        );
+        assert_eq!(m.event_log_pending_stats(C, turn), (0, 0, 0));
     }
 }
 
@@ -2360,7 +2516,10 @@ fn gap_wu_父缓存命中不提前结束失败冷却() {
     call_line(&m, "预读", "send_message", C, "");
     call_line(&m, "缓存留言", "send_message", C, "");
     interacted_to(&mut m, "预读", C);
-    fx::with(|f| { f.replies.insert(P.into(), Err(json!({"message":"暂不可读"}))); });
+    fx::with(|f| {
+        f.replies
+            .insert(P.into(), Err(json!({"message":"暂不可读"})));
+    });
     let deadline = m.clock.mono_ms + ROLLOUT_RETRY_MS;
     let file = m.relations.aux.rollout.files.get_mut(P).unwrap();
     file.path = RolloutPathState::Failed(V2FallbackReason::RolloutUnreadable);
@@ -2371,7 +2530,10 @@ fn gap_wu_父缓存命中不提前结束失败冷却() {
     assert_eq!(m.relations.aux.rollout.files[P].next_at, deadline);
     m.clock.mono_ms = deadline - 1;
     interacted_to(&mut m, "未命中", C);
-    assert_eq!(op(&m, "未命中").v2_fallback, Some(V2FallbackReason::RolloutUnreadable));
+    assert_eq!(
+        op(&m, "未命中").v2_fallback,
+        Some(V2FallbackReason::RolloutUnreadable)
+    );
     assert_eq!(fx::with(|f| f.path_reads), paths);
     m.clock.mono_ms = deadline;
     interacted_to(&mut m, "冷却结束", C);
@@ -2399,10 +2561,14 @@ fn gap_wu_开始记录满时文件留言零绑定而跟进按证据回退() {
     // 预读缓存也已满，当前等待的调用仍须直接交给它的操作。
     let cached = m.relations.aux.rollout.calls[&(P.into(), "种子".into())].clone();
     for n in 1..MAX_OPERATIONS {
-        m.relations.aux.rollout.calls.insert((P.into(), format!("缓存{n}")), cached.clone());
+        m.relations
+            .aux
+            .rollout
+            .calls
+            .insert((P.into(), format!("缓存{n}")), cached.clone());
     }
     assert_eq!(m.relations.aux.rollout.calls.len(), MAX_OPERATIONS);
-    for (id, tool) in [("留言","send_message"), ("跟进","followup_task")] {
+    for (id, tool) in [("留言", "send_message"), ("跟进", "followup_task")] {
         call_line(&m, id, tool, C, id);
         interacted_to(&mut m, id, C);
         let operation = op(&m, id);
@@ -2428,7 +2594,12 @@ fn gap_wu_发起路径未知时先按子证据决定是否等待() {
         apply(&mut m, a);
         apply(&mut m, b);
         assert!(awaiting(&m, "等路径"));
-        assert!(m.relations.aux.rollout.calls.contains_key(&(C.into(),"等路径".into())));
+        assert!(m
+            .relations
+            .aux
+            .rollout
+            .calls
+            .contains_key(&(C.into(), "等路径".into())));
         assert!(!m.relations.aux.v2_agent_paths.contains_key(C));
         let now = m.clock.mono_ms;
         if mode == "冷却" {
@@ -2445,19 +2616,22 @@ fn gap_wu_发起路径未知时先按子证据决定是否等待() {
             m.drive_rollout(&mut vec![]);
         }
         assert!(!awaiting(&m, "等路径"));
-        assert_eq!(op(&m, "等路径").v2_fallback, Some(match mode {
-            "冷却" => V2FallbackReason::RolloutUnreadable,
-            "未知" => V2FallbackReason::RawUnknown,
-            _ => V2FallbackReason::RolloutSenderUnknown,
-        }));
+        assert_eq!(
+            op(&m, "等路径").v2_fallback,
+            Some(match mode {
+                "冷却" => V2FallbackReason::RolloutUnreadable,
+                "未知" => V2FallbackReason::RawUnknown,
+                _ => V2FallbackReason::RolloutSenderUnknown,
+            })
+        );
     }
 }
 
 #[test]
 fn gap_wu_停止再跟随隔离旧读取的成功和失败() {
     use crate::relations::rollout_pairing::{ReadTicketState, RolloutPathState};
-    for restart in [false,true] {
-        for fail in [false,true] {
+    for restart in [false, true] {
+        for fail in [false, true] {
             let (mut m, _) = base();
             files(&m);
             call_line(&m, "旧跟进", "followup_task", C, "旧任务");
@@ -2466,25 +2640,42 @@ fn gap_wu_停止再跟随隔离旧读取的成功和失败() {
             fx::poll(&mut m);
             let old = fx::with(|f| f.held.iter().find(|r| r.thread == C).unwrap().clone());
             assert!(old.cursor.is_some());
-            let key = op(&m,"旧跟进").key.clone();
+            let key = op(&m, "旧跟进").key.clone();
             m.relations.operations.get_mut(&key).unwrap().outcome = EvidenceOutcome::Failed;
             m.drive_rollout(&mut vec![]);
-            assert_eq!(m.relations.aux.rollout.rollout_reads[&old.id].state, ReadTicketState::Retired);
+            assert_eq!(
+                m.relations.aux.rollout.rollout_reads[&old.id].state,
+                ReadTicketState::Retired
+            );
             if restart {
                 call_line(&m, "新跟进", "followup_task", C, "新任务");
                 interacted_to(&mut m, "新跟进", C);
-                let new = fx::with(|f| f.held.iter().find(|r| r.thread == C && r.id != old.id).unwrap().clone());
+                let new = fx::with(|f| {
+                    f.held
+                        .iter()
+                        .find(|r| r.thread == C && r.id != old.id)
+                        .unwrap()
+                        .clone()
+                });
                 assert!(new.cursor.is_none());
             }
             let before = m.relations.aux.rollout.files[C].clone();
-            message_line(&m,C,"旧回包消费","NEW_TASK","旧任务");
-            let result = if fail { Err(crate::rollout::RolloutError::Unreadable) }
-                else { crate::rollout::read_chunk(&old.path,old.cursor.as_ref()) };
-            m.rollout_read_done(old.id,C,old.conn_epoch,result,&mut vec![]);
+            message_line(&m, C, "旧回包消费", "NEW_TASK", "旧任务");
+            let result = if fail {
+                Err(crate::rollout::RolloutError::Unreadable)
+            } else {
+                crate::rollout::read_chunk(&old.path, old.cursor.as_ref())
+            };
+            m.rollout_read_done(old.id, C, old.conn_epoch, result, &mut vec![]);
             assert_eq!(m.relations.aux.rollout.files[C], before);
             assert!(matches!(before.path, RolloutPathState::Ready(_)));
             assert!(!m.relations.aux.rollout.rollout_reads.contains_key(&old.id));
-            assert!(m.relations.aux.v2_deliveries.iter().all(|d| d.id != "旧回包消费"));
+            assert!(m
+                .relations
+                .aux
+                .v2_deliveries
+                .iter()
+                .all(|d| d.id != "旧回包消费"));
         }
     }
 }
@@ -2493,20 +2684,26 @@ fn gap_wu_停止再跟随隔离旧读取的成功和失败() {
 fn gap_wu_缓存确认的文件留言在父线程转实时后仍只入队() {
     let (mut m, _) = base();
     files(&m);
-    call_line(&m,"预读","send_message",C,"");
-    call_line(&m,"已知留言","send_message",C,"");
-    interacted_to(&mut m,"预读",C);
-    notify(&mut m, "rawResponseItem/completed", json!({"threadId":P,"turnId":T,"item":{"type":"reasoning"}}));
+    call_line(&m, "预读", "send_message", C, "");
+    call_line(&m, "已知留言", "send_message", C, "");
+    interacted_to(&mut m, "预读", C);
+    notify(
+        &mut m,
+        "rawResponseItem/completed",
+        json!({"threadId":P,"turnId":T,"item":{"type":"reasoning"}}),
+    );
     let reads = m.relations.aux.rollout.reads_issued;
-    interacted_to(&mut m,"已知留言",C);
-    let known = op(&m,"已知留言");
+    interacted_to(&mut m, "已知留言", C);
+    let known = op(&m, "已知留言");
     assert!(known.v2_queue_only && known.receivers.is_empty());
-    assert_eq!(known.v2_source,V2EvidenceSource::RolloutFile);
-    interacted_to(&mut m,"无缓存",C);
-    assert_eq!(op(&m,"无缓存").v2_fallback, Some(V2FallbackReason::StartMissing));
+    assert_eq!(known.v2_source, V2EvidenceSource::RolloutFile);
+    interacted_to(&mut m, "无缓存", C);
+    assert_eq!(
+        op(&m, "无缓存").v2_fallback,
+        Some(V2FallbackReason::StartMissing)
+    );
     assert_eq!(m.relations.aux.rollout.reads_issued, reads);
 }
-
 
 #[test]
 fn gap_wu_操作刚失去需求时错误回包不能留下冷却() {
@@ -2514,20 +2711,32 @@ fn gap_wu_操作刚失去需求时错误回包不能留下冷却() {
     for live in [false, true] {
         let (mut m, _) = base();
         files(&m);
-        call_line(&m,"跟进","followup_task",C,"任务");
-        interacted_to(&mut m,"跟进",C);
+        call_line(&m, "跟进", "followup_task", C, "任务");
+        interacted_to(&mut m, "跟进", C);
         fx::with(|f| f.hold = true);
         fx::poll(&mut m);
         let id = m.relations.aux.rollout.files[C].reading.unwrap();
         if !live {
-            let key = op(&m,"跟进").key.clone();
+            let key = op(&m, "跟进").key.clone();
             m.relations.operations.get_mut(&key).unwrap().outcome = EvidenceOutcome::Failed;
         }
         let epoch = m.relations.conn_epoch;
-        m.rollout_read_done(id,C,epoch,Err(crate::rollout::RolloutError::Unreadable),&mut vec![]);
+        m.rollout_read_done(
+            id,
+            C,
+            epoch,
+            Err(crate::rollout::RolloutError::Unreadable),
+            &mut vec![],
+        );
         let file = &m.relations.aux.rollout.files[C];
         assert!(file.reading.is_none());
-        assert_eq!(matches!(file.path, RolloutPathState::Failed(V2FallbackReason::RolloutUnreadable)), live);
+        assert_eq!(
+            matches!(
+                file.path,
+                RolloutPathState::Failed(V2FallbackReason::RolloutUnreadable)
+            ),
+            live
+        );
         if !live {
             assert!(matches!(file.path, RolloutPathState::Ready(_)));
             assert!(file.cursor.is_none());
@@ -2539,37 +2748,54 @@ fn gap_wu_操作刚失去需求时错误回包不能留下冷却() {
 #[test]
 fn gap_wu_重新跟随时不沿用旧路径请求的成功或失败() {
     use crate::relations::rollout_pairing::RolloutPathState;
-    for (success, early) in [(false,false), (true,false), (false,true), (true,true)] {
+    for (success, early) in [(false, false), (true, false), (false, true), (true, true)] {
         let (mut m, _) = base();
         files(&m);
         let request = |m: &mut Machine, id: &str| {
             let (start, _) = SubagentMock::v2_activity("interacted", P, T, id, C);
             let (next, actions) = step(std::mem::take(m), start);
             *m = next;
-            actions.into_iter().find_map(|a| match a {
-                Action::Request(ctx) => match ctx.operation {
-                    crate::claim::Operation::RolloutPath { thread, generation } if thread == C => Some(generation),
+            actions
+                .into_iter()
+                .find_map(|a| match a {
+                    Action::Request(ctx) => match ctx.operation {
+                        crate::claim::Operation::RolloutPath { thread, generation }
+                            if thread == C =>
+                        {
+                            Some(generation)
+                        }
+                        _ => None,
+                    },
                     _ => None,
-                },
-                _ => None,
-            }).expect("新的一段跟随须有独立路径请求")
+                })
+                .expect("新的一段跟随须有独立路径请求")
         };
         let old = request(&mut m, "旧跟进");
-        let key = op(&m,"旧跟进").key.clone();
+        let key = op(&m, "旧跟进").key.clone();
         m.relations.operations.get_mut(&key).unwrap().outcome = EvidenceOutcome::Failed;
         let good = Ok(json!({"thread":{"id":C,"path":fx::path(C)}}));
-        let old_result = if success { good.clone() } else { Err(json!({"message":"旧读取失败"})) };
+        let old_result = if success {
+            good.clone()
+        } else {
+            Err(json!({"message":"旧读取失败"}))
+        };
         if early {
-            m.rollout_path_reply(C,old,&old_result);
+            m.rollout_path_reply(C, old, &old_result);
             assert!(!m.relations.aux.rollout.files.contains_key(C));
         }
         m.drive_rollout(&mut vec![]);
         let new = request(&mut m, "新跟进");
         assert_ne!(old, new);
-        m.rollout_path_reply(C,old,&old_result);
-        assert_eq!(m.relations.aux.rollout.files[C].path, RolloutPathState::Requested(new));
-        m.rollout_path_reply(C,new,&good);
-        assert!(matches!(m.relations.aux.rollout.files[C].path, RolloutPathState::Ready(_)));
+        m.rollout_path_reply(C, old, &old_result);
+        assert_eq!(
+            m.relations.aux.rollout.files[C].path,
+            RolloutPathState::Requested(new)
+        );
+        m.rollout_path_reply(C, new, &good);
+        assert!(matches!(
+            m.relations.aux.rollout.files[C].path,
+            RolloutPathState::Ready(_)
+        ));
     }
 }
 
@@ -2578,8 +2804,14 @@ fn gap_wu_实时开始表满仍区分留言与跟进() {
     for receipts_full in [false, true] {
         let (mut m, _) = base();
         raw(&mut m, "已知跟进", "调用正文");
-        let (key, start) = m.relations.aux.followup_starts.iter()
-            .find(|(key,_)| key.item_id == "已知跟进").map(|(k,s)| (k.clone(),s.clone())).unwrap();
+        let (key, start) = m
+            .relations
+            .aux
+            .followup_starts
+            .iter()
+            .find(|(key, _)| key.item_id == "已知跟进")
+            .map(|(k, s)| (k.clone(), s.clone()))
+            .unwrap();
         for i in 1..MAX_OPERATIONS {
             let mut filler = start.clone();
             filler.message = None;
@@ -2592,28 +2824,35 @@ fn gap_wu_实时开始表满仍区分留言与跟进() {
             for i in 0..MAX_OPERATIONS {
                 let mut id = key.clone();
                 id.item_id = format!("已缓存留言{i}");
-                m.relations.aux.raw_queue_receipts.insert(id, (epoch, m.clock.mono_ms + 30_000));
+                m.relations
+                    .aux
+                    .raw_queue_receipts
+                    .insert(id, (epoch, m.clock.mono_ms + 30_000));
             }
         }
         assert_eq!(m.relations.aux.followup_starts.len(), MAX_OPERATIONS);
-        notify(&mut m, "rawResponseItem/completed",json!({"threadId":P,"turnId":T,
-            "item":{"type":"function_call","name":"send_message","call_id":"即时留言"}}));
-        interacted_to(&mut m,"即时留言",C);
-        let message = op(&m,"即时留言");
+        notify(
+            &mut m,
+            "rawResponseItem/completed",
+            json!({"threadId":P,"turnId":T,
+            "item":{"type":"function_call","name":"send_message","call_id":"即时留言"}}),
+        );
+        interacted_to(&mut m, "即时留言", C);
+        let message = op(&m, "即时留言");
         assert!(message.proven_turns.is_empty());
         if receipts_full {
             assert_eq!(message.outcome, EvidenceOutcome::Unproven);
         } else {
             assert!(message.v2_queue_only && message.receivers.is_empty());
-            assert_eq!(message.v2_source,V2EvidenceSource::Raw);
+            assert_eq!(message.v2_source, V2EvidenceSource::Raw);
         }
-        interacted_to(&mut m,"已知跟进",C);
-        let known = op(&m,"已知跟进");
+        interacted_to(&mut m, "已知跟进", C);
+        let known = op(&m, "已知跟进");
         assert!(known.v2_strict && !known.v2_queue_only);
-        assert_eq!(known.v2_source,V2EvidenceSource::Raw);
+        assert_eq!(known.v2_source, V2EvidenceSource::Raw);
         m.clock.mono_ms += 30_000;
-        interacted_to(&mut m,"窗口后",C);
-        let later = op(&m,"窗口后");
+        interacted_to(&mut m, "窗口后", C);
+        let later = op(&m, "窗口后");
         assert_eq!(later.v2_fallback, Some(V2FallbackReason::StartMissing));
         assert_ne!(later.outcome, EvidenceOutcome::Unproven);
     }

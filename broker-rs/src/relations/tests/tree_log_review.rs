@@ -238,12 +238,17 @@ fn gap_wu_祖先未绑定的孙摘要超限与到期均保留() {
         .filter(|r| r["threadId"] == G)
         .collect();
     assert!(!saved.is_empty());
-    assert!(saved.iter().all(|r| matches!(r["kind"].as_str(), Some("轮次开始" | "条目完成"))
-        && r["attribution"] == "unconfirmed"
-        && r["runId"] == R
-        && r["parentThreadId"] == C));
+    assert!(saved.iter().all(
+        |r| matches!(r["kind"].as_str(), Some("轮次开始" | "条目完成"))
+            && r["attribution"] == "unconfirmed"
+            && r["runId"] == R
+            && r["parentThreadId"] == C
+    ));
     assert_eq!(overflow.len() + saved.len(), 501);
-    assert!(overflow.iter().chain(&saved).filter(|r| r["kind"] == "条目完成")
+    assert!(overflow
+        .iter()
+        .chain(&saved)
+        .filter(|r| r["kind"] == "条目完成")
         .all(|r| r["summary"] == "孙线程已观察摘要"));
     assert!(m.binding(G, "孙轮").is_none());
 }

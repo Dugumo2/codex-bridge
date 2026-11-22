@@ -1,7 +1,9 @@
 //! 静态树日志：只保存规范化摘要，不重新驱动轮次、诊断、预算或空转状态。
 use super::{state::schedule, Phase, RunTimer, Runs};
 use crate::claim::{Action, Machine};
-use crate::relations::{BindingStatus, EvidenceOperation, EvidenceOutcome, MemberChange, RelationKind};
+use crate::relations::{
+    BindingStatus, EvidenceOperation, EvidenceOutcome, MemberChange, RelationKind,
+};
 use crate::store::StoreOp;
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -503,7 +505,11 @@ impl Machine {
                     )
                 })
             })
-            .map(|(run, parent)| Candidate { run, parent, expired_proof_evicted: false })
+            .map(|(run, parent)| Candidate {
+                run,
+                parent,
+                expired_proof_evicted: false,
+            })
             .collect()
     }
 
@@ -568,13 +574,20 @@ impl Machine {
             return;
         }
         event.candidates.retain(|candidate| {
-            let Candidate { run, parent, expired_proof_evicted } = candidate;
+            let Candidate {
+                run,
+                parent,
+                expired_proof_evicted,
+            } = candidate;
             match when {
                 Settlement::Ending(ending) if ending != run => return true,
                 Settlement::Expired => {
-                    let evidence_wait = self.runs.runs.get(run).is_some_and(|r|
-                        matches!(r.state, super::RunState::Running | super::RunState::Stopping))
-                        && self.event_log_evidence_in_flight(run, &event.thread);
+                    let evidence_wait = self.runs.runs.get(run).is_some_and(|r| {
+                        matches!(
+                            r.state,
+                            super::RunState::Running | super::RunState::Stopping
+                        )
+                    }) && self.event_log_evidence_in_flight(run, &event.thread);
                     if evidence_wait && self.clock.mono_ms < event.deadline {
                         return true;
                     }
@@ -601,7 +614,11 @@ impl Machine {
     /// 其他候选仍能在之后绑定。字节数按最初接纳的大小保守记账，直到最后一个候选结算。
     pub(super) fn settle_ending_event_log(&mut self, run: &str, actions: &mut Vec<Action>) {
         for mut event in std::mem::take(&mut self.runs.event_log.pending) {
-            if event.candidates.iter().any(|candidate| candidate.run == run) {
+            if event
+                .candidates
+                .iter()
+                .any(|candidate| candidate.run == run)
+            {
                 self.settle_pending_candidates(&mut event, Settlement::Ending(run), actions);
             }
             if event.candidates.is_empty() {
@@ -619,7 +636,9 @@ impl Machine {
             return;
         }
         for pending in &mut self.runs.event_log.pending {
-            if op.receivers.contains(&pending.thread) && !op.rejected_receivers.contains_key(&pending.thread) {
+            if op.receivers.contains(&pending.thread)
+                && !op.rejected_receivers.contains_key(&pending.thread)
+            {
                 for candidate in &mut pending.candidates {
                     if op.run_id.is_empty() || op.run_id == candidate.run {
                         candidate.expired_proof_evicted = true;
@@ -652,11 +671,21 @@ impl Machine {
                 && (op.run_id == run || op.run_id.is_empty())
                 && !op.rejected_receivers.contains_key(thread)
         };
-        let waits = self.relations.aux.rollout.waits.iter()
+        let waits = self
+            .relations
+            .aux
+            .rollout
+            .waits
+            .iter()
             .filter_map(|(key, wait)| (wait.child == thread).then_some(key))
             .chain(self.relations.aux.spawn_waits.get(thread));
-        self.relations.operations.values().any(|op| op.receivers.contains(thread) && applicable(op))
-            || waits.filter_map(|key| self.relations.operations.get(key)).any(applicable)
+        self.relations
+            .operations
+            .values()
+            .any(|op| op.receivers.contains(thread) && applicable(op))
+            || waits
+                .filter_map(|key| self.relations.operations.get(key))
+                .any(applicable)
     }
 
     /// 在途归属证据可续期；原到达顺序和独立截止时间均保持不变。
@@ -669,7 +698,11 @@ impl Machine {
                     self.runs.event_log.bytes -= event.bytes;
                     continue;
                 }
-                event.expires = self.clock.mono_ms.saturating_add(PENDING_MS).min(event.deadline);
+                event.expires = self
+                    .clock
+                    .mono_ms
+                    .saturating_add(PENDING_MS)
+                    .min(event.deadline);
             }
             self.runs.event_log.pending.push_back(event);
         }

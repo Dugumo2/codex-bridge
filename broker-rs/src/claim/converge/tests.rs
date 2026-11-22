@@ -47,7 +47,10 @@ fn setup_pending() -> (Machine, SubagentMock, crate::claim::RequestContext) {
 fn setup_pending_mode(shared: bool) -> (Machine, SubagentMock, crate::claim::RequestContext) {
     setup_pending_with_actions(shared, &mut vec![])
 }
-fn setup_pending_with_actions(shared: bool, all: &mut Vec<Action>) -> (Machine, SubagentMock, crate::claim::RequestContext) {
+fn setup_pending_with_actions(
+    shared: bool,
+    all: &mut Vec<Action>,
+) -> (Machine, SubagentMock, crate::claim::RequestContext) {
     let mut m = Machine {
         shared,
         ..Machine::default()

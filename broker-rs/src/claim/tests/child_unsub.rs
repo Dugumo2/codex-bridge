@@ -1836,8 +1836,12 @@ fn gap_wu_卸载探针必须对应原线程才解除订阅责任() {
         let actions = start_again(&mut m, "第二运行", 2);
         let read = rpc(&actions, "thread/read", C);
         assert!(m.relations.aux.released.contains_key(C));
-        let actions = reply(&mut m, &read, Ok(json!({"thread":{"id":id,"status":{"type":"notLoaded"}}})));
+        let actions = reply(
+            &mut m,
+            &read,
+            Ok(json!({"thread":{"id":id,"status":{"type":"notLoaded"}}})),
+        );
         assert_eq!(m.relations.aux.released.contains_key(C), id != C);
-        assert_eq!(has_rpc(&actions,"thread/resume",C), id != C);
+        assert_eq!(has_rpc(&actions, "thread/resume", C), id != C);
     }
 }

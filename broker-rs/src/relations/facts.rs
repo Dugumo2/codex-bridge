@@ -658,20 +658,32 @@ impl Machine {
                         // 归属留空的开始记录只配给同样在等发起方绑定的操作。
                         && (!run_id.is_empty() || parent_run == ParentRun::AwaitBinding)
                 });
-            let raw_queue_only = kind == EvidenceKind::V2Interacted && self.relations.aux.raw_queue_receipts
-                .remove(&key).is_some_and(|(epoch, until)| epoch == self.relations.conn_epoch && now < until);
-            let v2_fallback = (kind == EvidenceKind::V2Interacted && begin.is_none() && !raw_queue_only).then(|| {
-                if self.relations.aux.followup_starts.contains_key(&key) {
-                    V2FallbackReason::StartStale
-                } else {
-                    match self.raw_capability(parent) {
-                        v2_pairing::RawCapability::Seen => V2FallbackReason::StartMissing,
-                        v2_pairing::RawCapability::NotSeen => V2FallbackReason::ParentWithoutRaw,
-                        // 登记表满了：不知道有没有 raw，不能据此去读会话文件。
-                        v2_pairing::RawCapability::Unknown => V2FallbackReason::RawUnknown,
+            let raw_queue_only = kind == EvidenceKind::V2Interacted
+                && self
+                    .relations
+                    .aux
+                    .raw_queue_receipts
+                    .remove(&key)
+                    .is_some_and(|(epoch, until)| {
+                        epoch == self.relations.conn_epoch && now < until
+                    });
+            let v2_fallback = (kind == EvidenceKind::V2Interacted
+                && begin.is_none()
+                && !raw_queue_only)
+                .then(|| {
+                    if self.relations.aux.followup_starts.contains_key(&key) {
+                        V2FallbackReason::StartStale
+                    } else {
+                        match self.raw_capability(parent) {
+                            v2_pairing::RawCapability::Seen => V2FallbackReason::StartMissing,
+                            v2_pairing::RawCapability::NotSeen => {
+                                V2FallbackReason::ParentWithoutRaw
+                            }
+                            // 登记表满了：不知道有没有 raw，不能据此去读会话文件。
+                            v2_pairing::RawCapability::Unknown => V2FallbackReason::RawUnknown,
+                        }
                     }
-                }
-            });
+                });
             consider_file_call = v2_fallback == Some(V2FallbackReason::ParentWithoutRaw)
                 || (v2_fallback == Some(V2FallbackReason::RawUnknown)
                     && self.rollout_call(&key).is_some())
@@ -691,10 +703,17 @@ impl Machine {
                     ))
                 })
                 .collect();
-            let unresolved_kind = matches!(v2_fallback, Some(V2FallbackReason::StartMissing | V2FallbackReason::RawUnknown))
-                && self.rollout_call(&key).is_none()
-                && self.relations.aux.raw_queue_receipts_full.is_some_and(|(epoch, until)|
-                    epoch == self.relations.conn_epoch && now < until);
+            let unresolved_kind = matches!(
+                v2_fallback,
+                Some(V2FallbackReason::StartMissing | V2FallbackReason::RawUnknown)
+            ) && self.rollout_call(&key).is_none()
+                && self
+                    .relations
+                    .aux
+                    .raw_queue_receipts_full
+                    .is_some_and(|(epoch, until)| {
+                        epoch == self.relations.conn_epoch && now < until
+                    });
             self.relations.operations.insert(
                 key.clone(),
                 EvidenceOperation {
@@ -705,13 +724,18 @@ impl Machine {
                     kind,
                     started_seen: false,
                     completed_seen: false,
-                    outcome: if unresolved_kind { EvidenceOutcome::Unproven } else { outcome },
+                    outcome: if unresolved_kind {
+                        EvidenceOutcome::Unproven
+                    } else {
+                        outcome
+                    },
                     receivers: BTreeSet::new(),
                     rejected_receivers: BTreeMap::new(),
                     proven_turns: BTreeMap::new(),
                     baseline_turns,
                     v2_strict: raw_queue_only || begin.is_some(),
-                    v2_queue_only: raw_queue_only || begin.as_ref().is_some_and(|start| !start.trigger),
+                    v2_queue_only: raw_queue_only
+                        || begin.as_ref().is_some_and(|start| !start.trigger),
                     v2_source: if raw_queue_only || begin.is_some() {
                         V2EvidenceSource::Raw
                     } else {

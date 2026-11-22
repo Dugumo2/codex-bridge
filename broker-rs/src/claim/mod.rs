@@ -1053,16 +1053,8 @@ pub fn step(mut state: Machine, event: Event) -> (Machine, Vec<Action>) {
             thread,
             conn_epoch,
             result,
-        } => state.rollout_read_done(
-            id,
-            &thread,
-            conn_epoch,
-            result,
-            &mut actions,
-        ),
-        Event::ObservationGap { thread } => {
-            state.invalidate_rollout_reads(thread.as_deref())
-        }
+        } => state.rollout_read_done(id, &thread, conn_epoch, result, &mut actions),
+        Event::ObservationGap { thread } => state.invalidate_rollout_reads(thread.as_deref()),
     }
     if let Some(thread) = settled_goal {
         state.abandoned_root_goal_settled(&thread, &mut actions);

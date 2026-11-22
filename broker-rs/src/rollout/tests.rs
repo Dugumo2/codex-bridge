@@ -799,7 +799,12 @@ fn gap_wu_末尾半行保留轮定位补齐后只读取一次() {
     append(&file, "\n");
     let next = read_chunk(&path, Some(&first.cursor)).unwrap();
     assert_eq!(next.entries.len(), 1);
-    assert!(matches!(&next.entries[0].record, RolloutRecord::Message { turn:Some(t), item }
-        if t == "保留轮" && item["id"] == "消息"));
-    assert!(read_chunk(&path,Some(&next.cursor)).unwrap().entries.is_empty());
+    assert!(
+        matches!(&next.entries[0].record, RolloutRecord::Message { turn:Some(t), item }
+        if t == "保留轮" && item["id"] == "消息")
+    );
+    assert!(read_chunk(&path, Some(&next.cursor))
+        .unwrap()
+        .entries
+        .is_empty());
 }
