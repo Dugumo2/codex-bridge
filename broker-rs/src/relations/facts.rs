@@ -714,6 +714,9 @@ impl Machine {
                     .is_some_and(|(epoch, until)| {
                         epoch == self.relations.conn_epoch && now < until
                     });
+            // 「身份失记」的跟进：首次进入收敛账本时已经是 Unproven，
+            // 在账本记下它的结算期限（该操作的 expires_at_ms），到期结算不等收敛总期限。
+            let unproven_run = (unresolved_kind && !run_id.is_empty()).then(|| run_id.clone());
             self.relations.operations.insert(
                 key.clone(),
                 EvidenceOperation {
@@ -754,6 +757,15 @@ impl Machine {
                     failure: None,
                 },
             );
+            if let Some(run) = unproven_run {
+                let at = self.relations.operations[&key].expires_at_ms;
+                self.convergences
+                    .ledgers
+                    .entry(run)
+                    .or_default()
+                    .unproven_deadlines
+                    .insert(key.clone(), at);
+            }
         }
         if kind == EvidenceKind::V2Interacted {
             if let Some(path) = item

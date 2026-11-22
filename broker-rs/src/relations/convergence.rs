@@ -16,6 +16,10 @@ pub struct ConvergenceLedger {
     pub next_seq: BTreeMap<String, u64>,
     pub result_versions: BTreeMap<(String, u64), u64>,
     pub overflow: bool,
+    /// 「身份失记」操作的结算期限（登记时的证据期限）：期限内仍计入 pending，
+    /// 到期移出并清占位，不等收敛总期限。只覆盖登记时已未证明的失记跟进，
+    /// 其他来源的 Unproven（证据到期、定案不是自己的）不进这张表。
+    pub unproven_deadlines: BTreeMap<EvidenceKey, u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -315,6 +319,23 @@ impl Machine {
                         .or_default()
                         .insert(op.key.clone());
                 }
+            }
+        }
+        // 身份失记的跟进按登记时的证据期限结算：到期移出 pending 并清掉它留下的占位。
+        // 放在操作循环之后，晚到首同步的失记操作也不会空挂。
+        let expired: Vec<EvidenceKey> = ledger
+            .unproven_deadlines
+            .iter()
+            .filter(|(_, at)| self.clock.mono_ms >= **at)
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in expired {
+            ledger.unproven_deadlines.remove(&key);
+            if ledger.pending.remove(&key) {
+                for reasons in ledger.placeholder_operations.values_mut() {
+                    reasons.remove(&key);
+                }
+                ledger.work_epoch = ledger.work_epoch.saturating_add(1);
             }
         }
         for (thread, member) in &context.members {

@@ -736,6 +736,14 @@ impl Machine {
                 consider(at);
             }
         }
+        // 身份失记跟进的结算期限也占一个扫描点，到期不靠别的事件。
+        for ledger in self.convergences.ledgers.values() {
+            for (key, at) in &ledger.unproven_deadlines {
+                if ledger.pending.contains(key) {
+                    consider(*at);
+                }
+            }
+        }
         let Some(at) = next else {
             if self.relations.aux.sweep.take().is_some() {
                 actions.push(Action::Unschedule {
@@ -760,9 +768,25 @@ impl Machine {
     }
 
     /// 到期处理：证据过期转 unbound、回查到期按未知不答、重试到点的回查重新发出。
+    /// 身份失记的跟进到期结算：驱动该运行重新同步，保证不靠别的事件也能按时结算。
     fn sweep(&mut self, actions: &mut Vec<Action>) {
         self.facts_expire(actions);
         self.lookup_expire(actions);
         self.guardian_expire();
+        let due: Vec<String> = self
+            .convergences
+            .ledgers
+            .iter()
+            .filter(|(_, ledger)| {
+                ledger
+                    .unproven_deadlines
+                    .values()
+                    .any(|at| *at <= self.clock.mono_ms)
+            })
+            .map(|(run, _)| run.clone())
+            .collect();
+        for run in due {
+            self.convergence_drive(&run, actions);
+        }
     }
 }
