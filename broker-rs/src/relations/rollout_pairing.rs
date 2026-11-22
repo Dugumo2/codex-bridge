@@ -110,6 +110,9 @@ pub struct RolloutState {
     pub waits: BTreeMap<EvidenceKey, RolloutWait>,
     /// (父线程, call_id) → 调用。读到时对应的 Interacted 可能还没来。
     pub calls: BTreeMap<(String, String), RolloutCall>,
+    /// 缓存写满放不下、又没有同键等待认领的调用：父线程 → (连接代际, 读到时刻 + EVIDENCE_TTL_MS)。
+    /// 之后同父线程的等到期仍没拿到自己的调用时据它判未证明，不按宽松规则回退。
+    pub lost_calls: BTreeMap<String, (u64, u64)>,
     /// 轮询计时：(到期单调毫秒, 代号)。
     pub timer: Option<(u64, u64)>,
     pub next_id: u64,
@@ -120,6 +123,8 @@ pub struct RolloutState {
 enum Decision {
     Strict(RolloutCall),
     Fallback(V2FallbackReason),
+    /// 调用明明读到过却被写满的缓存丢下：不是「缺调用」，操作置未证明。
+    Unproven,
 }
 
 impl RolloutState {
@@ -231,8 +236,10 @@ impl Machine {
         else {
             return Ok(false);
         };
-        // 向上、平级、越级等注定被拒的接收方不需要证据，照原样处理。
-        if self.followup_rejection(key, child, &op.run_id).is_some() {
+        // 缓存已命中的留言先兑现身份：留言不纳管接收方，注定被拒的检查不适用于它。
+        // 缓存未命中的平级、向上等操作仍直接走原来的拒绝。
+        let cached = self.rollout_call(key).filter(|c| !c.trigger).cloned();
+        if cached.is_none() && self.followup_rejection(key, child, &op.run_id).is_some() {
             return Ok(false);
         }
         if self.rollout_call(key).is_none() {
@@ -253,7 +260,7 @@ impl Machine {
             .map(|o| o.turn.clone())
             .collect();
         let wait = RolloutWait {
-            call: None,
+            call: cached,
             deadline_ms: self.clock.mono_ms.saturating_add(ROLLOUT_WAIT_MS),
             wall_ms: self.clock.now_ms,
             child: child.into(),
@@ -380,6 +387,7 @@ impl Machine {
         }
         // raw 能力未知时禁止新派读；此前已从本代际文件读出的调用仍可区分留言与跟进。
         let call = wait.call.as_ref().or_else(|| self.rollout_call(key));
+        // 只入队的留言不依赖接收方文件：按父调用类型定为严格，子文件失败或冷却不降级。
         if let Some(message) = call.filter(|c| !c.trigger) {
             return Some(Decision::Strict(message.clone()));
         }
@@ -393,10 +401,7 @@ impl Machine {
         }
         let expired = self.clock.mono_ms >= wait.deadline_ms;
         if let Some(call) = call {
-            // 没有可比的正文摘要：严格配对只会等到收敛期限，不如照原样宽松。
-            if call.message.is_none() {
-                return Some(Decision::Fallback(V2FallbackReason::RolloutCallMissing));
-            }
+            // 父侧缺可比正文时先问子侧：能力未知或已知失败的子侧给出自己的原因。
             let raw = self.raw_capability(&wait.child);
             let unavailable = match raw {
                 RawCapability::Unknown => Some(V2FallbackReason::RawUnknown),
@@ -405,6 +410,10 @@ impl Machine {
             };
             if let Some(reason) = unavailable {
                 return Some(Decision::Fallback(reason));
+            }
+            // 没有可比的正文摘要：严格配对只会等到收敛期限，不如照原样宽松。
+            if call.message.is_none() {
+                return Some(Decision::Fallback(V2FallbackReason::RolloutCallMissing));
             }
             // 只有接收侧还能提供消费证据时，等待迟到的发起方路径才有意义。
             if self.v2_sender_path(op).is_none() {
@@ -425,6 +434,21 @@ impl Machine {
         }
         if let Some(reason) = self.rollout_file_failed(&key.parent_thread_id) {
             return Some(Decision::Fallback(reason));
+        }
+        // 这个父线程读到过调用但被写满的缓存丢下：等到期仍没拿到自己的调用时
+        // 不是「缺调用」，宽松回退会错绑接收方的轮次，置为未证明。
+        if expired
+            && self
+                .relations
+                .aux
+                .rollout
+                .lost_calls
+                .get(&key.parent_thread_id)
+                .is_some_and(|(epoch, until)| {
+                    *epoch == self.relations.conn_epoch && self.clock.mono_ms < *until
+                })
+        {
+            return Some(Decision::Unproven);
         }
         expired.then_some(Decision::Fallback(V2FallbackReason::RolloutCallMissing))
     }
@@ -473,6 +497,11 @@ impl Machine {
                 }
                 Decision::Fallback(reason) => {
                     op.v2_fallback = Some(*reason);
+                }
+                Decision::Unproven => {
+                    // 失记不是缺证据：仍记调用缺失的原因，结果置未证明，不宽松配对轮次。
+                    op.v2_fallback = Some(V2FallbackReason::RolloutCallMissing);
+                    op.outcome = EvidenceOutcome::Unproven;
                 }
             }
         }
@@ -609,6 +638,11 @@ impl Machine {
             .rollout
             .calls
             .retain(|_, c| c.epoch == epoch && now < c.at.saturating_add(EVIDENCE_TTL_MS));
+        self.relations
+            .aux
+            .rollout
+            .lost_calls
+            .retain(|_, (e, until)| *e == epoch && now < *until);
         let keys: Vec<EvidenceKey> = self.relations.aux.rollout.waits.keys().cloned().collect();
         for key in keys {
             let Some(wait) = self.relations.aux.rollout.waits.get(&key) else {
@@ -980,10 +1014,20 @@ impl Machine {
                     if !state.calls.contains_key(&key) && state.calls.len() < MAX_OPERATIONS {
                         state.calls.insert(key, observed);
                     } else if !state.calls.contains_key(&key) {
+                        let mut taken = false;
                         for (operation, wait) in &mut state.waits {
                             if operation.parent_thread_id == key.0 && operation.item_id == key.1 {
                                 wait.call.get_or_insert_with(|| observed.clone());
+                                taken = true;
                             }
+                        }
+                        // 既放不进缓存又没有同键等待认领：在父线程上留失记标志，
+                        // 之后到期的等待仍没拿到自己的调用时判未证明而不是宽松回退。
+                        if !taken && state.lost_calls.len() < MAX_ROLLOUT_FILES {
+                            state.lost_calls.insert(
+                                key.0.clone(),
+                                (epoch, now.saturating_add(EVIDENCE_TTL_MS)),
+                            );
                         }
                     }
                 }
