@@ -395,6 +395,10 @@ fn tree_log_全局暂存上限与未知线程不暂存() {
     while !saturated {
         let thread = format!("child-{n}");
         n += 1;
+        assert!(
+            n < 33,
+            "线程数超过全局上限理论值的二倍仍未饱和：全局上限疑似失效"
+        );
         candidate(&mut m, &thread, "root");
         loop {
             let thread_bytes: usize = m
@@ -711,7 +715,13 @@ fn gap_wu_超限直接保存新摘要且不挤掉旧暂存() {
     candidate(&mut m, "乙", "root");
     let mut actions = vec![];
     // 接纳序号位数不同使每条暂存的字节数略有差异：填到出现第一条超限结算为止。
+    let mut fills = 0;
     while logs(&actions).is_empty() {
+        fills += 1;
+        assert!(
+            fills < 16_384,
+            "暂存超过全局上限理论值的二倍仍未超限：全局上限疑似失效"
+        );
         暂存(&mut m, "已有", &mut actions);
     }
     let old = m.runs.event_log.pending.clone();
@@ -1442,7 +1452,10 @@ fn gap_wu_已结算备忘有界超限淘汰最旧且超期不补写() {
         m.runs.event_log.pending.back_mut().unwrap().expires = 0;
         m.settle_event_log_step(&mut actions);
         n += 1;
-        assert!(n < 100_000, "备忘字节上限未触发淘汰");
+        assert!(
+            n < 8_192,
+            "备忘-0 未被淘汰且条数超理论上限二倍：已结算备忘疑似无界增长"
+        );
     }
     assert!(m.runs.event_log.settled_bytes <= GLOBAL_BYTES);
     // 超限淘汰最旧：最早的备忘不再补写。
