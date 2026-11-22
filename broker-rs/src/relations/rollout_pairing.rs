@@ -74,6 +74,9 @@ pub struct RolloutFile {
     /// 当前这段跟随里成功读过几次。
     pub reads: u32,
     pub next_at: u64,
+    /// 这段从末尾窗口起读以来，被下限挡掉的消息里最新一条的行时间；
+    /// 下限降到它之下时下一次派发从末尾窗口重读，补回被挡的消费记录。
+    pub floor_dropped: Option<u64>,
 }
 
 /// 等文件的操作：暂存的 Interacted 通知，定案后按原样重放。
@@ -799,6 +802,7 @@ impl Machine {
                             reading: None,
                             reads: 0,
                             next_at: now,
+                            floor_dropped: None,
                         },
                     );
                     actions.push(Action::Request(RequestContext {
@@ -830,12 +834,15 @@ impl Machine {
                     let Some(id) = self.relations.aux.rollout.next_read_id.checked_add(1) else {
                         continue;
                     };
+                    let floor = self.rollout_floor(thread);
+                    let reread = f.floor_dropped.is_some_and(|at| at >= floor);
+                    let fresh = reread || f.cursor.is_none();
                     let request = RolloutReadRequest {
                         id,
                         thread: thread.clone(),
                         conn_epoch: epoch,
                         path: path.clone(),
-                        cursor: f.cursor.clone(),
+                        cursor: if reread { None } else { f.cursor.clone() },
                     };
                     let deadline = now.saturating_add(ROLLOUT_READ_MS);
                     let state = &mut self.relations.aux.rollout;
@@ -852,7 +859,11 @@ impl Machine {
                     );
                     due = Some(due.map_or(deadline, |d| d.min(deadline)));
                     state.reads_issued = state.reads_issued.saturating_add(1);
-                    state.files.get_mut(thread).expect("文件登记存在").reading = Some(id);
+                    let f = state.files.get_mut(thread).expect("文件登记存在");
+                    if fresh {
+                        f.floor_dropped = None;
+                    }
+                    f.reading = Some(id);
                     actions.push(Action::ReadRollout(request));
                 }
                 Some(RolloutPathState::Requested(_) | RolloutPathState::Failed(_)) => {}
@@ -1092,6 +1103,9 @@ impl Machine {
                         continue;
                     }
                     if entry.wall_ms < floor {
+                        if let Some(file) = self.relations.aux.rollout.files.get_mut(thread) {
+                            file.floor_dropped = file.floor_dropped.max(Some(entry.wall_ms));
+                        }
                         continue;
                     }
                     let Some(delivery) = parse_delivery(&item) else {

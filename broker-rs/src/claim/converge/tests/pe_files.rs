@@ -64,6 +64,7 @@ fn fill_cooling(m: &mut Machine, next_at: u64) {
                 reading: None,
                 reads: 0,
                 next_at,
+                floor_dropped: None,
             },
         );
     }
