@@ -56,6 +56,8 @@ struct Pending {
     /// 接纳序号；summaryId 的稳定部分，补写确认版沿用。
     seq: u64,
     candidates: Vec<Candidate>,
+    /// 已按归属未确认写出的候选运行；分批结算时先结算的运行也计入，供备忘累计。
+    unconfirmed: Vec<String>,
     bytes: usize,
     deadline: u64,
 }
@@ -83,7 +85,7 @@ enum Settlement<'a> {
     Limit,
     /// 关闭清理：结算但不留备忘。
     All,
-    /// 运行结束：结算但不留备忘。
+    /// 运行结束：结算；累计里还有别的在跑运行则仍建备忘。
     Ending(&'a str),
     /// 暂存到期：结算后留下备忘等迟到确认。
     Expired,
@@ -465,6 +467,7 @@ impl Machine {
                 summary,
                 seq,
                 candidates: candidates.clone(),
+                unconfirmed: vec![],
                 bytes: 0,
                 deadline: self.clock.mono_ms.saturating_add(MAX_PENDING_MS),
             };
@@ -673,18 +676,28 @@ impl Machine {
             written.push(run.clone());
             false
         });
-        // 到期或超限结算的摘要留下备忘，迟到确认时补写确认版；运行结束或关闭不留。
-        if event.candidates.is_empty() && matches!(when, Settlement::Expired | Settlement::Limit) {
-            let live: Vec<String> = written
-                .into_iter()
+        // 分批结算时先写出的候选也累计：一个摘要有多个候选时可能分几批结清，
+        // 先结算的运行之后仍能迟到确认，备忘须记住累计而不只记最后一批。
+        event.unconfirmed.extend(written.iter().cloned());
+        // 候选清空时（关闭清理除外）只要累计里还有在跑的运行就建备忘，等迟到确认补写确认版。
+        if event.candidates.is_empty() && !matches!(when, Settlement::All) {
+            let ending = match when {
+                Settlement::Ending(run) => Some(run),
+                _ => None,
+            };
+            let live: Vec<String> = event
+                .unconfirmed
+                .iter()
+                .filter(|run| Some(run.as_str()) != ending)
                 .filter(|run| {
-                    self.runs.runs.get(run).is_some_and(|r| {
+                    self.runs.runs.get(*run).is_some_and(|r| {
                         matches!(
                             r.state,
                             super::RunState::Running | super::RunState::Stopping
                         )
                     })
                 })
+                .cloned()
                 .collect();
             if !live.is_empty() {
                 let mut memo = SettledMemo {

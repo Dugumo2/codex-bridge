@@ -1416,59 +1416,116 @@ fn gap_wu_迟到确认沿用同一身份补写确认版() {
         .iter()
         .all(|l| l.1 == "run-a" && l.3["late"] == true && l.3.get("attribution").is_none()));
     assert_eq!(confirmed[0].3["summaryId"], summary_id);
-    // 接缝：写出行经读取端合并（同一运行同一摘要只留一条，确认版取代未确认版）。
-    // 第一条：run-a 恰一条确认版，run-b 恰一条未确认版；第二条：run-a 恰一条确认版。
-    let mut merged: Vec<(String, serde_json::Value)> = vec![];
-    for (run, row) in unconfirmed
-        .iter()
-        .chain(confirmed.iter())
-        .map(|l| (l.1.clone(), l.3.clone()))
-    {
-        let pos = merged
-            .iter()
-            .position(|(r, m)| *r == run && m["summaryId"] == row["summaryId"]);
-        match pos {
-            Some(i)
-                if merged[i].1["attribution"] == "unconfirmed"
-                    && row["attribution"] != "unconfirmed" =>
-            {
-                merged[i] = (run, row);
-            }
-            Some(_) => {}
-            None => merged.push((run, row)),
-        }
-    }
-    for (item_id, count) in [("第一条", 2), ("第二条", 1)] {
-        let rows: Vec<_> = merged
-            .iter()
-            .filter(|(_, r)| r["itemId"] == item_id)
-            .collect();
-        assert_eq!(rows.len(), count, "{item_id} 合并后 {count} 条");
-    }
-    let first: Vec<_> = merged
-        .iter()
-        .filter(|(_, r)| r["itemId"] == "第一条")
-        .collect();
-    assert_eq!(first.len(), 2);
-    let run_a: Vec<_> = first
-        .iter()
-        .filter(|(r, _)| r.as_str() == "run-a")
-        .collect();
-    assert_eq!(run_a.len(), 1);
-    assert!(
-        run_a[0].1["late"] == true && run_a[0].1.get("attribution").is_none(),
-        "run-a 合并后恰一条且为确认版"
-    );
-    let run_b: Vec<_> = first
-        .iter()
-        .filter(|(r, _)| r.as_str() == "run-b")
-        .collect();
-    assert_eq!(run_b.len(), 1);
-    assert_eq!(run_b[0].1["attribution"], "unconfirmed");
     // 重复补写不再写。
     actions.clear();
     m.flush_bound_event_log("run-a", "乙", "目标", "root", &mut actions);
     assert!(logs(&actions).is_empty());
+}
+
+/// 多候选分批结算：先到期写未确认副本的运行之后确认归属，仍按备忘补写确认版。
+#[test]
+fn gap_wu_分批结算先写未确认的运行确认后仍补写() {
+    for second in ["结束", "二次到期"] {
+        let mut m = setup();
+        open(&mut m, "run-b", "root");
+        candidate(&mut m, "乙", "root");
+        let mut actions = vec![];
+        暂存(&mut m, "目标", &mut actions);
+        // run-b 有在途证据：首次到期结算只写 run-a 的未确认副本，run-b 留在暂存。
+        evidence_to(
+            &mut m,
+            "乙",
+            EvidenceKind::V2Interacted,
+            EvidenceOutcome::Pending,
+            false,
+        );
+        m.relations.operations.values_mut().next().unwrap().run_id = "run-b".into();
+        m.runs.event_log.pending[0].expires = 0;
+        m.settle_event_log_step(&mut actions);
+        let unconfirmed: Vec<_> = logs(&actions)
+            .into_iter()
+            .filter(|l| l.3["itemId"] == "same-item")
+            .collect();
+        assert_eq!(unconfirmed.len(), 1, "首批只结算 run-a，第二批={second}");
+        assert_eq!(unconfirmed[0].1, "run-a");
+        assert_eq!(unconfirmed[0].3["attribution"], "unconfirmed");
+        let summary_id = unconfirmed[0].3["summaryId"].clone();
+        assert_eq!(
+            m.runs.event_log.pending[0]
+                .candidates
+                .iter()
+                .map(|c| c.run.as_str())
+                .collect::<Vec<_>>(),
+            ["run-b"]
+        );
+        assert!(m.runs.event_log.settled.is_empty());
+        // 第二批：run-b 结束结清，或证据续期到头后二次到期结算再结束。
+        if second == "结束" {
+            m.run_released("run-b", crate::runs::ReleaseKind::Natural, &mut actions);
+        } else {
+            m.clock.mono_ms = MAX_PENDING_MS;
+            m.settle_event_log_step(&mut actions);
+            m.run_released("run-b", crate::runs::ReleaseKind::Natural, &mut actions);
+        }
+        // 备忘留下且记住仍在跑的 run-a：迟到确认还补写确认版。
+        let memos: Vec<_> = m
+            .runs
+            .event_log
+            .settled
+            .iter()
+            .filter(|memo| memo.thread == "乙" && memo.turn == "目标")
+            .collect();
+        assert_eq!(memos.len(), 1, "分批结清后仍建备忘，第二批={second}");
+        assert_eq!(memos[0].runs, ["run-a".to_owned()]);
+        actions.clear();
+        bind(&mut m, "run-a", "乙", "目标", "root");
+        m.flush_bound_event_log("run-a", "乙", "目标", "root", &mut actions);
+        let confirmed = logs(&actions);
+        assert_eq!(confirmed.len(), 1, "补写确认版恰一行，第二批={second}");
+        assert_eq!(confirmed[0].1, "run-a");
+        assert_eq!(confirmed[0].3["summaryId"], summary_id);
+        assert_eq!(confirmed[0].3["late"], true);
+        assert!(confirmed[0].3.get("attribution").is_none());
+    }
+}
+
+/// 超限直接保存的摘要也留备忘：之后确认归属沿用同一身份补写确认版。
+#[test]
+fn gap_wu_超限结算的摘要确认归属后沿用身份补写确认版() {
+    let mut m = setup();
+    candidate(&mut m, "乙", "root");
+    let mut actions = vec![];
+    // 填到出现第一条超限结算为止。
+    let mut fills = 0;
+    while logs(&actions).is_empty() {
+        fills += 1;
+        assert!(
+            fills < 16_384,
+            "暂存超过全局上限理论值的二倍仍未超限：全局上限疑似失效"
+        );
+        暂存(&mut m, "已有", &mut actions);
+    }
+    actions.clear();
+    暂存(&mut m, "目标", &mut actions);
+    核对保存(&actions, "目标");
+    let summary_id = logs(&actions)[0].3["summaryId"].clone();
+    assert!(
+        m.runs
+            .event_log
+            .settled
+            .iter()
+            .any(|memo| memo.thread == "乙" && memo.turn == "目标"),
+        "超限结算留下备忘等迟到确认"
+    );
+    actions.clear();
+    bind(&mut m, "run-a", "乙", "目标", "root");
+    m.flush_bound_event_log("run-a", "乙", "目标", "root", &mut actions);
+    let confirmed = logs(&actions);
+    assert_eq!(confirmed.len(), 1);
+    assert_eq!(confirmed[0].3["itemId"], "same-item");
+    assert_eq!(confirmed[0].3["summaryId"], summary_id);
+    assert_eq!(confirmed[0].3["late"], true);
+    assert!(confirmed[0].3.get("attribution").is_none());
 }
 
 /// 已结算备忘有界：总字节不超过全局上限（超限淘汰最旧）；兜底时长到期不再补写。

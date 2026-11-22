@@ -2272,6 +2272,11 @@ fn 兄弟唤醒两轮(快照位置: usize) {
             ]
         );
     }
+    assert_eq!(
+        归属误报行数(&all),
+        0,
+        "零归属冲突、零 discoveryIncomplete、零覆盖提示与告警"
+    );
 }
 
 #[test]
@@ -2547,7 +2552,7 @@ fn gap_wu_开始记录满时文件留言零绑定而跟进按证据回退() {
     let (mut m, _) = base();
     files(&m);
     call_line(&m, "种子", "followup_task", C, "已有任务");
-    interacted_to(&mut m, "种子", C);
+    let mut all = interacted_to(&mut m, "种子", C);
     let seed = op(&m, "种子").key.clone();
     let start = m.relations.aux.followup_starts[&seed].clone();
     for n in 1..MAX_OPERATIONS {
@@ -2572,7 +2577,7 @@ fn gap_wu_开始记录满时文件留言零绑定而跟进按证据回退() {
     assert_eq!(m.relations.aux.rollout.calls.len(), MAX_OPERATIONS);
     for (id, tool) in [("留言", "send_message"), ("跟进", "followup_task")] {
         call_line(&m, id, tool, C, id);
-        interacted_to(&mut m, id, C);
+        all.extend(interacted_to(&mut m, id, C));
         let operation = op(&m, id);
         assert!(!m.relations.aux.followup_starts.contains_key(&operation.key));
         if id == "留言" {
@@ -2584,6 +2589,11 @@ fn gap_wu_开始记录满时文件留言零绑定而跟进按证据回退() {
             assert_eq!(operation.v2_fallback, Some(V2FallbackReason::StartMissing));
         }
     }
+    assert_eq!(
+        归属误报行数(&all),
+        0,
+        "零归属冲突、零 discoveryIncomplete、零覆盖提示与告警"
+    );
 }
 
 #[test]
@@ -2688,23 +2698,28 @@ fn gap_wu_缓存确认的文件留言在父线程转实时后仍只入队() {
     files(&m);
     call_line(&m, "预读", "send_message", C, "");
     call_line(&m, "已知留言", "send_message", C, "");
-    interacted_to(&mut m, "预读", C);
-    notify(
+    let mut all = interacted_to(&mut m, "预读", C);
+    all.extend(notify(
         &mut m,
         "rawResponseItem/completed",
         json!({"threadId":P,"turnId":T,"item":{"type":"reasoning"}}),
-    );
+    ));
     let reads = m.relations.aux.rollout.reads_issued;
-    interacted_to(&mut m, "已知留言", C);
+    all.extend(interacted_to(&mut m, "已知留言", C));
     let known = op(&m, "已知留言");
     assert!(known.v2_queue_only && known.receivers.is_empty());
     assert_eq!(known.v2_source, V2EvidenceSource::RolloutFile);
-    interacted_to(&mut m, "无缓存", C);
+    all.extend(interacted_to(&mut m, "无缓存", C));
     assert_eq!(
         op(&m, "无缓存").v2_fallback,
         Some(V2FallbackReason::StartMissing)
     );
     assert_eq!(m.relations.aux.rollout.reads_issued, reads);
+    assert_eq!(
+        归属误报行数(&all),
+        0,
+        "零归属冲突、零 discoveryIncomplete、零覆盖提示与告警"
+    );
 }
 
 #[test]
@@ -2805,6 +2820,7 @@ fn gap_wu_重新跟随时不沿用旧路径请求的成功或失败() {
 fn gap_wu_实时开始表满仍区分留言与跟进() {
     for receipts_full in [false, true] {
         let (mut m, _) = base();
+        let mut all = vec![];
         raw(&mut m, "已知跟进", "调用正文");
         let (key, start) = m
             .relations
@@ -2833,13 +2849,13 @@ fn gap_wu_实时开始表满仍区分留言与跟进() {
             }
         }
         assert_eq!(m.relations.aux.followup_starts.len(), MAX_OPERATIONS);
-        notify(
+        all.extend(notify(
             &mut m,
             "rawResponseItem/completed",
             json!({"threadId":P,"turnId":T,
             "item":{"type":"function_call","name":"send_message","call_id":"即时留言"}}),
-        );
-        interacted_to(&mut m, "即时留言", C);
+        ));
+        all.extend(interacted_to(&mut m, "即时留言", C));
         let message = op(&m, "即时留言");
         assert!(message.proven_turns.is_empty());
         if receipts_full {
@@ -2848,15 +2864,20 @@ fn gap_wu_实时开始表满仍区分留言与跟进() {
             assert!(message.v2_queue_only && message.receivers.is_empty());
             assert_eq!(message.v2_source, V2EvidenceSource::Raw);
         }
-        interacted_to(&mut m, "已知跟进", C);
+        all.extend(interacted_to(&mut m, "已知跟进", C));
         let known = op(&m, "已知跟进");
         assert!(known.v2_strict && !known.v2_queue_only);
         assert_eq!(known.v2_source, V2EvidenceSource::Raw);
         m.clock.mono_ms += 30_000;
-        interacted_to(&mut m, "窗口后", C);
+        all.extend(interacted_to(&mut m, "窗口后", C));
         let later = op(&m, "窗口后");
         assert_eq!(later.v2_fallback, Some(V2FallbackReason::StartMissing));
         assert_ne!(later.outcome, EvidenceOutcome::Unproven);
+        assert_eq!(
+            归属误报行数(&all),
+            0,
+            "零归属冲突、零 discoveryIncomplete、零覆盖提示与告警"
+        );
     }
 }
 
