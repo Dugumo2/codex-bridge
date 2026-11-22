@@ -1210,6 +1210,7 @@ impl Machine {
                 false,
                 false,
                 Some(crate::runs::event_log::LogNote::DiscoveryIncomplete),
+                None,
                 actions,
             );
         }
@@ -1345,6 +1346,7 @@ impl Machine {
                 false,
                 false,
                 Some(crate::runs::event_log::LogNote::DiscoveryIncomplete),
+                None,
                 actions,
             );
             if let Some(member) = self
@@ -1395,6 +1397,7 @@ impl Machine {
             "已确认活动绑定",
             false,
             false,
+            None,
             None,
             actions,
         );
@@ -1776,9 +1779,7 @@ impl Machine {
             let Some(oldest) = oldest else {
                 return false;
             };
-            if let Some(evicted) = self.relations.operations.remove(&oldest) {
-                self.remember_evicted_log_proof(&evicted);
-            }
+            self.relations.operations.remove(&oldest);
             self.relations.aux.v2_receiver_paths.remove(&oldest);
         }
         true
