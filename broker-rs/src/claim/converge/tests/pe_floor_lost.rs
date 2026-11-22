@@ -55,13 +55,7 @@ fn gap_pe_下限未下移时不重读末尾窗口() {
     // 暂扣下一次派发，断言它带着游标而不是从末尾窗口重读。
     fx::with(|f| f.hold = true);
     all.extend(fx::poll(&mut m));
-    let held = fx::with(|f| {
-        f.held
-            .iter()
-            .filter(|r| r.thread == C)
-            .map(|r| r.clone())
-            .collect::<Vec<_>>()
-    });
+    let held: Vec<_> = fx::with(|f| f.held.iter().filter(|r| r.thread == C).cloned().collect());
     assert!(!held.is_empty(), "跟随中的子文件应有下一次读取在途");
     assert!(
         held.iter().all(|r| r.cursor.is_some()),
@@ -197,6 +191,110 @@ fn gap_pe_等待先建标志后到到期仍判未证明() {
         "丢下调用后父线程应留下失记标志"
     );
     // 到期时标志仍在：按实时判断判未证明，不按宽松规则回退。
+    m.clock.mono_ms += ROLLOUT_WAIT_MS;
+    let mut out = vec![];
+    m.drive_rollout(&mut out);
+    all.extend(out);
+    let operation = op(&m, "留言");
+    assert_eq!(operation.outcome, EvidenceOutcome::Unproven);
+    assert!(operation.proven_turns.is_empty(), "接收方的活动轮不被绑定");
+    assert_no_alarm(&all);
+}
+
+/// 把失记表写满到 MAX_ROLLOUT_FILES（本代际、各自带期限），返回写入用的时刻。
+fn 塞满失记表(m: &mut Machine) {
+    let epoch = m.relations.conn_epoch;
+    let now = m.clock.mono_ms;
+    for n in 0..crate::relations::rollout_pairing::MAX_ROLLOUT_FILES {
+        m.relations.aux.rollout.lost_calls.insert(
+            format!("塞{n}"),
+            (epoch, now + crate::relations::EVIDENCE_TTL_MS),
+        );
+    }
+}
+
+/// E5：失记表写满时放不下的调用，父线程已在表里要刷新期限。
+/// 不刷新的话期限一到标志被清掉，之后建的等待照宽松规则回退错绑。
+#[test]
+fn gap_pe_失记表满时已有父线程刷新期限() {
+    let (mut m, _mock) = base();
+    files(&m);
+    let filler = crate::relations::rollout_pairing::RolloutCall {
+        epoch: m.relations.conn_epoch,
+        at: m.clock.mono_ms,
+        wall_ms: m.clock.now_ms,
+        trigger: true,
+        target: Some(C.into()),
+        message: None,
+    };
+    for n in 0..MAX_OPERATIONS {
+        m.relations
+            .aux
+            .rollout
+            .calls
+            .insert((P.into(), format!("缓存{n}")), filler.clone());
+    }
+    塞满失记表(&mut m);
+    // P 已在表里，期限只剩一毫秒。
+    let epoch = m.relations.conn_epoch;
+    let old_until = m.clock.mono_ms + 1;
+    m.relations
+        .aux
+        .rollout
+        .lost_calls
+        .insert(P.into(), (epoch, old_until));
+    call_line(&m, "留言", "send_message", C, "忙里捎话");
+    let mut all = interacted_to(&mut m, "占位", C);
+    let flag = m.relations.aux.rollout.lost_calls[P];
+    assert_eq!(flag.0, epoch);
+    // 缺陷断言：表满也要刷新已有父线程的期限到读到时刻 + EVIDENCE_TTL_MS。
+    assert!(
+        flag.1 == m.clock.mono_ms + crate::relations::EVIDENCE_TTL_MS,
+        "表满时已有父线程的失记期限应刷新到读到时刻 + EVIDENCE_TTL_MS，实际 {old_until} → {}",
+        flag.1
+    );
+    // 旧期限之后、新期限之内建等待：等到期仍判未证明。
+    m.clock.mono_ms = old_until + 1;
+    m.clock.now_ms += 100;
+    all.extend(interacted_to(&mut m, "留言", C));
+    m.clock.mono_ms += ROLLOUT_WAIT_MS;
+    let mut out = vec![];
+    m.drive_rollout(&mut out);
+    all.extend(out);
+    let operation = op(&m, "留言");
+    assert_eq!(operation.outcome, EvidenceOutcome::Unproven);
+    assert!(operation.proven_turns.is_empty(), "接收方的活动轮不被绑定");
+    assert_no_alarm(&all);
+}
+
+/// E5：失记表写满时放不下的调用，父线程不在表里要置全表标志。
+/// 不设标志的话这个父线程建的等待等到期查不到记录，照宽松规则回退错绑。
+#[test]
+fn gap_pe_失记表满时新父线程按全表标志判未证明() {
+    let (mut m, _mock) = base();
+    files(&m);
+    let filler = crate::relations::rollout_pairing::RolloutCall {
+        epoch: m.relations.conn_epoch,
+        at: m.clock.mono_ms,
+        wall_ms: m.clock.now_ms,
+        trigger: true,
+        target: Some(C.into()),
+        message: None,
+    };
+    for n in 0..MAX_OPERATIONS {
+        m.relations
+            .aux
+            .rollout
+            .calls
+            .insert((P.into(), format!("缓存{n}")), filler.clone());
+    }
+    // 表满且 P 不在表里。
+    塞满失记表(&mut m);
+    call_line(&m, "留言", "send_message", C, "忙里捎话");
+    let mut all = interacted_to(&mut m, "占位", C);
+    assert!(!m.relations.aux.rollout.lost_calls.contains_key(P));
+    // 表满标志在期限内：等到期仍判未证明，不按宽松规则回退。
+    all.extend(interacted_to(&mut m, "留言", C));
     m.clock.mono_ms += ROLLOUT_WAIT_MS;
     let mut out = vec![];
     m.drive_rollout(&mut out);
