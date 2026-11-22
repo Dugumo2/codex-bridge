@@ -121,6 +121,9 @@ pub struct RolloutState {
     /// 缓存写满放不下、又没有同键等待认领的调用：父线程 → (连接代际, 读到时刻 + EVIDENCE_TTL_MS)。
     /// 之后同父线程的等到期仍没拿到自己的调用时据它判未证明，不按宽松规则回退。
     pub lost_calls: BTreeMap<String, (u64, u64)>,
+    /// 失记表写满时又丢下的调用：父线程不在表里就置这条全表标志 (连接代际, 读到时刻 + EVIDENCE_TTL_MS)，
+    /// 覆盖所有本代际没有逐线程记录的父线程；随清扫按期限清掉。
+    pub lost_overflow: Option<(u64, u64)>,
     /// 轮询计时：(到期单调毫秒, 代号)。
     pub timer: Option<(u64, u64)>,
     pub next_id: u64,
@@ -401,16 +404,15 @@ impl Machine {
             })
     }
 
-    /// 父线程此刻带着本代际未失效的失记标志（写满的缓存丢下过它的调用）。
+    /// 父线程此刻带着本代际未失效的失记标志（写满的缓存丢下过它的调用，
+    /// 逐线程记录或表满时的全表标志）。
     fn rollout_lost_marked(&self, parent: &str) -> bool {
-        self.relations
-            .aux
-            .rollout
-            .lost_calls
-            .get(parent)
-            .is_some_and(|(epoch, until)| {
-                *epoch == self.relations.conn_epoch && self.clock.mono_ms < *until
-            })
+        let rollout = &self.relations.aux.rollout;
+        let live = |(epoch, until): (u64, u64)| {
+            epoch == self.relations.conn_epoch && self.clock.mono_ms < until
+        };
+        rollout.lost_calls.get(parent).is_some_and(|f| live(*f))
+            || rollout.lost_overflow.is_some_and(live)
     }
 
     fn rollout_decision(&self, key: &EvidenceKey, wait: &RolloutWait) -> Option<Decision> {
@@ -679,6 +681,15 @@ impl Machine {
             .rollout
             .lost_calls
             .retain(|_, (e, until)| *e == epoch && now < *until);
+        if self
+            .relations
+            .aux
+            .rollout
+            .lost_overflow
+            .is_some_and(|(e, until)| e != epoch || now >= until)
+        {
+            self.relations.aux.rollout.lost_overflow = None;
+        }
         let keys: Vec<EvidenceKey> = self.relations.aux.rollout.waits.keys().cloned().collect();
         for key in keys {
             let Some(wait) = self.relations.aux.rollout.waits.get(&key) else {
@@ -1097,11 +1108,18 @@ impl Machine {
                         }
                         // 既放不进缓存又没有同键等待认领：在父线程上留失记标志，
                         // 之后到期的等待仍没拿到自己的调用时判未证明而不是宽松回退。
-                        if !taken && state.lost_calls.len() < MAX_ROLLOUT_FILES {
-                            state.lost_calls.insert(
-                                key.0.clone(),
-                                (epoch, now.saturating_add(EVIDENCE_TTL_MS)),
-                            );
+                        // 表写满时：父线程已在表里刷新它的期限；不在表里置全表标志。
+                        if !taken {
+                            if let Some(flag) = state.lost_calls.get_mut(&key.0) {
+                                flag.1 = now.saturating_add(EVIDENCE_TTL_MS);
+                            } else if state.lost_calls.len() < MAX_ROLLOUT_FILES {
+                                state.lost_calls.insert(
+                                    key.0.clone(),
+                                    (epoch, now.saturating_add(EVIDENCE_TTL_MS)),
+                                );
+                            } else {
+                                state.lost_overflow = Some((epoch, now + EVIDENCE_TTL_MS));
+                            }
                         }
                     }
                 }
