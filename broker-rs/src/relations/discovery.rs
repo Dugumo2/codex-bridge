@@ -41,8 +41,8 @@ pub struct DiscoveryWork {
     pub loaded: BTreeSet<String>,
     pub reads_queue: VecDeque<String>,
     pub reads_in_flight: BTreeSet<String>,
-    /// 元数据请求发出时的连接与线程活动版本，只用于判定卸载观察是否仍然适用。
-    pub read_stamps: BTreeMap<String, (u64, u64)>,
+    /// 元数据请求发出时的连接代际、候选版本与在线活动序号，只用于判定卸载观察是否仍然适用。
+    pub read_stamps: BTreeMap<String, (u64, u64, u64)>,
     pub reads_total: usize,
     pub read_edges: BTreeMap<String, RelationEdge>,
     pub turn_reads: BTreeMap<String, ChildTurnRead>,
@@ -929,6 +929,8 @@ impl Machine {
             }
             let mut params = json!({"threadId": thread});
             if method == "thread/read" {
+                let activity =
+                    *Self::online_activity_slot(&mut self.relations.aux.online_activity, &thread);
                 work.read_stamps.insert(
                     thread.clone(),
                     (
@@ -939,6 +941,7 @@ impl Machine {
                             .get(&thread)
                             .copied()
                             .unwrap_or(0),
+                        activity,
                     ),
                 );
                 // 根只核实输入能力；子代理的轮次随后分页读，这里都不带历史。
@@ -1103,7 +1106,7 @@ impl Machine {
         self.convergence_sync_facts(&run);
     }
 
-    pub(super) fn metadata_read_stamp(&mut self, thread: &str) -> (u64, u64) {
+    pub(super) fn metadata_read_stamp(&mut self, thread: &str) -> (u64, u64, u64) {
         // 版本淘汰后不再认旧回包，不能将两次「未登记」视为同一次观察。
         if !self.relations.aux.candidate_versions.contains_key(thread) {
             self.candidate_changed(thread);
@@ -1111,6 +1114,7 @@ impl Machine {
         (
             self.relations.conn_epoch,
             self.relations.aux.candidate_versions[thread],
+            self.online_activity_stamp(thread),
         )
     }
 
@@ -1135,11 +1139,12 @@ impl Machine {
         &mut self,
         thread: &str,
         info: &Value,
-        stamp: (u64, u64),
+        stamp: (u64, u64, u64),
     ) {
         let version = self.relations.aux.candidate_versions.get(thread).copied();
         if stamp.0 == self.relations.conn_epoch
             && version == Some(stamp.1)
+            && !self.online_activity_since(thread, stamp.2)
             && info["id"].as_str() == Some(thread)
             && info["status"]["type"] == "notLoaded"
         {

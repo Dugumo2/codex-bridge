@@ -439,3 +439,97 @@ fn gap_wu_根能力回查只凭当前同线程卸载退休读取() {
 fn gap_wu_已加载列表定向回查只凭当前同线程卸载退休读取() {
     核对元数据卸载(true);
 }
+
+/// 命令开始通知（卸载口径里的在线活动）。
+fn command_started(thread: &str) -> Event {
+    Event::Notification {
+        method: "item/started".into(),
+        params: Some(
+            json!({"threadId":thread,"turnId":"子轮","item":{"type":"commandExecution","id":"条目","command":"echo"}}),
+        ),
+    }
+}
+
+#[test]
+fn gap_wu_发现回查发出后的在线活动作废旧卸载() {
+    use crate::relations::rollout_pairing::{ReadTicket, ReadTicketState};
+    // 已有线程不进发现回查（loaded/list 的 known 分支跳过），故「提前开始」对照由探针用例承担。
+    for event in ["无活动", "线程开始", "轮开始", "命令开始"] {
+        let (mut m, mut mock) = machine();
+        m.convergences.capabilities.remove(P);
+        mock.register(C, Some(P), "v1", false, true);
+        let (_op, mut queue) = begin(&mut m);
+        let ctx = loop {
+            let action = queue
+                .pop_front()
+                .unwrap_or_else(|| panic!("{event} 发现应派出元数据读取"));
+            let Action::Request(ctx) = action else {
+                continue;
+            };
+            if !matches!(ctx.operation, crate::claim::Operation::Discovery { .. }) {
+                continue;
+            }
+            if ctx.method == "thread/read" && params(&ctx)["threadId"] == C {
+                break ctx;
+            }
+            let value = match ctx.method.as_str() {
+                "thread/loaded/list" => json!({"data":[C],"nextCursor":null}),
+                "thread/list" | "thread/turns/list" => json!({"data":[],"nextCursor":null}),
+                "thread/goal/get" => json!({"goal":null}),
+                "thread/read" => {
+                    json!({"thread":mock.thread_info(params(&ctx)["threadId"].as_str().unwrap()).unwrap()})
+                }
+                other => panic!("未预期请求 {other}"),
+            };
+            queue.extend(mock.inject(
+                &mut m,
+                Event::Reply {
+                    context: ctx,
+                    result: Ok(value),
+                },
+            ));
+        };
+        m.relations.aux.rollout.rollout_reads.insert(
+            1,
+            ReadTicket {
+                id: 1,
+                thread: C.into(),
+                conn_epoch: m.relations.conn_epoch,
+                deadline: m.clock.mono_ms + 30_000,
+                state: ReadTicketState::Active,
+            },
+        );
+        // 回查发出后同线程的在线活动：这条随后到达的 notLoaded 是旧的，作废。
+        match event {
+            "线程开始" => {
+                mock.inject(&mut m, mock.thread_started(C));
+            }
+            "轮开始" => {
+                let started = mock.turn_started(C, "子轮");
+                mock.inject(&mut m, started);
+            }
+            "命令开始" => {
+                mock.inject(&mut m, command_started(C));
+            }
+            _ => {}
+        }
+        let mut info = mock.thread_info(C).unwrap();
+        info["status"] = json!({"type":"notLoaded"});
+        mock.inject(
+            &mut m,
+            Event::Reply {
+                context: ctx,
+                result: Ok(json!({"thread":info})),
+            },
+        );
+        assert_eq!(
+            m.relations.aux.rollout.rollout_reads[&1].state,
+            if event == "线程开始" || event == "轮开始" || event == "命令开始" {
+                ReadTicketState::Active
+            } else {
+                ReadTicketState::Retired
+            },
+            "{event}"
+        );
+    }
+}
