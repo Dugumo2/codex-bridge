@@ -311,6 +311,7 @@ function parseLog(text: string, label: string): LogLine[] {
           || !["run", "execution", "subagent"].includes(value.sourceRole as string)
           || typeof value.summary !== "string" || typeof value.truncated !== "boolean"
           || (value.late !== undefined && typeof value.late !== "boolean")
+          || (value.summaryId !== undefined && (typeof value.summaryId !== "string" || value.summaryId === ""))
           || (value.coverageIssue !== undefined && !["beforeBindingUnknown", "discoveryIncomplete"].includes(value.coverageIssue as string))) {
           throw new Error("结构化日志字段损坏");
         }

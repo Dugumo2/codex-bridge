@@ -22,6 +22,7 @@ export function treeTimeline(rootThreadId: string, lines: LogLine[], records: Ru
   const runIds = new Set(records.map((run) => run.runId));
   const seen = new Set<string>();
   const items: TreeLogEvent[] = [];
+  const summaryIds: Array<string | undefined> = [];
   for (const line of lines) {
     const source = line.source;
     if (source && source.rootThreadId !== rootThreadId) continue;
@@ -40,7 +41,23 @@ export function treeTimeline(rootThreadId: string, lines: LogLine[], records: Ru
       kind: line.event, text: line.text, summary: line.content, truncated: source?.truncated ?? false,
       ...(source?.attribution === "unconfirmed" ? { attribution: source.attribution } : {}),
       ...(source?.late !== undefined ? { late: source.late } : {}) });
+    summaryIds.push(source?.summaryId);
   }
+  // 同一运行内同一暂存摘要的迟到确认版取代未确认版：有确认版只留第一条确认版，全是未确认版留第一条；
+  // 不同运行的副本互不影响，没有 summaryId 的行不参与合并。summaryId 只在读取端内部使用，不进入输出。
+  const settled = new Map<string, number>();
+  const drop = new Set<number>();
+  for (let i = 0; i < items.length; i++) {
+    const sid = summaryIds[i];
+    if (sid === undefined || items[i]!.runId === null) continue;
+    const key = `${items[i]!.runId}\0${sid}`;
+    const kept = settled.get(key);
+    if (kept === undefined) { settled.set(key, i); continue; }
+    if (!items[kept]!.attribution || items[i]!.attribution !== undefined) { drop.add(i); continue; }
+    drop.add(kept);
+    settled.set(key, i);
+  }
+  const merged = drop.size ? items.filter((_, i) => !drop.has(i)) : items;
   for (const run of records) {
     const stop = run.childrenStop;
     // 停止核验中的报告也是暂态；只有运行或清理责任定案才能补出覆盖问题。
@@ -52,8 +69,8 @@ export function treeTimeline(rootThreadId: string, lines: LogLine[], records: Ru
     }
   }
   // 稳定排序保留同毫秒的落盘追加顺序；eventId 只用于去重，不用它重新排序。
-  items.sort((a, b) => a.ts.localeCompare(b.ts));
-  return { items, coverage: { scope: "retained", issues } };
+  merged.sort((a, b) => a.ts.localeCompare(b.ts));
+  return { items: merged, coverage: { scope: "retained", issues } };
 }
 
 export function treeLogLine(item: TreeLogEvent, labels: ReadonlyMap<string, string>, count?: number): string {
