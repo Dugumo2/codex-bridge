@@ -2418,6 +2418,7 @@ fn gap_wu_子文件冷却与能力未知均先判父调用类型() {
                     reading: None,
                     reads: 0,
                     next_at: m.clock.mono_ms + 30_000,
+                    floor_dropped: None,
                 },
             );
             if unknown {
@@ -3140,6 +3141,7 @@ fn gap_wu_缺可比正文的跟进先取子侧原因() {
                     reading: None,
                     reads: 0,
                     next_at: m.clock.mono_ms + 30_000,
+                    floor_dropped: None,
                 },
             );
         } else if mode == "未知" {
