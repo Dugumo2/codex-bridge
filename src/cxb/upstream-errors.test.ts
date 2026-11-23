@@ -248,6 +248,21 @@ test("失败摘要补一次改法行且不重复", () => {
     expect(o.lines.filter(line => line.includes("改法"))).toEqual([remedies.subscriptionSharingUsageLimit]);
   } finally { o.dispose(); }
 });
+test("晚接入失败收尾：补中文标签行再补改法行", () => {
+  const o = observer();
+  try {
+    // 运行已失败后才接入（如事后 wait）：上方没有中文三行，失败收尾先补标签再补改法。
+    const run = o.observed.apply(runResult({ status: "failed", diagnosticRevision: 1,
+      upstreamError: upstreamError({ category: "subscriptionSharingUnsupported", httpStatusCode: null, codexErrorInfo: "other" }),
+      turns: [{ ...runResult().turns[0]!, status: "failed", error: { message: "{\"error\":{\"code\":\"subscription_sharing_unsupported_capability\"}}", codexErrorInfo: "other" } }] }));
+    o.observed.failure(run);
+    expect(o.lines).toEqual([
+      "[cxb] 失败原因：{\"error\":{\"code\":\"subscription_sharing_unsupported_capability\"}}（other）",
+      "[cxb] 最近上游报错：订阅共享登录不支持子代理等能力，共观察到 3 次（运行已结束）。",
+      remedies.subscriptionSharingUnsupported,
+    ]);
+  } finally { o.dispose(); }
+});
 test("订阅共享两类：真实形状无 HTTP 状态码逐字", () => {
   // 上游真实报错是 HTTP 400、codexErrorInfo 为 "other"，broker 不带状态码。
   const shape = { httpStatusCode: null, codexErrorInfo: "other" as const };
