@@ -105,7 +105,7 @@ fn 未归属轮_跟进轮后自开一轮_结束通知丢失由发现回读补上
     unbound_turn_released(Shape::AfterFollowup, true);
 }
 
-/// 被消息唤醒的那一轮的轮号。消费方向按轮号里的开始时间登记，要用上游的格式（UUIDv7），开始时间晚于 core 启动。
+/// 被消息唤醒的子轮。
 const MESSAGE_TURN: &str = "ffffffff-ffff-7000-8000-000000000001";
 
 /// 子代理 C 的一轮由消费的消息唤醒、没有本运行的操作归属。经真实通知入口（raw 消费记录、条目通知）走到摘要暂存到期，
@@ -131,7 +131,7 @@ fn consumed_turn_expired(author: &str) -> Vec<Action> {
     let actions = notify(&mut m, "item/completed", item("条目一"));
     all.extend(replies(&mut m, &mock, actions));
     assert!(m.binding(C, U).is_none(), "前置：U 没有本运行的操作归属");
-    // 下一条摘要到达时先处理已到期的暂存（与计时器到期走同一出口）。
+    // 下一步处理完通知后，统一清扫此前已到期的摘要。
     m.clock.mono_ms += 31_000;
     m.clock.now_ms += 31_000;
     let actions = notify(&mut m, "item/completed", item("条目二"));
@@ -139,22 +139,30 @@ fn consumed_turn_expired(author: &str) -> Vec<Action> {
     all
 }
 
-/// 首次 raw 在本轮开始之后才观察到，兄弟消息不能追认开始覆盖，仍应保守记缺口。
-/// 对照：同样没有归属证据、消费的却是直接上级（根）的消息，照常留缺口。
 #[test]
-fn 记录缺口_缺先验覆盖的首轮平级与上级消息均告警() {
-    let first = consumed_turn_expired("/root/兄弟");
-    assert!(first.iter().any(|a| matches!(a, Action::Store(crate::store::StoreOp::AppendLog { lines, .. })
-        if lines.iter().any(|line| line.contains("beforeBindingUnknown") && line.contains(MESSAGE_TURN)))),
-        "首轮没有先验 raw 见证，平级消息也不能追认覆盖");
-    let control = consumed_turn_expired("/root");
-    let gap = control.iter().any(|a| {
-        matches!(a, Action::Store(crate::store::StoreOp::AppendLog { lines, .. })
-            if lines.iter().any(|l| l.contains("beforeBindingUnknown") && l.contains(MESSAGE_TURN)))
-    });
-    assert!(gap, "对照：上级消息唤醒却无归属证据，必须留缺口");
+fn gap_wu_未归属轮无论消息方向均保存原摘要() {
+    for author in ["/root/兄弟", "/root"] {
+        let actions = consumed_turn_expired(author);
+        let mut saved = vec![];
+        for action in &actions {
+            if let Action::Store(crate::store::StoreOp::AppendLog { lines, .. }) = action {
+                for line in lines {
+                    let fields: Vec<_> = line.splitn(4, ' ').collect();
+                    assert_ne!(fields[2], "记录缺口");
+                    let row: serde_json::Value =
+                        serde_json::from_str(fields[3].strip_prefix("\t@cxb2 ").unwrap()).unwrap();
+                    if row["itemId"] == "条目一" {
+                        saved.push(row);
+                    }
+                }
+            }
+        }
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0]["attribution"], "unconfirmed");
+        assert_eq!(saved[0]["summary"], "处理中");
+        assert_eq!(saved[0]["turnId"], MESSAGE_TURN);
+    }
 }
-
 /// 迟到归属的完整往返：文件严格跟进在等消费记录时，子代理开出承载轮 U，记录还没读到，U 暂时未归属；
 /// U 结束后移出账本，这期间跟进的等待和占位仍阻塞收尾。记录读到后 U 归属这次跟进，
 /// 按归属轮重建、核实并带上结果引用，汇总读取包含 U。
@@ -224,7 +232,7 @@ fn 未归属轮_结束移出后消费记录迟到补上归属_重建并进入汇
         m.relations
             .aux
             .rollout
-            .coverage_reads
+            .rollout_reads
             .values()
             .all(|ticket| ticket.state
                 != crate::relations::rollout_pairing::ReadTicketState::Retired),

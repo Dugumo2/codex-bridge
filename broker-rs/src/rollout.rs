@@ -18,9 +18,9 @@ use std::path::{Component, Path};
 
 /// 首次读取的末尾窗口。
 pub const TAIL_BYTES: u64 = 256 * 1024;
-/// 为确定窗口起点所在的轮向前多读的总上限（含首个窗口）。
+/// 为定位轮次扩展的解析窗口上限；跨窗首行另按单行上限核实。
 pub const MAX_TAIL_BYTES: u64 = 4 * 1024 * 1024;
-/// 跟随时单次读取的上限，也是单行上限：更长的行整行跳过。
+/// 跟随时单次读取的上限，也是含换行符的单行上限。
 pub const MAX_READ_BYTES: u64 = 4 * 1024 * 1024;
 
 /// 读到哪里：`offset` 总在行首（跳过超长行时在行中间，`skipping` 为真）；`turn` 是 `offset` 处所在的轮。
@@ -39,8 +39,6 @@ pub struct RolloutReadRequest {
     pub id: u64,
     pub thread: String,
     pub conn_epoch: u64,
-    pub observation_gen: u64,
-    pub issued_seq: u64,
     pub path: String,
     /// None 表示首次读取（末尾窗口）。
     pub cursor: Option<RolloutCursor>,
@@ -67,14 +65,23 @@ pub struct RolloutEntry {
 pub struct RolloutChunk {
     pub entries: Vec<RolloutEntry>,
     pub cursor: RolloutCursor,
-    /// 本次实际从文件读出的字节数。
+    /// 本次实际从文件读出的字节数，含扩窗及补查首行。
     pub bytes_read: u64,
-    /// 解析不了的行（不是 JSON、需要的字段缺失或类型不对）。
+    /// 不能当作无关记录的行：结构坏了，或类型不认识。
     pub bad_lines: u32,
     /// 超过单行上限而整行跳过的行。
     pub skipped_lines: u32,
     /// 读完后文件里还有没读的完整内容，应尽快再读。
     pub more: bool,
+}
+
+/// 一行为什么不能当作无关记录。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BadLine {
+    /// 外层、事件类型或轮号无法解析，这一行可能是轮边界。
+    PossibleBoundary,
+    /// 消费结构异常或类型未知仍可保留轮定位，使之后的合法消息能按原轮配对。
+    KeepTurn,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -167,7 +174,7 @@ fn is_collab_call(payload: &Value) -> bool {
             .is_some_and(|n| matches!(n, "followup_task" | "send_message"))
 }
 
-/// 只检查代理间消费的正文结构；其他输出的内部字段不参与覆盖判断。
+/// 只检查代理间消费的正文结构，其他输出的内部字段不影响配对。
 fn message_content_valid(payload: &Value) -> bool {
     payload
         .get("content")
@@ -214,6 +221,16 @@ fn irrelevant_event(kind: &str) -> bool {
             | "web_search_end"
             | "view_image_tool_call"
             | "plan_update"
+            // 以下是上游会写进文件的其余事件（rollout/src/policy.rs 的 should_persist_event_msg）。
+            // 条目视图与用户输入事件对应的模型输入另有 response_item 行，消费只认那一行。
+            | "item_completed"
+            | "user_message"
+            | "sub_agent_activity"
+            | "thread_goal_updated"
+            | "thread_settings_applied"
+            | "entered_review_mode"
+            | "exited_review_mode"
+            | "image_generation_end"
     )
 }
 
@@ -222,23 +239,32 @@ fn parse_line(
     line: &[u8],
     turn: &mut Option<String>,
     lost: &mut bool,
-) -> Result<Option<RolloutEntry>, ()> {
+    boundary_only: bool,
+) -> Result<Option<RolloutEntry>, BadLine> {
+    use BadLine::{KeepTurn, PossibleBoundary};
     let line = line.strip_suffix(b"\r").unwrap_or(line);
     if line.iter().all(u8::is_ascii_whitespace) {
         return Ok(None);
     }
-    let value: Value = serde_json::from_slice(line).map_err(|_| ())?;
-    let kind = value.get("type").and_then(Value::as_str).ok_or(())?;
+    let value: Value = serde_json::from_slice(line).map_err(|_| PossibleBoundary)?;
+    let kind = value
+        .get("type")
+        .and_then(Value::as_str)
+        .ok_or(PossibleBoundary)?;
     match kind {
         "event_msg" => {
-            let payload = value.get("payload").ok_or(())?;
-            match payload.get("type").and_then(Value::as_str).ok_or(())? {
+            let payload = value.get("payload").ok_or(PossibleBoundary)?;
+            match payload
+                .get("type")
+                .and_then(Value::as_str)
+                .ok_or(PossibleBoundary)?
+            {
                 "task_started" | "turn_started" => {
                     let id = payload
                         .get("turn_id")
                         .and_then(Value::as_str)
                         .filter(|s| !s.is_empty())
-                        .ok_or(())?;
+                        .ok_or(PossibleBoundary)?;
                     *turn = Some(id.to_owned());
                     *lost = false;
                 }
@@ -247,12 +273,12 @@ fn parse_line(
                         .get("turn_id")
                         .and_then(Value::as_str)
                         .filter(|s| !s.is_empty())
-                        .ok_or(())?;
+                        .ok_or(PossibleBoundary)?;
                     *turn = None;
                     *lost = false;
                 }
                 known if irrelevant_event(known) => {}
-                _ => return Err(()),
+                _ => return Err(KeepTurn),
             }
             Ok(None)
         }
@@ -262,14 +288,18 @@ fn parse_line(
                 .and_then(|p| p.get("turn_id"))
                 .and_then(Value::as_str)
                 .filter(|s| !s.is_empty())
-                .ok_or(())?;
+                .ok_or(PossibleBoundary)?;
             *turn = Some(id.to_owned());
             *lost = false;
             Ok(None)
         }
+        "response_item" if boundary_only => Ok(None),
         "response_item" => {
-            let payload = value.get("payload").ok_or(())?;
-            let kind = payload.get("type").and_then(Value::as_str).ok_or(())?;
+            let payload = value.get("payload").ok_or(KeepTurn)?;
+            let kind = payload
+                .get("type")
+                .and_then(Value::as_str)
+                .ok_or(KeepTurn)?;
             let message = match kind {
                 "agent_message" => {
                     for field in ["author", "recipient"] {
@@ -277,39 +307,32 @@ fn parse_line(
                             .get(field)
                             .and_then(Value::as_str)
                             .filter(|s| !s.is_empty())
-                            .ok_or(())?;
+                            .ok_or(KeepTurn)?;
                     }
                     if !message_content_valid(payload) {
-                        return Err(());
+                        return Err(KeepTurn);
                     }
                     true
                 }
+                // 与 raw 一致：只有模型输出（assistant）无关，其余角色（含不认识的）都是这一轮的输入。
                 "message" => match payload.get("role").and_then(Value::as_str) {
-                    Some("user" | "developer" | "system") => true,
                     Some("assistant") => return Ok(None),
-                    _ => return Err(()),
+                    _ => true,
                 },
                 "function_call" => {
                     if !is_collab_call(payload) {
                         return Ok(None);
                     }
-                    // 保留既有协作调用的配对输入，不验证其他工具的内部参数。
-                    for field in ["call_id", "arguments"] {
-                        payload.get(field).and_then(Value::as_str).ok_or(())?;
-                    }
+                    // 调用编号用于配对，缺少可比正文时由触发型调用的回退规则处理。
+                    payload
+                        .get("call_id")
+                        .and_then(Value::as_str)
+                        .ok_or(KeepTurn)?;
                     false
                 }
-                "configuration_update" => {
-                    // 本轮明确要求修复的 P3：这是配置记录唯一保留的值校验。
-                    payload
-                        .get("reasoning")
-                        .and_then(|v| v.get("effort"))
-                        .and_then(Value::as_str)
-                        .filter(|s| !s.is_empty())
-                        .ok_or(())?;
-                    return Ok(None);
-                }
-                "reasoning"
+                // 配置内容不改变会话文件的轮定位。
+                "configuration_update"
+                | "reasoning"
                 | "function_call_output"
                 | "custom_tool_call_output"
                 | "custom_tool_call"
@@ -323,13 +346,13 @@ fn parse_line(
                 | "context_compaction"
                 | "compaction"
                 | "compaction_summary" => return Ok(None),
-                _ => return Err(()),
+                _ => return Err(KeepTurn),
             };
             let wall_ms = value
                 .get("timestamp")
                 .and_then(Value::as_str)
                 .and_then(parse_timestamp)
-                .ok_or(())?;
+                .ok_or(KeepTurn)?;
             let record = if message {
                 RolloutRecord::Message {
                     turn: turn.clone(),
@@ -351,8 +374,11 @@ fn parse_line(
         | "inter_agent_communication_metadata"
         | "world_state"
         | "security_risk_score"
-        | "token_usage_record" => Ok(None),
-        _ => Err(()),
+        | "token_usage_record"
+        // 不进模型输入的展示与留存记录（上游 history 的 RolloutItem）。
+        | "retained_context"
+        | "realtime_item" => Ok(None),
+        _ => Err(KeepTurn),
     }
 }
 
@@ -367,14 +393,15 @@ fn parse_lines(
         return 0;
     };
     for line in buf[..last].split(|&b| b == b'\n') {
-        match parse_line(line, turn, lost) {
+        match parse_line(line, turn, lost, false) {
             Ok(Some(entry)) => chunk.entries.push(entry),
             Ok(None) => {}
-            Err(()) => {
+            Err(BadLine::PossibleBoundary) => {
                 chunk.bad_lines = chunk.bad_lines.saturating_add(1);
                 *turn = None;
                 *lost = true;
             }
+            Err(BadLine::KeepTurn) => chunk.bad_lines = chunk.bad_lines.saturating_add(1),
         }
     }
     last + 1
@@ -387,7 +414,46 @@ fn read_range(file: &mut std::fs::File, start: u64, len: u64) -> Result<Vec<u8>,
     file.take(len)
         .read_to_end(&mut buf)
         .map_err(|_| RolloutError::Unreadable)?;
+    if buf.len() as u64 != len {
+        return Err(RolloutError::Shrunk);
+    }
     Ok(buf)
+}
+
+/// 有界补齐跨窗首行只为核实长度与边界。窗口外的记录不送入配对，也不改写游标。
+fn inspect_clipped_line(
+    file: &mut std::fs::File,
+    mut from: u64,
+    suffix: &[u8],
+    chunk: &mut RolloutChunk,
+) -> Result<(), RolloutError> {
+    let mut parts = vec![];
+    let mut size = suffix.len() as u64;
+    let mut step = 4096;
+    // 包含末尾换行的行长恰好等于上限时，前一字节仍可能是换行。
+    while from > 0 && size <= MAX_READ_BYTES {
+        let count = from.min(step).min(MAX_READ_BYTES + 1 - size);
+        from -= count;
+        let mut prefix = read_range(file, from, count)?;
+        chunk.bytes_read += count;
+        if let Some(pos) = prefix.iter().rposition(|&b| b == b'\n') {
+            parts.push(prefix.split_off(pos + 1));
+            break;
+        }
+        parts.push(prefix);
+        size += count;
+        step *= 2;
+    }
+    if size > MAX_READ_BYTES {
+        chunk.skipped_lines += 1;
+    } else {
+        let mut line: Vec<u8> = parts.into_iter().rev().flatten().collect();
+        line.extend_from_slice(&suffix[..suffix.len() - 1]);
+        if parse_line(&line, &mut None, &mut true, true).is_err() {
+            chunk.bad_lines += 1;
+        }
+    }
+    Ok(())
 }
 
 /// 首次读取：窗口里没有轮次标记、或第一条消息之前没有轮次标记，而窗口又没到文件头时，加倍向前多读，
@@ -425,14 +491,19 @@ fn read_tail(file: &mut std::fs::File, len: u64) -> Result<RolloutChunk, Rollout
             continue;
         }
         let offset = from + skip as u64 + consumed as u64;
-        // 末尾不完整的半行留到下次读。
+        // 达到窗口上限且没有换行，后续从文件末尾继续跳到该行结束。
+        let skipping = start > 0 && skip == buf.len() && !buf.ends_with(b"\n");
+        if start > 0 && skip > 1 && !skipping {
+            inspect_clipped_line(file, from, &buf[..skip], &mut chunk)?;
+        }
+        // 末尾不完整的普通半行留到下次读。
         chunk.cursor = RolloutCursor {
             offset,
             turn,
-            skipping: false,
+            skipping,
             lost,
         };
-        chunk.bytes_read = bytes_read;
+        chunk.bytes_read += bytes_read;
         return Ok(chunk);
     }
 }

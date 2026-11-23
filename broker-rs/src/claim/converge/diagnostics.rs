@@ -277,6 +277,7 @@ impl Machine {
                     V2FallbackReason::RolloutSenderUnknown => "rolloutSenderUnknown",
                     V2FallbackReason::RolloutTurnUnknown => "rolloutTurnUnknown",
                     V2FallbackReason::RawUnknown => "rawUnknown",
+                    V2FallbackReason::ReceiverPathTooLong => "receiverPathTooLong",
                 });
             let receiver_ids: Vec<_> = if let Some(op) = op { op.receivers.iter().collect() } else {
                 ledger.placeholder_operations.iter().filter(|(_, reasons)| reasons.contains(*key)).map(|(thread, _)| thread).collect()
@@ -481,7 +482,6 @@ mod tests {
                 v2_source: crate::relations::V2EvidenceSource::None,
                 v2_fallback: Some(V2FallbackReason::ParentWithoutRaw),
                 rollout_arrival: None,
-                proof_expired: false,
                 lenient_floor: None,
                 first_seen_ms: 0,
                 expires_at_ms: 1,

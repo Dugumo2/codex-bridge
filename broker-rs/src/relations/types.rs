@@ -119,6 +119,8 @@ pub enum V2FallbackReason {
     RolloutTurnUnknown,
     /// raw 线程登记表已满，线程是否送过 raw 未知：容量不足不能当成「没有 raw」去读会话文件。
     RawUnknown,
+    /// 接收方代理路径超过登记上限，登记不进接收方路径表，定为严格永远配不出候选；按宽松结算。
+    ReceiverPathTooLong,
 }
 
 /// 跟进配对证据的来源，只供诊断。
@@ -187,7 +189,7 @@ pub struct EvidenceOperation {
     /// 在 Interacted 首次到达时固定；缺 raw 的旧线程可等会话文件定案（见 `rollout_pairing`），
     /// 定案后不因迟到的 raw 或文件行改写模式。
     pub v2_strict: bool,
-    /// 由 raw 认出是 `send_message`：上游只入队不开新轮，可能永远等不到承载轮，不授予管理权也不进待定账本。
+    /// 实时或文件调用已确认是留言，只入队，不授予管理权也不进待定账本。
     pub v2_queue_only: bool,
     /// 严格配对的证据来源；与 `v2_strict` 同时固定，只供诊断。
     pub v2_source: V2EvidenceSource,
@@ -196,9 +198,6 @@ pub struct EvidenceOperation {
     /// 按会话文件定为严格时，接收方和它在 Interacted 到达时已观察到的轮次。
     /// 之后文件丢失、降为宽松时，据此还原旧版当时会配的那一轮（`rollout_fallback_baseline`）。
     pub rollout_arrival: Option<(String, Vec<String>)>,
-    /// 等证据等到期限才转未证明：归属没证明出来，不等于确定不归本运行（日志要留缺口）。
-    /// 只记事实的条目（如 completed）、定案不是自己的，也是未证明，但不算这种。
-    pub proof_expired: bool,
     /// 宽松配对只接受这个观察序号之后真实开始的轮（`live_turn_starts`）。当时会配哪一轮还原不了时设置：
     /// 之后读到的历史轮不是新轮，不能凭「不在基线里」获得资格。
     pub lenient_floor: Option<u64>,

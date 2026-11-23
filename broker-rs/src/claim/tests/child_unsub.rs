@@ -1828,3 +1828,68 @@ fn 延后退订的旧代号不能退掉已结束的新认领订阅() {
         "迟到旧计时器不能重新登记延后项"
     );
 }
+
+#[test]
+fn gap_wu_卸载探针必须对应原线程才解除订阅责任() {
+    for id in [C, "其他线程"] {
+        let (mut m, _) = released();
+        let actions = start_again(&mut m, "第二运行", 2);
+        let read = rpc(&actions, "thread/read", C);
+        assert!(m.relations.aux.released.contains_key(C));
+        let actions = reply(
+            &mut m,
+            &read,
+            Ok(json!({"thread":{"id":id,"status":{"type":"notLoaded"}}})),
+        );
+        assert_eq!(m.relations.aux.released.contains_key(C), id != C);
+        assert_eq!(has_rpc(&actions, "thread/resume", C), id != C);
+    }
+}
+
+#[test]
+fn gap_wu_卸载探针发出后的在线活动作废旧卸载() {
+    for event in ["无活动", "提前开始", "线程开始", "轮开始", "命令开始"] {
+        let (mut m, mut mock) = released();
+        if event == "提前开始" {
+            // 线程首次 thread/started 发生在探针发出之前，不能误伤后来的卸载判定。
+            apply(&mut m, mock.thread_started(C));
+        }
+        let actions = start_again(&mut m, "第二运行", 2);
+        let read = rpc(&actions, "thread/read", C);
+        assert!(m.relations.aux.released.contains_key(C));
+        // 探针发出后同线程的在线活动：这条随后到达的 notLoaded 是旧的，作废。
+        match event {
+            "线程开始" => {
+                apply(&mut m, mock.thread_started(C));
+            }
+            "轮开始" => {
+                apply(&mut m, mock.turn_started(C, CT));
+            }
+            "命令开始" => {
+                apply(
+                    &mut m,
+                    notify(
+                        "item/started",
+                        json!({"threadId":C,"turnId":CT,"item":{"type":"commandExecution","id":"条目","command":"echo"}}),
+                    ),
+                );
+            }
+            _ => {}
+        }
+        let actions = reply(
+            &mut m,
+            &read,
+            Ok(json!({"thread":{"id":C,"status":{"type":"notLoaded"}}})),
+        );
+        match event {
+            "线程开始" | "轮开始" | "命令开始" => {
+                // 旧回包作废：不解除订阅责任，发新探针重新核实。
+                assert!(m.relations.aux.released.contains_key(C), "{event}");
+                assert!(has_rpc(&actions, "thread/read", C), "{event}");
+            }
+            _ => {
+                assert!(!m.relations.aux.released.contains_key(C), "{event}");
+            }
+        }
+    }
+}

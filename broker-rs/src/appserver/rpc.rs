@@ -1564,13 +1564,21 @@ mod tests {
         }
         m.feed(json!({"id":1,"result":42}));
         assert_eq!(request.await.unwrap(), Ok(json!(42)));
-        for _ in 0..7 {
-            assert!(matches!(
-                m.events.recv().await,
-                Some(AppEvent::ObservationGap { .. })
-            ));
+        // 无关回包不产生消费缺口；以同一队列的屏障收口，数量不符时直接失败。
+        m.feed(json!({"method":"barrier"}));
+        let mut gaps = 0;
+        loop {
+            match m.events.recv().await.unwrap() {
+                AppEvent::ObservationGap { .. } => gaps += 1,
+                AppEvent::Responsive => {}
+                AppEvent::Notification { method, params } if method == "barrier" => {
+                    assert!(params.is_none());
+                    break;
+                }
+                other => panic!("屏障前出现意外事件：{other:?}"),
+            }
         }
-        m.barrier().await;
+        assert_eq!(gaps, 5, "只有无法分类为无关回包的坏消息才产生消费缺口");
         m.client.close().await;
     }
 

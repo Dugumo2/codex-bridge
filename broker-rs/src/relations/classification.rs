@@ -40,6 +40,35 @@ impl Machine {
             .candidate_versions
             .insert(thread.into(), version);
     }
+
+    /// 表有界；先淘汰最老的条目（与候选版本同一淘汰规则）。只借序号表，可与回查进度借用并存。
+    pub(crate) fn online_activity_slot<'a>(
+        map: &'a mut BTreeMap<String, u64>,
+        thread: &str,
+    ) -> &'a mut u64 {
+        if !map.contains_key(thread) && map.len() >= MAX_OBSERVED_THREADS {
+            if let Some(first) = map.keys().next().cloned() {
+                map.remove(&first);
+            }
+        }
+        map.entry(thread.into()).or_insert(0)
+    }
+
+    /// 在线活动序号与 `stop/unloaded.rs` 的卸载口径一致：
+    /// thread/started、turn/started、commandExecution 的 item/started 各加一。
+    pub(crate) fn online_activity_noted(&mut self, thread: &str) {
+        *Self::online_activity_slot(&mut self.relations.aux.online_activity, thread) += 1;
+    }
+
+    /// 发出回查时记下当前序号；条目缺失则登记为零。
+    pub(crate) fn online_activity_stamp(&mut self, thread: &str) -> u64 {
+        *Self::online_activity_slot(&mut self.relations.aux.online_activity, thread)
+    }
+
+    /// 发出回查之后该线程是否出现过在线活动；序号条目被淘汰按「核对不上」算（回包作废）。
+    pub(crate) fn online_activity_since(&self, thread: &str, stamp: u64) -> bool {
+        self.relations.aux.online_activity.get(thread) != Some(&stamp)
+    }
     /// 通知与请求会改变候选事实；刷新已知血缘和已有分类，不授予管理权。
     pub(crate) fn refresh_thread_classifications(
         &mut self,
@@ -299,7 +328,7 @@ impl Machine {
                 // Pending 是可被后续核实消除的分类诊断，不能持久化为覆盖缺口。
                 self.runs.log_source(run, thread, None, "subagent", None, None, self.clock.now_ms,
                     "候选分类", &format!("runId={run} source={source} generation={gen} workEpoch={epoch} classification={membership:?}"),
-                    false, false, None, actions);
+                    false, false, None, None, actions);
             }
         }
         membership

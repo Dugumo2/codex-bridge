@@ -12,6 +12,9 @@ const R: &str = "run-convergence";
 
 mod causal_pairing;
 mod lineage;
+mod pe_agent_path;
+mod pe_files;
+mod pe_floor_lost;
 mod placeholder;
 mod rollout_pairing;
 mod unbound_turn;
@@ -45,6 +48,12 @@ fn setup_pending() -> (Machine, SubagentMock, crate::claim::RequestContext) {
     setup_pending_mode(false)
 }
 fn setup_pending_mode(shared: bool) -> (Machine, SubagentMock, crate::claim::RequestContext) {
+    setup_pending_with_actions(shared, &mut vec![])
+}
+fn setup_pending_with_actions(
+    shared: bool,
+    all: &mut Vec<Action>,
+) -> (Machine, SubagentMock, crate::claim::RequestContext) {
     let mut m = Machine {
         shared,
         ..Machine::default()
@@ -53,8 +62,8 @@ fn setup_pending_mode(shared: bool) -> (Machine, SubagentMock, crate::claim::Req
     m.clock.now_ms = 100_000;
     // 与生产 Core 相同：broker 启动即打开门禁，运行按需启用（不再绕过启用前的初始化路径）。
     assert!(m.enable_convergence(ready()));
-    apply(&mut m, Event::Connected { conn: 1 });
-    apply(&mut m, Event::Initialized { conn: 1, cxb: true });
+    all.extend(apply(&mut m, Event::Connected { conn: 1 }));
+    all.extend(apply(&mut m, Event::Initialized { conn: 1, cxb: true }));
     m.record(P).subscribed = true;
     let out = apply(
         &mut m,
@@ -68,6 +77,7 @@ fn setup_pending_mode(shared: bool) -> (Machine, SubagentMock, crate::claim::Req
             run_id: Some(R.into()),
         },
     );
+    all.extend(out.iter().cloned());
     let context = out
         .into_iter()
         .find_map(|a| match a {
@@ -85,19 +95,22 @@ fn setup_pending_mode(shared: bool) -> (Machine, SubagentMock, crate::claim::Req
     (m, mock, context)
 }
 fn setup() -> (Machine, SubagentMock) {
-    let (mut m, mock, context) = setup_pending();
-    apply(
+    setup_with_actions(&mut vec![])
+}
+fn setup_with_actions(all: &mut Vec<Action>) -> (Machine, SubagentMock) {
+    let (mut m, mock, context) = setup_pending_with_actions(false, all);
+    all.extend(apply(
         &mut m,
         Event::Reply {
             context,
             result: Ok(json!({"turn":{"id":T}})),
         },
-    );
-    notify(
+    ));
+    all.extend(notify(
         &mut m,
         "turn/started",
         json!({"threadId":P,"turn":{"id":T,"status":"inProgress","items":[]}}),
-    );
+    ));
     (m, mock)
 }
 /// 已纳管一个先完成的子代理：只有确有子代理的运行才进入收敛（用户 2026-10-11 定）。
@@ -748,24 +761,27 @@ fn batch(m: &Machine) -> ReconcileBatch {
     }
 }
 fn confirm_parent(m: &mut Machine) -> ConvergeToken {
+    confirm_parent_with_actions(m, &mut vec![])
+}
+fn confirm_parent_with_actions(m: &mut Machine, actions: &mut Vec<Action>) -> ConvergeToken {
     let mut op = operation(m, ReconcileSubmission::ConfirmedOwnTurn);
     let token = op.token.clone();
     m.convergences.progress.get_mut(R).unwrap().reading = None;
     m.remember_owned_turn(P, "汇总轮");
     op.outcome_unknown = false;
     m.convergence_operation_changed(op.clone());
-    assert!(m.convergence_delivered(&token, op.op_id, "汇总轮", op.work_epoch, &mut vec![]));
+    assert!(m.convergence_delivered(&token, op.op_id, "汇总轮", op.work_epoch, actions));
     m.convergence_event(
         P,
         ConvergeEvent::ParentTurn {
             turn: "汇总轮",
             started: true,
         },
-        &mut vec![],
+        actions,
     );
     // B 的确定性桩：确认后在原账本推进当前父轮；不创建第二个 RunRecord。
     m.runs.runs.get_mut(R).unwrap().current_turn_id = Some("汇总轮".into());
-    m.run_turn_started(R, P, "汇总轮", &mut vec![]);
+    m.run_turn_started(R, P, "汇总轮", actions);
     token
 }
 #[test]

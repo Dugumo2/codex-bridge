@@ -10,7 +10,6 @@ pub mod types;
 
 mod classification;
 pub mod convergence;
-pub(crate) mod coverage_observation;
 pub(crate) use classification::{CandidateClassification, CandidateObservation, Membership};
 mod discovery;
 mod facts;
@@ -101,6 +100,8 @@ pub enum ParentWait {
 /// 一个线程的回查状态：同一线程只有一个在途 thread/read。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Lookup {
+    /// 回查发出时的 (连接代际, 观察版本, 在线活动序号)，只用于判定回包是否仍然适用。
+    pub read_stamp: (u64, u64, u64),
     pub op_id: u64,
     pub generation: u64,
     pub attempt: u32,
@@ -140,6 +141,9 @@ pub struct RelationsAux {
     pub(crate) classifications: BTreeMap<(String, String), CandidateClassification>,
     pub(crate) candidate_observations: BTreeMap<String, CandidateObservation>,
     pub(crate) candidate_versions: BTreeMap<String, u64>,
+    /// 每线程的在线活动序号（thread/started、turn/started、命令开始各加一），
+    /// 回查发出时记下，回包核对；条目被淘汰按「核对不上」保守拒绝卸载结论。
+    pub(crate) online_activity: BTreeMap<String, u64>,
     pub next_id: u64,
     /// 关系版本：任一血缘边增删改时加一，发现据此判断期间是否变化。
     pub version: u64,
@@ -147,13 +151,11 @@ pub struct RelationsAux {
     pub observed_order: VecDeque<String>,
     /// 原始工具调用先于执行结果；只存身份、顺序和期限，不保存参数正文。
     pub followup_starts: BTreeMap<EvidenceKey, v2_pairing::FollowupStart>,
+    /// 开始表满时只暂存实时留言的身份，不保存正文或授予接收方权限。
+    pub raw_queue_receipts: BTreeMap<EvidenceKey, (u64, u64)>,
+    /// 两张表同时满且实际未能登记留言身份时，记下其连接代际与证据截止时刻。
+    pub raw_queue_receipts_full: Option<(u64, u64)>,
     pub observation_seq: u64,
-    /// 覆盖入口顺序与不可恢复的连续观察凭据，不随配对清理或连接换代删除。
-    pub(crate) coverage_seq: u64,
-    pub(crate) coverage_epoch: Option<u64>,
-    pub(crate) raw_globally_blocked: bool,
-    pub(crate) raw_observations: BTreeMap<String, coverage_observation::RawObservation>,
-    pub(crate) coverage_starts: BTreeMap<(String, String), coverage_observation::RawStart>,
     /// 仅真实 turn/started 登记；发现或迟到 completed 不能伪造轮次开始。
     pub live_turn_starts: BTreeMap<(String, String), (u64, u64)>,
     pub v2_receiver_paths: BTreeMap<EvidenceKey, String>,
@@ -738,6 +740,14 @@ impl Machine {
                 consider(at);
             }
         }
+        // 身份失记跟进的结算期限也占一个扫描点，到期不靠别的事件。
+        for ledger in self.convergences.ledgers.values() {
+            for (key, at) in &ledger.unproven_deadlines {
+                if ledger.pending.contains(key) {
+                    consider(*at);
+                }
+            }
+        }
         let Some(at) = next else {
             if self.relations.aux.sweep.take().is_some() {
                 actions.push(Action::Unschedule {
@@ -762,9 +772,25 @@ impl Machine {
     }
 
     /// 到期处理：证据过期转 unbound、回查到期按未知不答、重试到点的回查重新发出。
+    /// 身份失记的跟进到期结算：驱动该运行重新同步，保证不靠别的事件也能按时结算。
     fn sweep(&mut self, actions: &mut Vec<Action>) {
         self.facts_expire(actions);
         self.lookup_expire(actions);
         self.guardian_expire();
+        let due: Vec<String> = self
+            .convergences
+            .ledgers
+            .iter()
+            .filter(|(_, ledger)| {
+                ledger
+                    .unproven_deadlines
+                    .values()
+                    .any(|at| *at <= self.clock.mono_ms)
+            })
+            .map(|(run, _)| run.clone())
+            .collect();
+        for run in due {
+            self.convergence_drive(&run, actions);
+        }
     }
 }

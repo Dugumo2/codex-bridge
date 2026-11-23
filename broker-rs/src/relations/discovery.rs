@@ -41,6 +41,8 @@ pub struct DiscoveryWork {
     pub loaded: BTreeSet<String>,
     pub reads_queue: VecDeque<String>,
     pub reads_in_flight: BTreeSet<String>,
+    /// 元数据请求发出时的连接代际、候选版本与在线活动序号，只用于判定卸载观察是否仍然适用。
+    pub read_stamps: BTreeMap<String, (u64, u64, u64)>,
     pub reads_total: usize,
     pub read_edges: BTreeMap<String, RelationEdge>,
     pub turn_reads: BTreeMap<String, ChildTurnRead>,
@@ -191,17 +193,22 @@ impl Machine {
         let Some(generation) = self.relations.discoveries.get(&op_id).map(|o| o.generation) else {
             return;
         };
-        let work = self
-            .relations
-            .aux
-            .work
-            .get_mut(&op_id)
-            .expect("发现进度存在");
-        while work.reads_in_flight.len() < DISCOVERY_READS {
-            let Some(thread) = work.reads_queue.pop_front() else {
+        while self.relations.aux.work[&op_id].reads_in_flight.len() < DISCOVERY_READS {
+            let Some(thread) = self
+                .relations
+                .aux
+                .work
+                .get_mut(&op_id)
+                .unwrap()
+                .reads_queue
+                .pop_front()
+            else {
                 break;
             };
+            let stamp = self.metadata_read_stamp(&thread);
+            let work = self.relations.aux.work.get_mut(&op_id).unwrap();
             work.reads_in_flight.insert(thread.clone());
+            work.read_stamps.insert(thread.clone(), stamp);
             actions.push(Action::Request(RequestContext {
                 resume_retried: false,
                 stream_id: None,
@@ -331,6 +338,13 @@ impl Machine {
             }
             "thread/read" => {
                 let thread = params["threadId"].as_str().unwrap_or_default().to_owned();
+                if !self.relations.aux.work[&op_id]
+                    .reads_in_flight
+                    .contains(&thread)
+                {
+                    return;
+                }
+                self.discovery_observe_metadata(op_id, &thread, &result);
                 let work = self
                     .relations
                     .aux
@@ -915,6 +929,21 @@ impl Machine {
             }
             let mut params = json!({"threadId": thread});
             if method == "thread/read" {
+                let activity =
+                    *Self::online_activity_slot(&mut self.relations.aux.online_activity, &thread);
+                work.read_stamps.insert(
+                    thread.clone(),
+                    (
+                        self.relations.conn_epoch,
+                        self.relations
+                            .aux
+                            .candidate_versions
+                            .get(&thread)
+                            .copied()
+                            .unwrap_or(0),
+                        activity,
+                    ),
+                );
                 // 根只核实输入能力；子代理的轮次随后分页读，这里都不带历史。
                 params["includeTurns"] = json!(false);
             }
@@ -1000,6 +1029,9 @@ impl Machine {
                     .push("goalChanged".into());
                 return;
             }
+            if method == "thread/read" {
+                self.discovery_observe_metadata(op_id, thread, &result);
+            }
             if method == "thread/goal/get" {
                 if value.get("goal").is_some_and(Value::is_null)
                     || value
@@ -1072,6 +1104,52 @@ impl Machine {
             self.refresh_member(&run, thread, MemberChange::Activity, actions);
         }
         self.convergence_sync_facts(&run);
+    }
+
+    pub(super) fn metadata_read_stamp(&mut self, thread: &str) -> (u64, u64, u64) {
+        // 版本淘汰后不再认旧回包，不能将两次「未登记」视为同一次观察。
+        if !self.relations.aux.candidate_versions.contains_key(thread) {
+            self.candidate_changed(thread);
+        }
+        (
+            self.relations.conn_epoch,
+            self.relations.aux.candidate_versions[thread],
+            self.online_activity_stamp(thread),
+        )
+    }
+
+    fn discovery_observe_metadata(
+        &mut self,
+        op_id: u64,
+        thread: &str,
+        result: &Result<Value, Value>,
+    ) {
+        let stamp = self
+            .relations
+            .aux
+            .work
+            .get_mut(&op_id)
+            .and_then(|work| work.read_stamps.remove(thread));
+        if let (Some(stamp), Ok(value)) = (stamp, result) {
+            self.observe_metadata_unload(thread, &value["thread"], stamp);
+        }
+    }
+
+    pub(super) fn observe_metadata_unload(
+        &mut self,
+        thread: &str,
+        info: &Value,
+        stamp: (u64, u64, u64),
+    ) {
+        let version = self.relations.aux.candidate_versions.get(thread).copied();
+        if stamp.0 == self.relations.conn_epoch
+            && version == Some(stamp.1)
+            && !self.online_activity_since(thread, stamp.2)
+            && info["id"].as_str() == Some(thread)
+            && info["status"]["type"] == "notLoaded"
+        {
+            self.invalidate_rollout_reads(Some(thread));
+        }
     }
 
     /// 一页只要轮次的编号和状态。保持正序，和轮次发生的先后一致。
@@ -1160,7 +1238,7 @@ impl Machine {
     }
 
     /// 线程状态和全部轮次都到齐后的判定。返回这个子代理是否核实通过。
-    fn convergence_apply_child_turns(
+    pub(super) fn convergence_apply_child_turns(
         &mut self,
         run: &str,
         thread: &str,

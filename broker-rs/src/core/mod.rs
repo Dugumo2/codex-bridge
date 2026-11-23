@@ -80,8 +80,6 @@ pub enum CoreMsg {
         id: u64,
         thread: String,
         conn_epoch: u64,
-        observation_gen: u64,
-        issued_seq: u64,
         result: Result<crate::rollout::RolloutChunk, crate::rollout::RolloutError>,
     },
 }
@@ -315,16 +313,12 @@ impl Core {
                 id,
                 thread,
                 conn_epoch,
-                observation_gen,
-                issued_seq,
                 result,
             } => {
                 self.dispatch(Event::RolloutRead {
                     id,
                     thread,
                     conn_epoch,
-                    observation_gen,
-                    issued_seq,
                     result,
                 });
             }
@@ -673,11 +667,8 @@ impl Core {
 
     fn on_app_event(&mut self, ev: AppEvent) {
         match ev {
-            AppEvent::ObservationGap { reason } => {
-                self.dispatch(Event::ObservationGap {
-                    thread: None,
-                    reason,
-                });
+            AppEvent::ObservationGap { .. } => {
+                self.dispatch(Event::ObservationGap { thread: None });
             }
             AppEvent::Responsive => {
                 self.touch();
@@ -724,11 +715,8 @@ impl Core {
                 self.dispatch(Event::AppReplyWritten { op, outcome })
             }
             AppEvent::Closed { reason } => {
-                // 先终止连续观察，再处理关闭结算；不能让排队中的完成证明越过断开。
-                self.dispatch(Event::ObservationGap {
-                    thread: None,
-                    reason: reason.clone(),
-                });
+                // 断开前派出的读取不能在关闭期间继续配对。
+                self.dispatch(Event::ObservationGap { thread: None });
                 self.app_disconnected = true;
                 if self.phase == Phase::Running {
                     tracing::error!(%reason, "app-server 意外退出，broker 关闭");

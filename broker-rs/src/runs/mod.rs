@@ -1216,6 +1216,7 @@ impl Machine {
     pub(crate) fn run_released(&mut self, run: &str, kind: ReleaseKind, actions: &mut Vec<Action>) {
         let sa1b_enabled = self.sa1b_active(run);
         self.stall_released(run, actions);
+        self.settle_ending_event_log(run, actions);
         self.on_run_finishing(run, kind, actions);
         self.finalize_parent_pointer(run);
         let convergence_terminal = self.run_convergence_terminal(
@@ -1455,7 +1456,7 @@ impl Machine {
                 schedule("", RunTimer::DailyCleanup, CLEANUP_INTERVAL_MS, actions);
             }
             RunTimer::DailyCleanup => {}
-            RunTimer::EventLogSweep { generation } => self.sweep_event_log(generation, actions),
+            RunTimer::EventLogSweep { generation } => self.sweep_event_log(generation),
         }
     }
 
@@ -1731,6 +1732,7 @@ impl Machine {
             return;
         }
         let run = commit.snapshot.identity.run_id.clone();
+        self.settle_ending_event_log(&run, actions);
         self.finalize_parent_pointer(&run);
         let convergence_terminal = self.run_convergence_terminal(
             &run,

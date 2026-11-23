@@ -6,8 +6,21 @@ import { stopStageDescription } from "./stop-diagnostics";
 
 const labels: Record<UpstreamErrorCategory, string> = {
   authentication: "上游认证失败", paymentRequired: "上游要求付费", permissionDenied: "上游拒绝访问",
-  usageLimit: "上游用量已达上限", rateLimit: "上游限流", server: "上游服务器错误", network: "上游连接失败", unknown: "上游报错",
+  usageLimit: "上游用量已达上限", rateLimit: "上游限流", server: "上游服务器错误", network: "上游连接失败",
+  subscriptionSharingUnsupported: "订阅共享登录不支持子代理等能力", subscriptionSharingUsageLimit: "订阅共享额度已用完", unknown: "上游报错",
 };
+
+/** 两类订阅共享报错的改法提示；其余类别返回 null。 */
+function remedy(error: UpstreamError): string | null {
+  switch (error.category) {
+    case "subscriptionSharingUnsupported":
+      return "[cxb] 改法：改用 Codex 自己的登录或 API key；已经出过这个错的线程请新开线程。";
+    case "subscriptionSharingUsageLimit":
+      return "[cxb] 改法：等订阅共享额度重置，或改用 Codex 自己的登录或 API key。";
+    default:
+      return null;
+  }
+}
 function object(value: unknown): Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
 }
@@ -34,8 +47,11 @@ function statusNote(error: Pick<UpstreamError, "httpStatusCode" | "codexErrorInf
   const variant = codexErrorVariant(error.codexErrorInfo);
   return variant ? `（${diagnosticLine(variant)}）` : "";
 }
+const subscriptionSharingCategories = new Set<UpstreamErrorCategory>(["subscriptionSharingUnsupported", "subscriptionSharingUsageLimit"]);
 export function upstreamLabel(error: UpstreamError): string {
-  return `${labels[error.category] ?? labels.unknown}${statusNote(error)}`;
+  // 订阅共享两类的 codexErrorInfo 恒为 "other"，无信息量；没有 HTTP 状态码时不带括注。
+  const note = error.httpStatusCode === null && subscriptionSharingCategories.has(error.category) ? "" : statusNote(error);
+  return `${labels[error.category] ?? labels.unknown}${note}`;
 }
 function reason(error: UpstreamError): string { return diagnosticLine(error.additionalDetails?.trim() ? error.additionalDetails : error.message); }
 export function upstreamNoticeLines(error: UpstreamError, ended = false): string[] {
@@ -43,15 +59,19 @@ export function upstreamNoticeLines(error: UpstreamError, ended = false): string
   const first = ended ? `[cxb] 最近上游报错：${label}，共观察到 ${error.count} 次（运行已结束）。`
     : error.willRetry === true ? `[cxb] ${label}，Codex 正在重试；已观察到 ${error.count} 次。`
       : error.willRetry === false ? `[cxb] ${label}，上游已报告终止错误，等待轮次结束确认。` : `[cxb] ${label}。`;
-  return [first, `[cxb] 原因：${reason(error)}`];
+  const fix = remedy(error);
+  return fix ? [first, `[cxb] 原因：${reason(error)}`, fix] : [first, `[cxb] 原因：${reason(error)}`];
 }
 export function upstreamShowLines(run: Pick<RunResult, "state" | "upstreamError">): string[] {
   const error = run.upstreamError;
   if (!error) return [];
   const status = run.state === "ended" || run.state === "lost" ? "运行已结束"
     : error.willRetry === true ? "仍在重试" : error.willRetry === false ? "已报告终止错误" : "重试状态未知";
-  return [`最近上游报错：${upstreamLabel(error)}；${error.count} 次；首次 ${new Date(error.firstSeenAt).toISOString()}，最近 ${new Date(error.lastSeenAt).toISOString()}；${status}`,
+  const fix = remedy(error);
+  const lines = [`最近上游报错：${upstreamLabel(error)}；${error.count} 次；首次 ${new Date(error.firstSeenAt).toISOString()}，最近 ${new Date(error.lastSeenAt).toISOString()}；${status}`,
     `原因：${reason(error)}`];
+  if (fix) lines.push(fix.replace(/^\[cxb\] /, ""));
+  return lines;
 }
 /** 与 broker 的分组键相同：只能移除整段 Reconnecting... n/m 提示。 */
 export function upstreamGroupKey(error: UpstreamError): string {
@@ -95,6 +115,15 @@ export function observeUpstreamErrors(rpc: BrokerRpc, runId: () => string | null
   const printed = new Map<string, { key: string; retry: boolean | null; at: number; ended: boolean; revision?: number }>();
   /** 每个运行已在「原因」行输出过的文本，失败摘要据此避免把同一原因再说一遍。 */
   const reasons = new Map<string, Set<string>>();
+  /** 每个运行已在「改法」行输出过的类别，同一次运行同一类只说一遍。 */
+  const remedies = new Map<string, Set<string>>();
+  const remedied = (runId: string, error: UpstreamError) => {
+    let seen = remedies.get(runId);
+    if (!seen) remedies.set(runId, seen = new Set());
+    const fresh = !seen.has(error.category);
+    seen.add(error.category);
+    return fresh;
+  };
   const failures = new Set<string>();
   const stages = new Set<string>();
   const display = (view: View, forceEnded = false) => {
@@ -114,7 +143,9 @@ export function observeUpstreamErrors(rpc: BrokerRpc, runId: () => string | null
     let shown = reasons.get(view.runId);
     if (!shown) reasons.set(view.runId, shown = new Set());
     shown.add(reason(error));
-    for (const line of lines) notice(line);
+    // 同一次运行同一类的「改法」只说一遍。
+    const cut = remedy(error) ? (remedied(view.runId, error) ? lines.length : 2) : lines.length;
+    for (const line of lines.slice(0, cut)) notice(line);
   };
   const diagnostics = (view: View) => {
     if (!view.runId) return;
@@ -132,7 +163,7 @@ export function observeUpstreamErrors(rpc: BrokerRpc, runId: () => string | null
     }
     if (view.interruptReason === "upstreamAccessError") {
       const access = [view.upstreamError, ...(view.childUpstreamErrors ?? []).map((child) => child.upstreamError)]
-        .find((error) => error && ["authentication", "paymentRequired", "permissionDenied"].includes(error.category));
+        .find((error) => error && ["authentication", "paymentRequired", "permissionDenied", "subscriptionSharingUsageLimit"].includes(error.category));
       if (access) once("access", `[cxb] 已按 --upstream-error-policy stop-access 停止本次运行：${upstreamLabel(access)}。`);
     }
     if (isUnconfirmedRun(view)) {
@@ -150,9 +181,10 @@ export function observeUpstreamErrors(rpc: BrokerRpc, runId: () => string | null
       if (previous?.revision !== undefined && previous.revision === view.diagnosticRevision) continue;
       if (previous?.key === key && (ended || previous.retry === error.willRetry && now() - previous.at < 30_000)) continue;
       printed.set(printedId, { key, retry: error.willRetry, at: now(), ended, revision: view.diagnosticRevision });
-      const [first, cause] = upstreamNoticeLines(error, ended);
+      const [first, cause, ...rest] = upstreamNoticeLines(error, ended);
       notice(first!.replace("[cxb] ", `[cxb] 子代理 ${child.threadId.slice(0, 8)} `));
       notice(cause!);
+      if (rest.length && remedied(view.runId, error)) for (const extra of rest) notice(extra);
     }
   };
   const acceptKnown = (view: View) => {
@@ -200,6 +232,11 @@ export function observeUpstreamErrors(rpc: BrokerRpc, runId: () => string | null
         .some((text) => typeof text === "string" && text.trim() !== "" && said.has(diagnosticLine(text)));
       notice(repeated ? `[cxb] 失败原因：见上方上游报错${statusNote({ httpStatusCode: httpStatus(info), codexErrorInfo: info })}。`
         : `[cxb] 失败原因：${turnErrorLine(error)}`);
+      const latest = views.get(run.runId);
+      const error2 = latest?.upstreamError;
+      const fix = error2 ? remedy(error2) : null;
+      // 改法行只在上方提示还没说过时才补一遍；补时先补一行中文标签（晚接入时上方没有它）。
+      if (fix && error2 && remedied(run.runId, error2)) { notice(upstreamNoticeLines(error2, true)[0]!); notice(fix); }
     } else display(merge(run), true);
   };
   const off = rpc.on("broker/run/updated", (raw) => { if (raw && typeof raw === "object") accept(raw as View); });
@@ -221,5 +258,5 @@ export function observeUpstreamErrors(rpc: BrokerRpc, runId: () => string | null
   } };
   return { accept, refresh, apply, failure, rpc: watchedRpc,
     fields: () => { const view = views.get(runId() ?? "") ?? {}; return { ...upstreamFields(view as Partial<RunResult>), ...diagnosticFields(view as Partial<RunResult>) }; },
-    dispose: () => { active = false; off(); buffered.length = 0; views.clear(); printed.clear(); reasons.clear(); failures.clear(); stages.clear(); } };
+    dispose: () => { active = false; off(); buffered.length = 0; views.clear(); printed.clear(); reasons.clear(); remedies.clear(); failures.clear(); stages.clear(); } };
 }

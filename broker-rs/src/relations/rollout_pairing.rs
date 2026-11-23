@@ -16,6 +16,7 @@
 //! [`Event::RolloutRead`](crate::claim::Event::RolloutRead) 回来；路径用 thread/read 请求拿。
 //! 只在有操作等文件或等文件里的消费记录时才轮询，操作有结果、运行结束、停止、连接或授权换代后立即停止。
 //! 有 raw 的线程一次都不读。不存、不记任何正文，只用摘要与字段名。
+use super::facts::MAX_AGENT_PATH_BYTES;
 use super::v2_pairing::{parse_call, parse_delivery, EvidenceSource, ParsedCall, RawCapability};
 use super::*;
 use crate::rollout::{
@@ -34,12 +35,14 @@ pub const MAX_ROLLOUT_FILES: usize = 64;
 /// 文件读取或路径请求失败后，这么久内不重试；过后遇到新跟进重新取路径、重新读。
 pub const ROLLOUT_RETRY_MS: u64 = 30_000;
 /// 逻辑到期并不释放物理 IO 占位，只有真实结果能收尾。
-pub const COVERAGE_READ_MS: u64 = 30_000;
-pub const MAX_COVERAGE_READS: usize = 64;
+pub const ROLLOUT_READ_MS: u64 = 30_000;
+pub const MAX_ROLLOUT_READS: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReadTicketState {
     Active,
+    /// 已观察到断档，本步驱动时清理文件状态。
+    Interrupted,
     Retired,
 }
 
@@ -48,8 +51,6 @@ pub struct ReadTicket {
     pub id: u64,
     pub thread: String,
     pub conn_epoch: u64,
-    pub observation_gen: u64,
-    pub issued_seq: u64,
     pub deadline: u64,
     pub state: ReadTicketState,
 }
@@ -74,14 +75,22 @@ pub struct RolloutFile {
     /// 当前这段跟随里成功读过几次。
     pub reads: u32,
     pub next_at: u64,
+    /// 这段从末尾窗口起读以来，被下限挡掉的消息里最新一条的行时间；
+    /// 下限降到它之下时下一次派发从末尾窗口重读，补回被挡的消费记录。
+    pub floor_dropped: Option<u64>,
 }
 
 /// 等文件的操作：暂存的 Interacted 通知，定案后按原样重放。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RolloutWait {
+    /// 已有等待直接接收对应调用，不依赖为未来通知预留的调用缓存有空位。
+    pub call: Option<RolloutCall>,
     pub deadline_ms: u64,
     /// Interacted 到达时的墙钟毫秒，用来给末尾窗口里的旧消息定下限。
     pub wall_ms: u64,
+    /// 建等待那一刻父线程带着有效的失记标志；等到期仍没拿到调用时按它判未证明，
+    /// 不按到期那一刻再查标志（标志可能在等到期之前已失效）。
+    pub lost_at_arrival: bool,
     pub child: String,
     /// Interacted 到达时接收方已观察到的轮次：退回宽松时据此还原旧版当时会配的那一轮。
     pub child_turns: Vec<String>,
@@ -102,12 +111,20 @@ pub struct RolloutCall {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RolloutState {
     /// 与配对文件生命周期分离；跨连接代际保留直到 IO 实际返回。
-    pub coverage_reads: BTreeMap<u64, ReadTicket>,
+    pub rollout_reads: BTreeMap<u64, ReadTicket>,
     pub next_read_id: u64,
     pub files: BTreeMap<String, RolloutFile>,
+    /// 被淘汰的冷却文件保留的失败截止：线程 →（连接代际, 冷却截止的单调毫秒, 原因）。上限同 `files`。
+    pub evicted_cooldowns: BTreeMap<String, (u64, u64, V2FallbackReason)>,
     pub waits: BTreeMap<EvidenceKey, RolloutWait>,
     /// (父线程, call_id) → 调用。读到时对应的 Interacted 可能还没来。
     pub calls: BTreeMap<(String, String), RolloutCall>,
+    /// 缓存写满放不下、又没有同键等待认领的调用：父线程 → (连接代际, 读到时刻 + EVIDENCE_TTL_MS)。
+    /// 之后同父线程的等到期仍没拿到自己的调用时据它判未证明，不按宽松规则回退。
+    pub lost_calls: BTreeMap<String, (u64, u64)>,
+    /// 失记表写满时又丢下的调用：父线程不在表里就置这条全表标志 (连接代际, 读到时刻 + EVIDENCE_TTL_MS)，
+    /// 覆盖所有本代际没有逐线程记录的父线程；随清扫按期限清掉。
+    pub lost_overflow: Option<(u64, u64)>,
     /// 轮询计时：(到期单调毫秒, 代号)。
     pub timer: Option<(u64, u64)>,
     pub next_id: u64,
@@ -118,6 +135,8 @@ pub struct RolloutState {
 enum Decision {
     Strict(RolloutCall),
     Fallback(V2FallbackReason),
+    /// 调用明明读到过却被写满的缓存丢下：不是「缺调用」，操作置未证明。
+    Unproven,
 }
 
 impl RolloutState {
@@ -135,48 +154,58 @@ fn read_failure(error: RolloutError) -> V2FallbackReason {
 }
 
 impl Machine {
-    pub(crate) fn coverage_read_deadline(&self, thread: &str) -> Option<u64> {
-        self.relations
-            .aux
-            .rollout
-            .coverage_reads
-            .values()
-            .filter(|t| t.thread == thread && t.state == ReadTicketState::Active)
-            .map(|t| t.deadline)
-            .min()
-    }
-
     /// 先撤销，再退休；禁止换代、清文件或超时重新获得物理 IO 名额。
-    fn retire_coverage_reads(&mut self, all: bool) {
+    fn retire_rollout_reads(&mut self, all: bool) {
         let retired: Vec<(u64, String)> = self
             .relations
             .aux
             .rollout
-            .coverage_reads
+            .rollout_reads
             .values()
             .filter(|t| {
-                t.state == ReadTicketState::Active
-                    && (all
+                t.state != ReadTicketState::Retired
+                    && (t.state == ReadTicketState::Interrupted
+                        || all
                         || t.deadline <= self.clock.mono_ms
-                        || t.conn_epoch != self.relations.conn_epoch
-                        || t.observation_gen != self.coverage_read_observation_gen(&t.thread))
+                        || t.conn_epoch != self.relations.conn_epoch)
             })
             .map(|t| (t.id, t.thread.clone()))
             .collect();
+        if retired.is_empty() {
+            return;
+        }
+        let needed = self.rollout_needed();
         for (id, thread) in retired {
-            self.observation_gap(Some(&thread), "会话文件读取被保守放弃");
-            if let Some(ticket) = self.relations.aux.rollout.coverage_reads.get_mut(&id) {
+            if let Some(ticket) = self.relations.aux.rollout.rollout_reads.get_mut(&id) {
                 ticket.state = ReadTicketState::Retired;
             }
             if let Some(file) = self.relations.aux.rollout.files.get_mut(&thread) {
                 if file.reading == Some(id) {
                     file.reading = None;
                     file.cursor = None;
-                    file.path = RolloutPathState::Failed(V2FallbackReason::RolloutLost);
-                    file.next_at = self.clock.mono_ms.saturating_add(ROLLOUT_RETRY_MS);
+                    file.reads = 0;
+                    if needed.contains(&thread) {
+                        file.path = RolloutPathState::Failed(V2FallbackReason::RolloutLost);
+                        file.next_at = self.clock.mono_ms.saturating_add(ROLLOUT_RETRY_MS);
+                    }
                 }
             }
         }
+    }
+
+    /// 退订或传输断档前派发的读取不能参与后续配对。
+    pub(crate) fn invalidate_rollout_reads(&mut self, thread: Option<&str>) {
+        for ticket in self.relations.aux.rollout.rollout_reads.values_mut() {
+            if ticket.state == ReadTicketState::Active && thread.is_none_or(|t| t == ticket.thread)
+            {
+                ticket.state = ReadTicketState::Interrupted;
+            }
+        }
+        // 断档一并退休在途的路径请求（None 表示全部线程）：线程仍被需要时
+        // 本步驱动会按新代次重发，旧回包到达时因登记缺失或代次不符被拒。
+        self.relations.aux.rollout.files.retain(|t, f| {
+            !(thread.is_none_or(|x| x == t) && matches!(f.path, RolloutPathState::Requested(_)))
+        });
     }
 
     /// 只有确认本连接里没送过 raw 的线程才读会话文件；送过 raw 的、或登记满了能力未知的，一次都不读。
@@ -185,16 +214,25 @@ impl Machine {
     }
 
     fn rollout_file_failed(&self, thread: &str) -> Option<V2FallbackReason> {
-        self.relations
-            .aux
-            .rollout
+        let state = &self.relations.aux.rollout;
+        let from_file = state
             .files
             .get(thread)
             .filter(|f| f.epoch == self.relations.conn_epoch)
             .and_then(|f| match f.path {
                 RolloutPathState::Failed(reason) if self.clock.mono_ms < f.next_at => Some(reason),
                 _ => None,
-            })
+            });
+        // 文件表里没有本代际未到期的失败时，查淘汰时保留的冷却。
+        from_file.or_else(|| {
+            state
+                .evicted_cooldowns
+                .get(thread)
+                .filter(|(e, until, _)| {
+                    *e == self.relations.conn_epoch && self.clock.mono_ms < *until
+                })
+                .map(|(_, _, reason)| *reason)
+        })
     }
 
     /// Interacted 首次到达、父线程没送过 raw、也没有开始记录：能用会话文件时进入「等文件」。
@@ -224,21 +262,16 @@ impl Machine {
         else {
             return Ok(false);
         };
-        // 向上、平级、越级等注定被拒的接收方不需要证据，照原样处理。
-        if self.followup_rejection(key, child, &op.run_id).is_some() {
+        // 缓存已命中的留言先兑现身份：留言不纳管接收方，注定被拒的检查不适用于它。
+        // 缓存未命中的平级、向上等操作仍直接走原来的拒绝。
+        let cached = self.rollout_call(key).filter(|c| !c.trigger).cloned();
+        if cached.is_none() && self.followup_rejection(key, child, &op.run_id).is_some() {
             return Ok(false);
         }
-        if let Some(reason) = self.rollout_file_failed(&key.parent_thread_id) {
-            return Err(reason);
-        }
-        match self.raw_capability(child) {
-            RawCapability::Seen => {}
-            RawCapability::NotSeen => {
-                if let Some(reason) = self.rollout_file_failed(child) {
-                    return Err(reason);
-                }
+        if self.rollout_call(key).is_none() {
+            if let Some(reason) = self.rollout_file_failed(&key.parent_thread_id) {
+                return Err(reason);
             }
-            RawCapability::Unknown => return Err(V2FallbackReason::RawUnknown),
         }
         if self.relations.aux.rollout.waits.len() >= MAX_OPERATIONS {
             return Ok(false);
@@ -253,8 +286,10 @@ impl Machine {
             .map(|o| o.turn.clone())
             .collect();
         let wait = RolloutWait {
+            call: cached,
             deadline_ms: self.clock.mono_ms.saturating_add(ROLLOUT_WAIT_MS),
             wall_ms: self.clock.now_ms,
+            lost_at_arrival: self.rollout_lost_marked(&key.parent_thread_id),
             child: child.into(),
             child_turns,
             events: vec![(item.clone(), completed)],
@@ -269,7 +304,7 @@ impl Machine {
             .rollout
             .files
             .get_mut(&key.parent_thread_id)
-            .filter(|f| f.epoch == epoch)
+            .filter(|f| f.epoch == epoch && matches!(f.path, RolloutPathState::Ready(_)))
         {
             file.next_at = file.next_at.min(now);
         }
@@ -358,6 +393,29 @@ impl Machine {
         )
     }
 
+    pub(super) fn rollout_call(&self, key: &EvidenceKey) -> Option<&RolloutCall> {
+        self.relations
+            .aux
+            .rollout
+            .calls
+            .get(&(key.parent_thread_id.clone(), key.item_id.clone()))
+            .filter(|c| {
+                c.epoch == self.relations.conn_epoch
+                    && self.clock.mono_ms < c.at.saturating_add(EVIDENCE_TTL_MS)
+            })
+    }
+
+    /// 父线程此刻带着本代际未失效的失记标志（写满的缓存丢下过它的调用，
+    /// 逐线程记录或表满时的全表标志）。
+    fn rollout_lost_marked(&self, parent: &str) -> bool {
+        let rollout = &self.relations.aux.rollout;
+        let live = |(epoch, until): (u64, u64)| {
+            epoch == self.relations.conn_epoch && self.clock.mono_ms < until
+        };
+        rollout.lost_calls.get(parent).is_some_and(|f| live(*f))
+            || rollout.lost_overflow.is_some_and(live)
+    }
+
     fn rollout_decision(&self, key: &EvidenceKey, wait: &RolloutWait) -> Option<Decision> {
         let Some(op) = self.relations.operations.get(key) else {
             return Some(Decision::Fallback(V2FallbackReason::RolloutCancelled));
@@ -365,44 +423,49 @@ impl Machine {
         if !self.rollout_wait_live(op) {
             return Some(Decision::Fallback(V2FallbackReason::RolloutCancelled));
         }
-        // 等待期间父线程的能力变了：送来了 raw（这次调用的开始记录已经错过），或登记满了不再确定。
-        // 两种都不能再读它的文件，按 raw 下的同一结论定案。
+        // raw 能力未知时禁止新派读；此前已从本代际文件读出的调用仍可区分留言与跟进。
+        let call = wait.call.as_ref().or_else(|| self.rollout_call(key));
+        // 只入队的留言不依赖接收方文件：按父调用类型定为严格，子文件失败或冷却不降级。
+        if let Some(message) = call.filter(|c| !c.trigger) {
+            return Some(Decision::Strict(message.clone()));
+        }
         match self.raw_capability(&key.parent_thread_id) {
             RawCapability::NotSeen => {}
+            RawCapability::Unknown if call.is_some() => {}
             RawCapability::Seen => return Some(Decision::Fallback(V2FallbackReason::StartMissing)),
             RawCapability::Unknown => {
                 return Some(Decision::Fallback(V2FallbackReason::RawUnknown))
             }
         }
         let expired = self.clock.mono_ms >= wait.deadline_ms;
-        let call = self
-            .relations
-            .aux
-            .rollout
-            .calls
-            .get(&(key.parent_thread_id.clone(), key.item_id.clone()))
-            .filter(|c| c.epoch == self.relations.conn_epoch);
         if let Some(call) = call {
+            // 父侧缺可比正文时先问子侧：能力未知或已知失败的子侧给出自己的原因。
+            let raw = self.raw_capability(&wait.child);
+            let unavailable = match raw {
+                RawCapability::Unknown => Some(V2FallbackReason::RawUnknown),
+                RawCapability::NotSeen => self.rollout_file_failed(&wait.child),
+                RawCapability::Seen => None,
+            };
+            if let Some(reason) = unavailable {
+                return Some(Decision::Fallback(reason));
+            }
             // 没有可比的正文摘要：严格配对只会等到收敛期限，不如照原样宽松。
-            if call.trigger && call.message.is_none() {
+            if call.message.is_none() {
                 return Some(Decision::Fallback(V2FallbackReason::RolloutCallMissing));
             }
-            // 文件证据只按消费记录配对，消费记录按发起方的代理路径比对。路径可能稍后才从父线程的活动条目学到
-            // （父子事件由不同监听器送来，到达顺序会交错），窗口内继续等；到期仍未知才退回宽松，免得卡到期限。
-            if call.trigger && self.v2_sender_path(op).is_none() {
+            // E6：接收方路径超长登记不进 `v2_receiver_paths`，定为严格永远配不出候选；
+            // 直接按宽松结算，不等到期。留言在上面的提前返回里已定案，走不到这里。
+            if wait.events.iter().any(|(item, _)| {
+                item.get("agentPath")
+                    .and_then(Value::as_str)
+                    .is_some_and(|s| s.len() > MAX_AGENT_PATH_BYTES)
+            }) {
+                return Some(Decision::Fallback(V2FallbackReason::ReceiverPathTooLong));
+            }
+            // 只有接收侧还能提供消费证据时，等待迟到的发起方路径才有意义。
+            if self.v2_sender_path(op).is_none() {
                 return expired
                     .then_some(Decision::Fallback(V2FallbackReason::RolloutSenderUnknown));
-            }
-            match self.raw_capability(&wait.child) {
-                _ if !call.trigger => return Some(Decision::Strict(call.clone())),
-                RawCapability::Seen => return Some(Decision::Strict(call.clone())),
-                RawCapability::Unknown => {
-                    return Some(Decision::Fallback(V2FallbackReason::RawUnknown))
-                }
-                RawCapability::NotSeen => {}
-            }
-            if let Some(reason) = self.rollout_file_failed(&wait.child) {
-                return Some(Decision::Fallback(reason));
             }
             let ready = self
                 .relations
@@ -411,13 +474,20 @@ impl Machine {
                 .files
                 .get(&wait.child)
                 .is_some_and(|f| f.epoch == self.relations.conn_epoch && f.reads > 0);
-            if ready {
+            if raw == RawCapability::Seen || ready {
                 return Some(Decision::Strict(call.clone()));
             }
             return expired.then_some(Decision::Fallback(V2FallbackReason::RolloutUnreadable));
         }
         if let Some(reason) = self.rollout_file_failed(&key.parent_thread_id) {
             return Some(Decision::Fallback(reason));
+        }
+        // 这个父线程读到过调用但被写满的缓存丢下：等到期仍没拿到自己的调用时
+        // 不是「缺调用」，宽松回退会错绑接收方的轮次，置为未证明。
+        // 标志按等待建立那一刻登记，也查此刻的实时判断：标志可能在等到期之前失效，
+        // 也可能在建等待之后才出现（等待先建、父文件之后才因缓存写满丢下调用）。
+        if expired && (wait.lost_at_arrival || self.rollout_lost_marked(&key.parent_thread_id)) {
+            return Some(Decision::Unproven);
         }
         expired.then_some(Decision::Fallback(V2FallbackReason::RolloutCallMissing))
     }
@@ -431,6 +501,8 @@ impl Machine {
             return;
         };
         let decision = match decision {
+            // 父文件已确认的留言无需配对开始记录。
+            Decision::Strict(call) if !call.trigger => Decision::Strict(call),
             Decision::Strict(call) => {
                 let recorded = self.v2_record_start(
                     key.clone(),
@@ -464,6 +536,20 @@ impl Machine {
                 }
                 Decision::Fallback(reason) => {
                     op.v2_fallback = Some(*reason);
+                }
+                Decision::Unproven => {
+                    // 失记不是缺证据：仍记调用缺失的原因，结果置未证明，不宽松配对轮次。
+                    op.v2_fallback = Some(V2FallbackReason::RolloutCallMissing);
+                    op.outcome = EvidenceOutcome::Unproven;
+                    // 与登记时已未证明的失记跟进同口径：按证据期限移出 pending，不等收敛总期限。
+                    if !op.run_id.is_empty() {
+                        self.convergences
+                            .ledgers
+                            .entry(op.run_id.clone())
+                            .or_default()
+                            .unproven_deadlines
+                            .insert(key.clone(), op.expires_at_ms);
+                    }
                 }
             }
         }
@@ -577,7 +663,7 @@ impl Machine {
 
     /// 每步末尾：定案到期或有结果的等待、补发路径与读取、维护轮询计时。没有文件模式的操作时什么都不做。
     pub(crate) fn drive_rollout(&mut self, actions: &mut Vec<Action>) {
-        self.retire_coverage_reads(self.closing);
+        self.retire_rollout_reads(self.closing);
         if self.closing {
             self.rollout_stop(actions);
             return;
@@ -587,9 +673,9 @@ impl Machine {
             && state.files.is_empty()
             && state.timer.is_none()
             && !state
-                .coverage_reads
+                .rollout_reads
                 .values()
-                .any(|t| t.state == ReadTicketState::Active)
+                .any(|t| t.state != ReadTicketState::Retired)
         {
             return;
         }
@@ -600,6 +686,20 @@ impl Machine {
             .rollout
             .calls
             .retain(|_, c| c.epoch == epoch && now < c.at.saturating_add(EVIDENCE_TTL_MS));
+        self.relations
+            .aux
+            .rollout
+            .lost_calls
+            .retain(|_, (e, until)| *e == epoch && now < *until);
+        if self
+            .relations
+            .aux
+            .rollout
+            .lost_overflow
+            .is_some_and(|(e, until)| e != epoch || now >= until)
+        {
+            self.relations.aux.rollout.lost_overflow = None;
+        }
         let keys: Vec<EvidenceKey> = self.relations.aux.rollout.waits.keys().cloned().collect();
         for key in keys {
             let Some(wait) = self.relations.aux.rollout.waits.get(&key) else {
@@ -631,6 +731,30 @@ impl Machine {
             self.rollout_downgrade(&key, reason, actions);
         }
         let needed = self.rollout_needed();
+        // 同一编号只属于一段连续跟随，物理名额留到真实回包。
+        let state = &mut self.relations.aux.rollout;
+        let tickets = &mut state.rollout_reads;
+        state.files.retain(|thread, file| {
+            if file.epoch != epoch
+                || (matches!(file.path, RolloutPathState::Failed(_)) && now >= file.next_at)
+            {
+                return false;
+            }
+            if needed.contains(thread) {
+                return true;
+            }
+            if let Some(id) = file.reading.take() {
+                if let Some(read) = tickets.get_mut(&id) {
+                    read.state = ReadTicketState::Retired;
+                }
+            }
+            file.cursor = None;
+            file.reads = 0;
+            if matches!(file.path, RolloutPathState::Ready(_)) {
+                file.next_at = now;
+            }
+            !matches!(file.path, RolloutPathState::Requested(_))
+        });
         let mut due: Option<u64> = self
             .relations
             .aux
@@ -642,43 +766,56 @@ impl Machine {
                 self.relations
                     .aux
                     .rollout
-                    .coverage_reads
+                    .rollout_reads
                     .values()
-                    .filter(|t| t.state == ReadTicketState::Active)
+                    .filter(|t| t.state != ReadTicketState::Retired)
                     .map(|t| t.deadline),
             )
             .min();
-        // 不再需要的文件停止跟随：清掉游标（重新需要时从末尾重来），只留路径与失败结论。
-        let state = &mut self.relations.aux.rollout;
-        state.files.retain(|thread, f| {
-            if f.epoch != epoch {
-                return false;
-            }
-            // 失败已过期：丢掉这条记录，还需要这个文件时从取路径重新开始。
-            if matches!(f.path, RolloutPathState::Failed(_)) && now >= f.next_at {
-                return false;
-            }
-            if !needed.contains(thread) && f.reading.is_none() {
-                f.cursor = None;
-                f.reads = 0;
-            }
-            true
-        });
         for thread in &needed {
             let file = self.relations.aux.rollout.files.get(thread);
             match file.map(|f| &f.path) {
                 None => {
                     if self.relations.aux.rollout.files.len() >= MAX_ROLLOUT_FILES {
-                        let idle = self
-                            .relations
+                        // 量保留表容量前，先删掉表里已到期或换代作废的项。
+                        self.relations
                             .aux
                             .rollout
-                            .files
+                            .evicted_cooldowns
+                            .retain(|_, (e, until, _)| *e == epoch && now < *until);
+                        let files = &self.relations.aux.rollout.files;
+                        let idle = |(t, f): &(&String, &RolloutFile)| {
+                            !needed.contains(*t) && f.reading.is_none()
+                        };
+                        let cooling = |f: &RolloutFile| {
+                            matches!(f.path, RolloutPathState::Failed(_)) && now < f.next_at
+                        };
+                        // 先选不在冷却中的空闲项；没有才选冷却中的，且保留表须有空位。
+                        let evict = files
                             .iter()
-                            .find(|(t, f)| !needed.contains(*t) && f.reading.is_none())
+                            .find(|e| idle(e) && !cooling(e.1))
+                            .or_else(|| {
+                                if self.relations.aux.rollout.evicted_cooldowns.len()
+                                    >= MAX_ROLLOUT_FILES
+                                {
+                                    None
+                                } else {
+                                    files.iter().find(|e| idle(e) && cooling(e.1))
+                                }
+                            })
                             .map(|(t, _)| t.clone());
-                        match idle {
+                        match evict {
                             Some(t) => {
+                                // 淘汰冷却文件时保留它的失败截止：截止前原线程不提前重取路径。
+                                if let Some(f) = self.relations.aux.rollout.files.get(&t) {
+                                    if let RolloutPathState::Failed(reason) = f.path {
+                                        self.relations
+                                            .aux
+                                            .rollout
+                                            .evicted_cooldowns
+                                            .insert(t.clone(), (epoch, f.next_at, reason));
+                                    }
+                                }
                                 self.relations.aux.rollout.files.remove(&t);
                             }
                             None => continue,
@@ -694,6 +831,7 @@ impl Machine {
                             reading: None,
                             reads: 0,
                             next_at: now,
+                            floor_dropped: None,
                         },
                     );
                     actions.push(Action::Request(RequestContext {
@@ -719,46 +857,43 @@ impl Machine {
                         due = Some(due.map_or(f.next_at, |d| d.min(f.next_at)));
                         continue;
                     }
-                    if self.relations.aux.rollout.coverage_reads.len() >= MAX_COVERAGE_READS {
+                    if self.relations.aux.rollout.rollout_reads.len() >= MAX_ROLLOUT_READS {
                         continue;
                     }
                     let Some(id) = self.relations.aux.rollout.next_read_id.checked_add(1) else {
                         continue;
                     };
+                    let floor = self.rollout_floor(thread);
+                    let reread = f.floor_dropped.is_some_and(|at| at >= floor);
+                    let fresh = reread || f.cursor.is_none();
                     let request = RolloutReadRequest {
                         id,
                         thread: thread.clone(),
                         conn_epoch: epoch,
-                        observation_gen: self.coverage_read_observation_gen(thread),
-                        issued_seq: 0,
                         path: path.clone(),
-                        cursor: f.cursor.clone(),
+                        cursor: if reread { None } else { f.cursor.clone() },
                     };
-                    let Some(issued_seq) = self.coverage_next_seq() else {
-                        continue;
-                    };
-                    let deadline = now.saturating_add(COVERAGE_READ_MS);
+                    let deadline = now.saturating_add(ROLLOUT_READ_MS);
                     let state = &mut self.relations.aux.rollout;
                     state.next_read_id = id;
-                    state.coverage_reads.insert(
+                    state.rollout_reads.insert(
                         id,
                         ReadTicket {
                             id,
                             thread: thread.clone(),
                             conn_epoch: epoch,
-                            observation_gen: request.observation_gen,
-                            issued_seq,
                             deadline,
                             state: ReadTicketState::Active,
                         },
                     );
                     due = Some(due.map_or(deadline, |d| d.min(deadline)));
                     state.reads_issued = state.reads_issued.saturating_add(1);
-                    state.files.get_mut(thread).expect("文件登记存在").reading = Some(id);
-                    actions.push(Action::ReadRollout(RolloutReadRequest {
-                        issued_seq,
-                        ..request
-                    }));
+                    let f = state.files.get_mut(thread).expect("文件登记存在");
+                    if fresh {
+                        f.floor_dropped = None;
+                    }
+                    f.reading = Some(id);
+                    actions.push(Action::ReadRollout(request));
                 }
                 Some(RolloutPathState::Requested(_) | RolloutPathState::Failed(_)) => {}
             }
@@ -771,6 +906,14 @@ impl Machine {
     fn rollout_needed(&self) -> BTreeSet<String> {
         let mut needed = BTreeSet::new();
         for (key, wait) in &self.relations.aux.rollout.waits {
+            if !self
+                .relations
+                .operations
+                .get(key)
+                .is_some_and(|op| self.rollout_wait_live(op))
+            {
+                continue;
+            }
             needed.insert(key.parent_thread_id.clone());
             needed.insert(wait.child.clone());
         }
@@ -817,10 +960,11 @@ impl Machine {
     }
 
     fn rollout_stop(&mut self, actions: &mut Vec<Action>) {
-        self.retire_coverage_reads(true);
+        self.retire_rollout_reads(true);
         let state = &mut self.relations.aux.rollout;
         state.waits.clear();
         state.files.clear();
+        state.evicted_cooldowns.clear();
         state.calls.clear();
         if state.timer.take().is_some() {
             actions.push(Action::Unschedule {
@@ -849,10 +993,14 @@ impl Machine {
         result: &Result<Value, Value>,
     ) {
         let epoch = self.relations.conn_epoch;
-        let Some(file) = self.relations.aux.rollout.files.get_mut(thread) else {
+        let Some(file) = self.relations.aux.rollout.files.get(thread) else {
             return;
         };
         if file.epoch != epoch || file.path != RolloutPathState::Requested(generation) {
+            return;
+        }
+        if !self.rollout_needed().contains(thread) {
+            self.relations.aux.rollout.files.remove(thread);
             return;
         }
         let path = result
@@ -864,6 +1012,13 @@ impl Machine {
             .and_then(Value::as_str)
             .filter(|p| crate::rollout::validate_path(p, thread));
         let now = self.clock.mono_ms;
+        let file = self
+            .relations
+            .aux
+            .rollout
+            .files
+            .get_mut(thread)
+            .expect("路径请求仍有效");
         (file.path, file.next_at) = match path {
             Some(path) => (RolloutPathState::Ready(path.into()), now),
             None => (
@@ -878,59 +1033,31 @@ impl Machine {
         &mut self,
         id: u64,
         thread: &str,
-        identity: (u64, u64, u64),
+        conn_epoch: u64,
         result: Result<RolloutChunk, RolloutError>,
         actions: &mut Vec<Action>,
     ) {
         let now = self.clock.mono_ms;
         let epoch = self.relations.conn_epoch;
-        let (conn_epoch, observation_gen, issued_seq) = identity;
         // 身份只认派读时冻结的票据，绝不以当前 file.reading 补造身份。
-        let Some(ticket) = self.relations.aux.rollout.coverage_reads.get(&id) else {
-            self.observation_gap(None, "未知会话文件读取票据");
+        let Some(ticket) = self.relations.aux.rollout.rollout_reads.get(&id) else {
             return;
         };
-        if ticket.thread != thread
-            || ticket.conn_epoch != conn_epoch
-            || ticket.observation_gen != observation_gen
-            || ticket.issued_seq != issued_seq
-        {
-            self.observation_gap(None, "会话文件读取票据身份冲突");
+        if ticket.thread != thread || ticket.conn_epoch != conn_epoch {
             return;
         }
-        self.retire_coverage_reads(false);
+        self.retire_rollout_reads(false);
         let ticket = self
             .relations
             .aux
             .rollout
-            .coverage_reads
+            .rollout_reads
             .remove(&id)
             .expect("已核验票据");
         if ticket.state == ReadTicketState::Retired {
             return;
         }
-        // 所有文件反证先于 files、reading、needed、raw、floor 及消费去重过滤。
-        match &result {
-            Ok(chunk) => {
-                if chunk.bad_lines > 0 || chunk.skipped_lines > 0 || chunk.cursor.skipping {
-                    self.observation_gap(Some(thread), "会话文件含无法解释或跳过的记录");
-                }
-                for entry in &chunk.entries {
-                    if let RolloutRecord::Message { turn, .. } = &entry.record {
-                        self.coverage_veto(
-                            Some(thread),
-                            turn.as_deref(),
-                            "文件来源消费不能证明实时覆盖",
-                            true,
-                        );
-                        if turn.is_none() {
-                            self.observation_gap(Some(thread), "文件消费没有可靠轮锚点");
-                        }
-                    }
-                }
-            }
-            Err(_) => self.observation_gap(Some(thread), "会话文件读取失败"),
-        }
+        let followed = self.rollout_needed().contains(thread);
         let Some(file) = self.relations.aux.rollout.files.get_mut(thread) else {
             return;
         };
@@ -938,6 +1065,12 @@ impl Machine {
             return;
         }
         file.reading = None;
+        if !followed {
+            file.cursor = None;
+            file.reads = 0;
+            file.next_at = now;
+            return;
+        }
         let chunk = match result {
             Ok(chunk) => chunk,
             Err(error) => {
@@ -947,17 +1080,6 @@ impl Machine {
                 return;
             }
         };
-        // 停止跟随后才回来的结果不推进游标，下次重新需要时从末尾重来。
-        if !self.rollout_needed().contains(thread) {
-            return;
-        }
-        let file = self
-            .relations
-            .aux
-            .rollout
-            .files
-            .get_mut(thread)
-            .expect("文件登记存在");
         file.cursor = Some(chunk.cursor.clone());
         file.reads = file.reads.saturating_add(1);
         file.next_at = if chunk.more {
@@ -974,22 +1096,42 @@ impl Machine {
                     let Some(call) = parse_call(&item) else {
                         continue;
                     };
-                    let calls = &mut self.relations.aux.rollout.calls;
-                    let key = (thread.to_owned(), call.call_id.clone());
-                    if calls.contains_key(&key) || calls.len() >= MAX_OPERATIONS {
-                        continue;
+                    let state = &mut self.relations.aux.rollout;
+                    let key = (thread.to_owned(), call.call_id);
+                    let observed = RolloutCall {
+                        epoch,
+                        at: now,
+                        wall_ms: entry.wall_ms,
+                        trigger: call.trigger,
+                        target: call.target,
+                        message: call.message,
+                    };
+                    if !state.calls.contains_key(&key) && state.calls.len() < MAX_OPERATIONS {
+                        state.calls.insert(key, observed);
+                    } else if !state.calls.contains_key(&key) {
+                        let mut taken = false;
+                        for (operation, wait) in &mut state.waits {
+                            if operation.parent_thread_id == key.0 && operation.item_id == key.1 {
+                                wait.call.get_or_insert_with(|| observed.clone());
+                                taken = true;
+                            }
+                        }
+                        // 既放不进缓存又没有同键等待认领：在父线程上留失记标志，
+                        // 之后到期的等待仍没拿到自己的调用时判未证明而不是宽松回退。
+                        // 表写满时：父线程已在表里刷新它的期限；不在表里置全表标志。
+                        if !taken {
+                            if let Some(flag) = state.lost_calls.get_mut(&key.0) {
+                                flag.1 = now.saturating_add(EVIDENCE_TTL_MS);
+                            } else if state.lost_calls.len() < MAX_ROLLOUT_FILES {
+                                state.lost_calls.insert(
+                                    key.0.clone(),
+                                    (epoch, now.saturating_add(EVIDENCE_TTL_MS)),
+                                );
+                            } else {
+                                state.lost_overflow = Some((epoch, now + EVIDENCE_TTL_MS));
+                            }
+                        }
                     }
-                    calls.insert(
-                        key,
-                        RolloutCall {
-                            epoch,
-                            at: now,
-                            wall_ms: entry.wall_ms,
-                            trigger: call.trigger,
-                            target: call.target,
-                            message: call.message,
-                        },
-                    );
                 }
                 RolloutRecord::Message { turn, item } => {
                     // 有 raw 或能力未知的线程只认 raw。
@@ -997,6 +1139,9 @@ impl Machine {
                         continue;
                     }
                     if entry.wall_ms < floor {
+                        if let Some(file) = self.relations.aux.rollout.files.get_mut(thread) {
+                            file.floor_dropped = file.floor_dropped.max(Some(entry.wall_ms));
+                        }
                         continue;
                     }
                     let Some(delivery) = parse_delivery(&item) else {

@@ -35,6 +35,8 @@ pub struct Released {
     pub result: SubscriptionResult,
     pub context: RequestContext,
     pub probe: Option<u64>,
+    /// 核实探针发出时的 (连接代际, 在线活动序号)：回包核对是否为旧 notLoaded。
+    pub probe_stamp: Option<(u64, u64)>,
     pub failures: u32,
     pub retry_at: u64,
     pub compensations: u32,
@@ -126,6 +128,7 @@ impl Machine {
                 result: SubscriptionResult::Pending,
                 context: context.clone(),
                 probe: None,
+                probe_stamp: None,
                 failures: old.as_ref().map_or(0, |r| r.failures),
                 retry_at: old.as_ref().map_or(0, |r| r.retry_at),
                 compensations: old.as_ref().map_or(0, |r| r.compensations),
@@ -173,7 +176,11 @@ impl Machine {
         let Operation::ChildSubscription { op, .. } = context.operation else {
             unreachable!()
         };
-        self.relations.aux.released.get_mut(thread).unwrap().probe = Some(op);
+        let epoch = self.relations.conn_epoch;
+        let seq = self.online_activity_stamp(thread);
+        let r = self.relations.aux.released.get_mut(thread).unwrap();
+        r.probe = Some(op);
+        r.probe_stamp = Some((epoch, seq));
         actions.push(Action::Request(context));
     }
 
@@ -431,12 +438,24 @@ impl Machine {
             self.relations.aux.released.get_mut(thread).unwrap().probe = None;
             // 0.160.0 read_thread_view：只读存储/get_thread，不调用 resume；此精确错误表示存储与运行时均不存在。
             let unloaded = match result {
-                Some(Ok(value)) => value["thread"]["status"]["type"] == "notLoaded",
+                Some(Ok(value)) => {
+                    value["thread"]["id"].as_str() == Some(thread)
+                        && value["thread"]["status"]["type"] == "notLoaded"
+                }
                 Some(Err(error)) => {
                     error["message"].as_str() == Some(&format!("thread not loaded: {thread}"))
                 }
                 _ => false,
             };
+            // 探针发出后该线程有在线活动（或序号条目已淘汰，核对不上）：这条 notLoaded 是旧的，作废，
+            // 不解除订阅责任，发新探针重新核实。
+            let stale = released.probe_stamp.is_none_or(|(epoch, seq)| {
+                epoch != self.relations.conn_epoch || self.online_activity_since(thread, seq)
+            });
+            if unloaded && stale {
+                self.child_probe(thread, actions);
+                return;
+            }
             if unloaded {
                 self.child_confirm_unloaded(thread, actions);
             } else if matches!(result, Some(Ok(_))) && self.child_waited(thread) {
@@ -635,7 +654,7 @@ impl Machine {
                 continue;
             };
             // 即使尚未识别血缘，发送订阅切换也已中断连续观察。
-            self.observation_continuity_lost(thread, "订阅操作切换");
+            self.invalidate_rollout_reads(Some(thread));
             if self.thread_relation(thread).is_some()
                 && (context.method == "thread/unsubscribe"
                     || self.relations.aux.released.contains_key(thread)

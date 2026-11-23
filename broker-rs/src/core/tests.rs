@@ -7,33 +7,49 @@ use super::*;
 use crate::appserver::rpc;
 use crate::claim::{Operation, State};
 
-#[tokio::test]
-async fn 方案b_core真实rpc缺口先于完成并全局封锁() {
-    let mut h = Harness::new(false);
-    assert!(!h.core.machine.relations.aux.raw_globally_blocked);
-    h.app_input.send("{bad".into()).unwrap();
-    h.app_input.send(r#"{"method":"turn/completed","params":{"threadId":"线程","turn":{"id":"01900000-0000-7000-8000-000000000001","status":"completed"}}}"#.into()).unwrap();
-    let first = h.inbox.recv().await.unwrap();
-    assert!(
-        matches!(&first, CoreMsg::App(AppEvent::ObservationGap { .. })),
-        "前置：来自真实RPC读取任务的缺口先交付"
+use crate::relations::rollout_pairing::{ReadTicket, ReadTicketState};
+
+fn 登记在途读取(h: &mut Harness) {
+    let machine = &mut h.core.machine;
+    machine.relations.aux.rollout.rollout_reads.insert(
+        1,
+        ReadTicket {
+            id: 1,
+            thread: "线程".into(),
+            conn_epoch: machine.relations.conn_epoch,
+            deadline: machine.clock.mono_ms + 30_000,
+            state: ReadTicketState::Active,
+        },
     );
-    h.core.handle(first);
-    assert!(h.core.machine.relations.aux.raw_globally_blocked);
+}
+
+#[tokio::test]
+async fn gap_wu_真实传输断档先于完成通知使旧读取失效() {
+    let mut h = Harness::new(false);
+    登记在途读取(&mut h);
+    h.app_input.send("{bad".into()).unwrap();
+    h.app_input.send(r#"{"method":"turn/completed","params":{"threadId":"线程","turn":{"id":"轮","status":"completed"}}}"#.into()).unwrap();
+    let gap = h.inbox.recv().await.unwrap();
+    assert!(matches!(
+        &gap,
+        CoreMsg::App(AppEvent::ObservationGap { .. })
+    ));
+    h.core.handle(gap);
+    assert_eq!(
+        h.core.machine.relations.aux.rollout.rollout_reads[&1].state,
+        ReadTicketState::Retired
+    );
     let completed = h.inbox.recv().await.unwrap();
     assert!(
-        matches!(&completed, CoreMsg::App(AppEvent::Notification { method, .. }) if method == "turn/completed")
+        matches!(completed, CoreMsg::App(AppEvent::Notification { method, .. }) if method == "turn/completed")
     );
-    h.core.handle(completed);
-    assert!(h.core.machine.relations.aux.raw_globally_blocked);
     h.core.app.close().await;
 }
 
 #[tokio::test]
-async fn 方案b_core仅客户端重连不封锁但上游断开封锁() {
+async fn gap_wu_客户端重连保留票据而上游断开使之失效() {
     let mut h = Harness::new(false);
-    assert!(h.core.conns.contains_key(&1));
-    assert!(!h.core.machine.relations.aux.raw_globally_blocked);
+    登记在途读取(&mut h);
     h.core.handle(CoreMsg::Conn(ConnEvent::Closed {
         conn: 1,
         reason: CloseReason::Eof,
@@ -41,18 +57,17 @@ async fn 方案b_core仅客户端重连不封锁但上游断开封锁() {
     let (writer, _output) = mpsc::unbounded_channel();
     h.core
         .handle(CoreMsg::Conn(ConnEvent::Connected { conn: 2, writer }));
-    assert!(h.core.conns.contains_key(&2));
-    assert!(
-        !h.core.machine.relations.aux.raw_globally_blocked,
-        "前端客户端重连没有造成上游观察断档"
+    assert_eq!(
+        h.core.machine.relations.aux.rollout.rollout_reads[&1].state,
+        ReadTicketState::Active
     );
     h.core.app.inner.fail("上游传输断开");
-    h.pump_until(|message| matches!(message, CoreMsg::App(AppEvent::Closed { .. })))
+    h.pump_until(|msg| matches!(msg, CoreMsg::App(AppEvent::Closed { .. })))
         .await;
     assert!(h.core.app_disconnected);
-    assert!(
-        h.core.machine.relations.aux.raw_globally_blocked,
-        "上游断开必须先封锁再关闭结算"
+    assert_eq!(
+        h.core.machine.relations.aux.rollout.rollout_reads[&1].state,
+        ReadTicketState::Retired
     );
 }
 

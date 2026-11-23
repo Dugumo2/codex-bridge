@@ -582,6 +582,47 @@ fn access_error(info: &str) -> Event {
     )
 }
 
+/// 样本 2 原文：订阅共享额度用完的 WebSocket 形状正文。
+const SS_USAGE_LIMIT_BODY: &str = r#"{"type":"error","status":400,"error":{"message":"The ChatGPT user has reached their Subscription Sharing usage limit. Ask the user to try again after their usage limit resets or use an API key instead.","type":"invalid_request_error","param":null,"code":"subscription_sharing_usage_limit_exceeded"}}"#;
+/// t3code issue #29992 原文：能力不支持的 HTTP 形状正文。
+const SS_UNSUPPORTED_BODY: &str = r#"{"error":{"message":"User subscription sharing currently supports only text, image, and file messages, item references, additional tools, compaction summaries, reasoning items, Web Search call items, developer function and custom tool call items, and programmatic tool calling items. Remove unsupported input items or use an API key instead.","type":"invalid_request_error","param":"input","code":"subscription_sharing_unsupported_capability"}}"#;
+
+fn ss_error(body: &str) -> Event {
+    notify(
+        "error",
+        json!({"threadId":"线程","turnId":"本轮","willRetry":true,
+            "error":{"message":body,"codexErrorInfo":"other"}}),
+    )
+}
+
+#[test]
+fn ss_额度用完触发即停_能力不支持不触发() {
+    let (mut m, _) = running_with(false, 0, "stopAccess");
+    let a = apply(&mut m, ss_error(SS_USAGE_LIMIT_BODY));
+    assert_eq!(interrupts(&a), 1);
+    assert_eq!(
+        m.runs.runs[RUN].interrupt_reason,
+        Some(InterruptReason::UpstreamAccessError)
+    );
+    // 同一运行只触发一次。
+    let a = apply(&mut m, ss_error(SS_USAGE_LIMIT_BODY));
+    assert_eq!(interrupts(&a), 0);
+
+    // 能力不支持不触发即停。
+    let (mut m, _) = running_with(false, 0, "stopAccess");
+    let a = apply(&mut m, ss_error(SS_UNSUPPORTED_BODY));
+    assert_eq!(interrupts(&a), 0);
+    assert_eq!(m.runs.runs[RUN].state, RunState::Running);
+    assert!(!m.runs.access_stopped.contains(RUN));
+
+    // observe 策略下两类都不触发。
+    for body in [SS_USAGE_LIMIT_BODY, SS_UNSUPPORTED_BODY] {
+        let (mut m, _) = running_with(false, 0, "observe");
+        let a = apply(&mut m, ss_error(body));
+        assert_eq!(interrupts(&a), 0);
+    }
+}
+
 #[test]
 fn 访问报错即停只对三类结构化错误触发一次() {
     for info in [

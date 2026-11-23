@@ -1149,6 +1149,7 @@ impl Machine {
         self.relations.aux.lookups.insert(
             target.clone(),
             Lookup {
+                read_stamp: (0, 0, 0),
                 op_id,
                 generation: 0,
                 attempt: 0,
@@ -1176,6 +1177,7 @@ impl Machine {
                 break;
             };
             let generation = self.relations.aux.next();
+            let stamp = self.metadata_read_stamp(&target);
             let Some(lookup) = self.relations.aux.lookups.get_mut(&target) else {
                 continue;
             };
@@ -1184,6 +1186,7 @@ impl Machine {
             }
             lookup.in_flight = true;
             lookup.generation = generation;
+            lookup.read_stamp = stamp;
             lookup.retry_at_ms = None;
             let op_id = lookup.op_id;
             actions.push(Action::Request(RequestContext {
@@ -1224,8 +1227,14 @@ impl Machine {
         }
         match result {
             Ok(value) => {
-                self.relations.aux.lookups.remove(thread);
+                let lookup = self
+                    .relations
+                    .aux
+                    .lookups
+                    .remove(thread)
+                    .expect("回查身份已核对");
                 let info = value.get("thread").cloned().unwrap_or(Value::Null);
+                self.observe_metadata_unload(thread, &info, lookup.read_stamp);
                 match edge_from_thread_checked(&info, thread) {
                     Some(edge) => {
                         self.record_edge(edge, actions);

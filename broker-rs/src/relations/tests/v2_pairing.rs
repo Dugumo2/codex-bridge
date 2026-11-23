@@ -372,6 +372,385 @@ fn v2兄弟与隔房子代理互发不记归属冲突且不授管理权() {
     assert!(conflicts[0].contains("未核实为本父线程的子代理"));
 }
 
+/// 两表都满且留言身份失记：真实 followup_task（raw 调用＋Interacted）在证据期限内
+/// 计入 pending 给真实子轮留出开始时间；期限到了移出 pending 并清掉占位，运行可进入
+/// 汇总而不是等到收敛总期限。不误绑保持：不产生绑定。对照：留言身份表没满时，
+/// 同样的跟进仍按 StartMissing 宽松配对。
+#[test]
+fn gap_wu_身份失记的跟进按证据期限结算() {
+    for full in [true, false] {
+        let (mut m, mut mock) = super::lineage_safety::machine();
+        // 本运行派生的非历史子线程：正文归属只看本运行候选，不依赖块 1。
+        spawn_v1(&mut m, &mut mock, C, "派生子线程", "首轮");
+        for index in 0..MAX_OPERATIONS {
+            m.relations.aux.followup_starts.insert(
+                EvidenceKey {
+                    parent_thread_id: P.into(),
+                    parent_turn_id: T.into(),
+                    item_id: format!("占位开始{index}"),
+                },
+                crate::relations::v2_pairing::FollowupStart {
+                    epoch: m.relations.conn_epoch,
+                    seq: index as u64,
+                    at: m.clock.mono_ms,
+                    source: EvidenceSource::Raw,
+                    wall_ms: m.clock.now_ms,
+                    run: R.into(),
+                    generation: 1,
+                    target: None,
+                    message: None,
+                    trigger: true,
+                },
+            );
+        }
+        if full {
+            let epoch = m.relations.conn_epoch;
+            for index in 0..MAX_OPERATIONS {
+                m.relations.aux.raw_queue_receipts.insert(
+                    EvidenceKey {
+                        parent_thread_id: P.into(),
+                        parent_turn_id: T.into(),
+                        item_id: format!("占位留言{index}"),
+                    },
+                    (epoch, m.clock.mono_ms + EVIDENCE_TTL_MS),
+                );
+            }
+            // 再放一条放不下身份的留言，让本批证据进入「身份失记」窗口。
+            mock.inject(
+                &mut m,
+                Event::Notification {
+                    method: "rawResponseItem/completed".into(),
+                    params: Some(json!({"threadId":P,"turnId":T,
+                        "item":{"type":"function_call","name":"send_message","call_id":"溢出留言"}})),
+                },
+            );
+            assert!(
+                m.relations.aux.raw_queue_receipts_full.is_some(),
+                "前置：留言身份表也放不下"
+            );
+        }
+        // 真实跟进：raw 调用到达时开始表放不下，Interacted 到来时身份已失记。
+        mock.inject(
+            &mut m,
+            Event::Notification {
+                method: "rawResponseItem/completed".into(),
+                params: Some(json!({"threadId":P,"turnId":T,
+                    "item":{"type":"function_call","name":"followup_task","call_id":"失记跟进"}})),
+            },
+        );
+        let (a, b) = SubagentMock::v2_activity("interacted", P, T, "失记跟进", C);
+        run(&mut m, &mut mock, vec![a, b]);
+        m.convergence_sync_facts(R);
+        let key = EvidenceKey {
+            parent_thread_id: P.into(),
+            parent_turn_id: T.into(),
+            item_id: "失记跟进".into(),
+        };
+        let op = m
+            .relations
+            .operations
+            .get(&key)
+            .expect("跟进登记了证据操作");
+        if !full {
+            assert_eq!(op.v2_fallback, Some(V2FallbackReason::StartMissing));
+            assert_ne!(
+                op.outcome,
+                EvidenceOutcome::Unproven,
+                "留言身份表没满时仍按 StartMissing 宽松配对"
+            );
+            continue;
+        }
+        assert_eq!(op.outcome, EvidenceOutcome::Unproven);
+        assert!(
+            m.convergences.ledgers[R].pending.contains(&key),
+            "期限内失记跟进仍计入 pending，给真实子轮留开始时间"
+        );
+        // 子线程开新轮并输出：轮次不误绑，正文按归属未确认暂存。
+        let event = mock.turn_started(C, "子轮");
+        mock.inject(&mut m, event);
+        assert!(
+            !m.binding(C, "子轮")
+                .is_some_and(|b| b.status == BindingStatus::Bound),
+            "失记跟进不授予管理权"
+        );
+        m.buffer_child_event_log(
+            C,
+            "item/completed",
+            &Some(json!({"threadId":C,"turnId":"子轮",
+                "item":{"id":"子轮输出","type":"agentMessage","text":"失记跟进的实际正文"}})),
+            false,
+            &mut vec![],
+        );
+        // 子轮结束且到期后：移出 pending、清占位，运行可进入汇总。
+        let event = mock.turn_completed(C, "子轮", "completed");
+        mock.inject(&mut m, event);
+        m.convergence_sync_facts(R);
+        assert!(
+            m.convergences.ledgers[R].pending.contains(&key),
+            "30 秒内操作仍在 pending"
+        );
+        let mut settled = advance(&mut m, &mut mock, EVIDENCE_TTL_MS);
+        assert!(
+            !m.convergences.ledgers[R].pending.contains(&key),
+            "证据期限到了失记跟进要移出 pending，不能挂到收敛总期限"
+        );
+        assert!(
+            m.convergences.ledgers[R]
+                .placeholder_operations
+                .values()
+                .all(|reasons| !reasons.contains(&key)),
+            "占位也随结算清掉"
+        );
+        assert_eq!(
+            m.convergence_facts(R).unwrap().pending_starts,
+            0,
+            "结算后运行可进入汇总"
+        );
+        // 到期结算后暂存正文按归属未确认写回，仍可取回。
+        m.settle_event_log_step(&mut settled);
+        assert!(
+            log_lines_with(&settled, "unconfirmed")
+                .iter()
+                .any(|line| line.contains("失记跟进的实际正文")),
+            "正文按归属未确认保存并可取回"
+        );
+    }
+}
+
+/// 接缝：历史子线程（旧运行派生、本次只补记到 child_history）的失记跟进同样
+/// 按证据期限结算：计入 pending 给子轮留开始时间、到期移出并清占位、
+/// 正文按归属未确认写回可取回。A 之后结算不看历史分类，口径与本运行派生一致。
+#[test]
+fn gap_wu_历史子线程的失记跟进按证据期限结算() {
+    let (mut m, mut mock) = super::lineage_safety::machine();
+    // 历史子线程：登记元数据并记入 child_history，不经本运行的 v1 派生。
+    mock.register(C, Some(P), "v1", false, true);
+    super::lineage_safety::history(&mut m, C);
+    for index in 0..MAX_OPERATIONS {
+        m.relations.aux.followup_starts.insert(
+            EvidenceKey {
+                parent_thread_id: P.into(),
+                parent_turn_id: T.into(),
+                item_id: format!("占位开始{index}"),
+            },
+            crate::relations::v2_pairing::FollowupStart {
+                epoch: m.relations.conn_epoch,
+                seq: index as u64,
+                at: m.clock.mono_ms,
+                source: EvidenceSource::Raw,
+                wall_ms: m.clock.now_ms,
+                run: R.into(),
+                generation: 1,
+                target: None,
+                message: None,
+                trigger: true,
+            },
+        );
+    }
+    let epoch = m.relations.conn_epoch;
+    for index in 0..MAX_OPERATIONS {
+        m.relations.aux.raw_queue_receipts.insert(
+            EvidenceKey {
+                parent_thread_id: P.into(),
+                parent_turn_id: T.into(),
+                item_id: format!("占位留言{index}"),
+            },
+            (epoch, m.clock.mono_ms + EVIDENCE_TTL_MS),
+        );
+    }
+    mock.inject(
+        &mut m,
+        Event::Notification {
+            method: "rawResponseItem/completed".into(),
+            params: Some(json!({"threadId":P,"turnId":T,
+                "item":{"type":"function_call","name":"send_message","call_id":"溢出留言"}})),
+        },
+    );
+    mock.inject(
+        &mut m,
+        Event::Notification {
+            method: "rawResponseItem/completed".into(),
+            params: Some(json!({"threadId":P,"turnId":T,
+                "item":{"type":"function_call","name":"followup_task","call_id":"失记跟进"}})),
+        },
+    );
+    let (a, b) = SubagentMock::v2_activity("interacted", P, T, "失记跟进", C);
+    run(&mut m, &mut mock, vec![a, b]);
+    m.convergence_sync_facts(R);
+    let key = EvidenceKey {
+        parent_thread_id: P.into(),
+        parent_turn_id: T.into(),
+        item_id: "失记跟进".into(),
+    };
+    let op = m
+        .relations
+        .operations
+        .get(&key)
+        .expect("跟进登记了证据操作");
+    assert_eq!(op.outcome, EvidenceOutcome::Unproven);
+    assert!(
+        m.convergences.ledgers[R].pending.contains(&key),
+        "期限内失记跟进仍计入 pending"
+    );
+    let event = mock.turn_started(C, "子轮");
+    mock.inject(&mut m, event);
+    assert!(
+        !m.binding(C, "子轮")
+            .is_some_and(|b| b.status == BindingStatus::Bound),
+        "失记跟进不授予管理权"
+    );
+    m.buffer_child_event_log(
+        C,
+        "item/completed",
+        &Some(json!({"threadId":C,"turnId":"子轮",
+            "item":{"id":"子轮输出","type":"agentMessage","text":"历史子线程的失记跟进正文"}})),
+        false,
+        &mut vec![],
+    );
+    let event = mock.turn_completed(C, "子轮", "completed");
+    mock.inject(&mut m, event);
+    m.convergence_sync_facts(R);
+    assert!(m.convergences.ledgers[R].pending.contains(&key));
+    let mut settled = advance(&mut m, &mut mock, EVIDENCE_TTL_MS);
+    assert!(
+        !m.convergences.ledgers[R].pending.contains(&key),
+        "证据期限到了移出 pending"
+    );
+    assert!(m.convergences.ledgers[R]
+        .placeholder_operations
+        .values()
+        .all(|reasons| !reasons.contains(&key)));
+    m.settle_event_log_step(&mut settled);
+    assert!(
+        log_lines_with(&settled, "unconfirmed")
+            .iter()
+            .any(|line| line.contains("历史子线程的失记跟进正文")),
+        "历史子线程的正文同样按归属未确认写回可取回"
+    );
+}
+
+/// P1-2 正文落盘再读回：结算写回的归属未确认行提交真实存储后，
+/// 从磁盘文件读回仍是同一行（不止停在写日志的动作上）。
+#[tokio::test]
+async fn gap_wu_失记跟进的正文落盘后可读回() {
+    let temp = crate::store::tests::Temp::new();
+    let (store, _) = crate::store::open(temp.config()).await.unwrap();
+    let (mut m, mut mock) = super::lineage_safety::machine();
+    spawn_v1(&mut m, &mut mock, C, "派生子线程", "首轮");
+    for index in 0..MAX_OPERATIONS {
+        m.relations.aux.followup_starts.insert(
+            EvidenceKey {
+                parent_thread_id: P.into(),
+                parent_turn_id: T.into(),
+                item_id: format!("占位开始{index}"),
+            },
+            crate::relations::v2_pairing::FollowupStart {
+                epoch: m.relations.conn_epoch,
+                seq: index as u64,
+                at: m.clock.mono_ms,
+                source: EvidenceSource::Raw,
+                wall_ms: m.clock.now_ms,
+                run: R.into(),
+                generation: 1,
+                target: None,
+                message: None,
+                trigger: true,
+            },
+        );
+    }
+    let epoch = m.relations.conn_epoch;
+    for index in 0..MAX_OPERATIONS {
+        m.relations.aux.raw_queue_receipts.insert(
+            EvidenceKey {
+                parent_thread_id: P.into(),
+                parent_turn_id: T.into(),
+                item_id: format!("占位留言{index}"),
+            },
+            (epoch, m.clock.mono_ms + EVIDENCE_TTL_MS),
+        );
+    }
+    mock.inject(
+        &mut m,
+        Event::Notification {
+            method: "rawResponseItem/completed".into(),
+            params: Some(json!({"threadId":P,"turnId":T,
+                "item":{"type":"function_call","name":"send_message","call_id":"溢出留言"}})),
+        },
+    );
+    mock.inject(
+        &mut m,
+        Event::Notification {
+            method: "rawResponseItem/completed".into(),
+            params: Some(json!({"threadId":P,"turnId":T,
+                "item":{"type":"function_call","name":"followup_task","call_id":"失记跟进"}})),
+        },
+    );
+    let (a, b) = SubagentMock::v2_activity("interacted", P, T, "失记跟进", C);
+    run(&mut m, &mut mock, vec![a, b]);
+    m.convergence_sync_facts(R);
+    let key = EvidenceKey {
+        parent_thread_id: P.into(),
+        parent_turn_id: T.into(),
+        item_id: "失记跟进".into(),
+    };
+    assert_eq!(
+        m.relations.operations[&key].outcome,
+        EvidenceOutcome::Unproven,
+        "两表都满，跟进身份失记"
+    );
+    let event = mock.turn_started(C, "子轮");
+    mock.inject(&mut m, event);
+    m.buffer_child_event_log(
+        C,
+        "item/completed",
+        &Some(json!({"threadId":C,"turnId":"子轮",
+            "item":{"id":"子轮输出","type":"agentMessage","text":"失记跟进的实际正文"}})),
+        false,
+        &mut vec![],
+    );
+    let event = mock.turn_completed(C, "子轮", "completed");
+    mock.inject(&mut m, event);
+    m.convergence_sync_facts(R);
+    let mut settled = advance(&mut m, &mut mock, EVIDENCE_TTL_MS);
+    m.settle_event_log_step(&mut settled);
+    let expected = settled
+        .iter()
+        .flat_map(|a| match a {
+            Action::Store(StoreOp::AppendLog { lines, .. }) => lines.clone(),
+            _ => vec![],
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        expected
+            .iter()
+            .any(|line| line.contains("失记跟进的实际正文") && line.contains("unconfirmed")),
+        "结算写回了归属未确认的正文行"
+    );
+    for action in &settled {
+        if let Action::Store(op) = action {
+            store.submit(op.clone());
+        }
+    }
+    assert!(store
+        .drain(std::time::Duration::from_secs(2))
+        .await
+        .abandoned
+        .is_empty());
+    let path = temp
+        .dir()
+        .join(format!("runs/{}.log", m.runs.runs[R].short_id));
+    let on_disk = std::fs::read_to_string(path).unwrap();
+    assert_eq!(
+        on_disk,
+        format!("{}\n", expected.join("\n")),
+        "落盘内容与写出行一致"
+    );
+    assert!(
+        on_disk.contains("失记跟进的实际正文") && on_disk.contains("unconfirmed"),
+        "从磁盘读回正文仍在且归属未确认"
+    );
+}
+
 #[test]
 fn v2乱序消费暂存有界并按ttl清理() {
     let (mut m, _) = fixture();

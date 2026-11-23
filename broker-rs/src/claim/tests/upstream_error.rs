@@ -23,6 +23,21 @@ fn upstream(thread: &str, turn: &str, retry: bool) -> Event {
     )
 }
 
+/// 样本 2 原文：订阅共享额度用完的 WebSocket 形状正文。
+const SS_USAGE_LIMIT_BODY: &str = r#"{"type":"error","status":400,"error":{"message":"The ChatGPT user has reached their Subscription Sharing usage limit. Ask the user to try again after their usage limit resets or use an API key instead.","type":"invalid_request_error","param":null,"code":"subscription_sharing_usage_limit_exceeded"}}"#;
+/// t3code issue #29992 原文：能力不支持的 HTTP 形状正文。
+const SS_UNSUPPORTED_BODY: &str = r#"{"error":{"message":"User subscription sharing currently supports only text, image, and file messages, item references, additional tools, compaction summaries, reasoning items, Web Search call items, developer function and custom tool call items, and programmatic tool calling items. Remove unsupported input items or use an API key instead.","type":"invalid_request_error","param":"input","code":"subscription_sharing_unsupported_capability"}}"#;
+
+fn ss_error(thread: &str, turn: &str, body: &str, retry: bool) -> Event {
+    notify(
+        "error",
+        json!({
+            "threadId":thread,"turnId":turn,"willRetry":retry,
+            "error":{"message":body,"codexErrorInfo":"other"}
+        }),
+    )
+}
+
 fn updates(actions: &[Action]) -> Vec<(ConnId, Value)> {
     sends(actions)
         .into_iter()
@@ -365,6 +380,49 @@ fn 上游报错启动失败诊断在释放前通知所有者并保留原错误()
     assert_eq!(record.diagnostic_revision, 1);
     assert_eq!(updates(&actions).len(), 1);
     assert!(machine.claims.is_empty());
+}
+
+#[test]
+fn ss_错误通知归类为订阅共享类别() {
+    let (mut machine, _) = running();
+    connected(&mut machine, 1, true);
+    let actions = apply(
+        &mut machine,
+        ss_error("线程", "本轮", SS_USAGE_LIMIT_BODY, false),
+    );
+    let record = &machine.runs.runs[RUN];
+    let error = record.upstream_error.as_ref().unwrap();
+    assert_eq!(
+        error.category,
+        UpstreamErrorCategory::SubscriptionSharingUsageLimit
+    );
+    // 正文里的 code 形如长 token，按既有脱敏规则被隐藏；归类用的是脱敏前原文。
+    assert_eq!(
+        error.message,
+        SS_USAGE_LIMIT_BODY.replace("subscription_sharing_usage_limit_exceeded", "[已隐藏]")
+    );
+    assert_eq!(error.count, 1);
+    assert_eq!(
+        updates(&actions)[0].1["params"]["upstreamError"]["category"],
+        "subscriptionSharingUsageLimit"
+    );
+
+    let actions = apply(
+        &mut machine,
+        ss_error("线程", "本轮", SS_UNSUPPORTED_BODY, false),
+    );
+    assert_eq!(
+        machine.runs.runs[RUN]
+            .upstream_error
+            .as_ref()
+            .unwrap()
+            .category,
+        UpstreamErrorCategory::SubscriptionSharingUnsupported
+    );
+    assert_eq!(
+        updates(&actions)[0].1["params"]["upstreamError"]["category"],
+        "subscriptionSharingUnsupported"
+    );
 }
 
 #[test]

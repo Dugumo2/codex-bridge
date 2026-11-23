@@ -66,7 +66,7 @@ pub(super) fn finish(m: &mut Machine, mock: &mut SubagentMock) -> Vec<Action> {
         all.extend(replies(m, mock, actions));
     }
     if m.convergences.progress[R].reading.is_some() {
-        confirm_parent(m);
+        confirm_parent_with_actions(m, &mut all);
         let actions = complete(m, mock, P, "汇总轮", "completed");
         all.extend(replies(m, mock, actions));
     }
@@ -454,6 +454,14 @@ pub(super) fn assert_no_alarm(actions: &[Action]) {
             Action::Warn(warning) => panic!("正常路径不应告警：{warning}"),
             Action::Store(crate::store::StoreOp::AppendLog { lines, .. }) => {
                 for line in lines {
+                    if let Some((header, payload)) = line.split_once("\t@cxb2 ") {
+                        let row: serde_json::Value = serde_json::from_str(payload).unwrap();
+                        if row["attribution"] == "unconfirmed" {
+                            assert_ne!(header.split_whitespace().nth(2), Some("记录缺口"));
+                            assert!(row.get("coverageIssue").is_none());
+                            continue;
+                        }
+                    }
                     for word in [
                         "缺口",
                         "冲突",
@@ -996,6 +1004,56 @@ fn 历史兄弟收到平级消息不算冲突_兄弟新轮在跑时仍阻塞收�
         } else {
             all.extend(sweep_pending_event_log(&mut m, &all));
         }
+        // 历史兄弟的摘要也保存：归属未确认、不带 late，但不授予管理权。
+        // 精确组成：恰两条未确认行（轮次开始＋轮次完成），各带自己的 summaryId，
+        // 无确认版、无重复补写——放宽会放过重复补写这类回归。
+        let mut saved: Vec<serde_json::Value> = vec![];
+        for action in &all {
+            if let Action::Store(crate::store::StoreOp::AppendLog { lines, .. }) = action {
+                for line in lines {
+                    let fields: Vec<_> = line.splitn(4, ' ').collect();
+                    if fields[1] == R2 {
+                        let row: serde_json::Value =
+                            serde_json::from_str(fields[3].strip_prefix("\t@cxb2 ").unwrap())
+                                .unwrap();
+                        if row["threadId"] == S && row["turnId"] == "兄弟新轮" {
+                            assert_eq!(row["attribution"], "unconfirmed");
+                            assert!(row.get("late").is_none());
+                            saved.push(row);
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(saved.len(), 2, "恰两条未确认行：{close} {saved:?}");
+        assert_eq!(
+            saved
+                .iter()
+                .map(|row| row["summary"].as_str().unwrap())
+                .collect::<std::collections::BTreeSet<_>>()
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec!["completed", "兄弟新轮"],
+            "轮次开始与完成各一条：{close}"
+        );
+        assert_ne!(
+            saved[0]["summaryId"], saved[1]["summaryId"],
+            "两条摘要各有身份：{close}"
+        );
+        assert!(
+            m.relations
+                .aux
+                .classifications
+                .get(&(R2.into(), S.into()))
+                .is_some_and(|c| c.membership == Membership::Historical),
+            "仍是历史子代理：{close}"
+        );
+        assert!(
+            m.manage_context(R2)
+                .is_none_or(|c| !c.members.contains_key(S)),
+            "不授予管理权：{close}"
+        );
         assert_no_alarm(&all);
     }
 }
@@ -1436,7 +1494,7 @@ fn 共享服务器review溢出迁移到子线程_等定案的跟进要结算不�
     assert_eq!(op(&m, "跟进").outcome, EvidenceOutcome::Unproven);
 }
 
-/// 只有等证据等到期限才算「证明超时」（日志要留缺口）；上游 completed 这种只记事实的条目不算。
+/// 只有等证据等到期限才算「证明超时」（保留未确认摘要）；上游 completed 这种只记事实的条目不算。
 #[test]
 fn 等归属的跟进到期才标证明超时_只记事实的条目不标() {
     const G: &str = "孙";
@@ -1459,13 +1517,20 @@ fn 等归属的跟进到期才标证明超时_只记事实的条目不标() {
     assert_eq!(op(&m, "已完成").outcome, EvidenceOutcome::Unproven, "前置");
     m.clock.mono_ms += crate::relations::EVIDENCE_TTL_MS + 1;
     m.facts_expire(&mut Vec::new());
-    assert_eq!(op(&m, "转手").outcome, EvidenceOutcome::Unproven);
-    assert!(op(&m, "转手").proof_expired, "等到期限才转未证明");
-    assert_eq!(op(&m, "迟派生").outcome, EvidenceOutcome::Unproven);
-    assert!(op(&m, "迟派生").proof_expired, "普通到期同样算证明超时");
-    assert!(
-        !op(&m, "已完成").proof_expired,
-        "只记事实的条目不算证明超时"
+    assert_eq!(
+        op(&m, "转手").outcome,
+        EvidenceOutcome::Unproven,
+        "等到期限才转未证明"
+    );
+    assert_eq!(
+        op(&m, "迟派生").outcome,
+        EvidenceOutcome::Unproven,
+        "普通到期同样算证明超时"
+    );
+    assert_eq!(
+        op(&m, "已完成").outcome,
+        EvidenceOutcome::Unproven,
+        "只记事实的条目到期前后不变"
     );
 }
 
