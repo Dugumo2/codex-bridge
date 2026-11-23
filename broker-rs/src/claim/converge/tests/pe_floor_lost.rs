@@ -143,6 +143,10 @@ fn gap_pe_失记标志过期后建的等待照原样宽松回退() {
     call_line(&m, "留言", "send_message", C, "忙里捎话");
     let mut all = interacted_to(&mut m, "占位", C);
     let flag = m.relations.aux.rollout.lost_calls[P];
+    assert!(
+        m.relations.aux.rollout.lost_overflow.is_none(),
+        "表未满时只记该父线程，不置全表标志"
+    );
     // 标志失效之后才建等待。
     m.clock.mono_ms = flag.1 + 1;
     m.clock.now_ms += 100;

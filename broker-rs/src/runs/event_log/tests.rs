@@ -717,6 +717,10 @@ fn gap_wu_超限直接保存新摘要且不挤掉旧暂存() {
         );
         暂存(&mut m, "已有", &mut actions);
     }
+    assert!(
+        m.runs.event_log.bytes <= PER_THREAD_BYTES,
+        "同一线程的暂存不得越过线程上限"
+    );
     let old = m.runs.event_log.pending.clone();
     actions.clear();
     暂存(&mut m, "目标", &mut actions);
