@@ -2501,6 +2501,12 @@ fn gap_wu_截止时同一文件回包确认两轮后才清扫() {
                     let fields: Vec<_> = line.splitn(4, ' ').collect();
                     let row: serde_json::Value =
                         serde_json::from_str(fields[3].strip_prefix("\t@cxb2 ").unwrap()).unwrap();
+                    if row["threadId"] == C && row["turnId"] == turn {
+                        assert!(
+                            row.get("attribution").is_none(),
+                            "同刻确认的轮不得先被清扫成未确认行"
+                        );
+                    }
                     if row["threadId"] == C && row["turnId"] == turn && row["late"] == true {
                         assert!(row.get("attribution").is_none());
                         saved.push(row["summary"].as_str().unwrap().to_owned());

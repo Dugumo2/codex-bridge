@@ -270,3 +270,44 @@ fn gap_pe_传输断档退休全部在途路径请求() {
         assert_ne!(old, new);
     }
 }
+
+/// W71 的守护：只入队留言的调用已在缓存里，之后父文件进入失败冷却。
+/// 留言按父调用类型定为严格，不看父文件此刻读不读得了（调用是本代际此前读到的）。
+#[test]
+fn gap_pe_父文件冷却不降级已缓存的只入队留言() {
+    let (mut m, _) = base();
+    files(&m);
+    call_line(&m, "预读", "send_message", C, "");
+    call_line(&m, "目标", "send_message", C, "任务");
+    interacted_to(&mut m, "预读", C);
+    assert!(m
+        .relations
+        .aux
+        .rollout
+        .calls
+        .contains_key(&(P.into(), "目标".into())));
+    let epoch = m.relations.conn_epoch;
+    m.relations.aux.rollout.files.insert(
+        P.into(),
+        RolloutFile {
+            epoch,
+            path: RolloutPathState::Failed(V2FallbackReason::RolloutUnreadable),
+            cursor: None,
+            reading: None,
+            reads: 0,
+            next_at: m.clock.mono_ms + ROLLOUT_RETRY_MS,
+            floor_dropped: None,
+        },
+    );
+    let reads = m.relations.aux.rollout.reads_issued;
+    interacted_to(&mut m, "目标", C);
+    assert_eq!(
+        m.relations.aux.rollout.reads_issued, reads,
+        "不为留言再派读"
+    );
+    let operation = op(&m, "目标");
+    assert!(operation.v2_queue_only, "留言只入队");
+    assert!(operation.v2_strict, "父文件冷却不降级留言");
+    assert_eq!(operation.v2_fallback, None);
+    assert!(operation.receivers.is_empty() && operation.proven_turns.is_empty());
+}
