@@ -235,8 +235,8 @@ export function observeUpstreamErrors(rpc: BrokerRpc, runId: () => string | null
       const latest = views.get(run.runId);
       const error2 = latest?.upstreamError;
       const fix = error2 ? remedy(error2) : null;
-      // 改法行只在上方提示还没说过时才补一遍。
-      if (fix && error2 && remedied(run.runId, error2)) notice(fix);
+      // 改法行只在上方提示还没说过时才补一遍；补时先补一行中文标签（晚接入时上方没有它）。
+      if (fix && error2 && remedied(run.runId, error2)) { notice(upstreamNoticeLines(error2, true)[0]!); notice(fix); }
     } else display(merge(run), true);
   };
   const off = rpc.on("broker/run/updated", (raw) => { if (raw && typeof raw === "object") accept(raw as View); });
