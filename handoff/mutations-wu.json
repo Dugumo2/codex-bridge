@@ -1,0 +1,998 @@
+[
+ {
+  "name": "W01_到期仍报告缺口",
+  "file": "broker-rs/src/runs/event_log.rs",
+  "before": "self.settle_pending_candidates(&mut event, Settlement::Expired, actions);",
+  "after": "for c in &event.candidates { self.log_final_discovery(&c.run, false, actions); } event.candidates.clear();",
+  "filters": [
+   "gap_wu_到期与关闭各自保存原摘要"
+  ]
+ },
+ {
+  "name": "W02_暂存超限改用关闭语义",
+  "file": "broker-rs/src/runs/event_log.rs",
+  "before": "self.settle_pending_candidates(&mut pending, Settlement::Limit, actions);\n                continue;",
+  "after": "self.settle_pending_candidates(&mut pending, Settlement::All, actions);\n                continue;",
+  "filters": [
+   "gap_wu_超限结算的摘要确认归属后沿用身份补写确认版",
+   "gap_wu_超限直接保存新摘要且不挤掉旧暂存"
+  ],
+  "killed_by": [
+   "test runs::event_log::tests::gap_wu_超限结算的摘要确认归属后沿用身份补写确认版 ... FAILED",
+   "thread 'runs::event_log::tests::gap_wu_超限结算的摘要确认归属后沿用身份补写确认版' (9056) panicked at src\\runs\\event_log\\tests.rs:1512:5:",
+   "test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 1639 filtered out; finished in 0.01s"
+  ]
+ },
+ {
+  "name": "W03_关闭不保存",
+  "file": "broker-rs/src/runs/event_log.rs",
+  "before": "for mut pending in std::mem::take(&mut self.runs.event_log.pending) {\n            self.settle_pending_candidates",
+  "after": "for mut pending in std::mem::take(&mut self.runs.event_log.pending) {\n            pending.candidates.clear();\n            self.settle_pending_candidates",
+  "filters": [
+   "gap_wu_到期与关闭各自保存原摘要"
+  ]
+ },
+ {
+  "name": "W04_绑定前不清扫过期暂存",
+  "file": "broker-rs/src/runs/event_log.rs",
+  "before": "        let mut hits: Vec<(u64, u64, Summary)> = vec![];\n        for event in std::mem::take(&mut self.runs.event_log.pending) {",
+  "after": "        self.expire_event_log(actions);\n        let mut hits: Vec<(u64, u64, Summary)> = vec![];\n        for event in std::mem::take(&mut self.runs.event_log.pending) {",
+  "filters": [
+   "gap_wu_同刻绑定先补写目标轮再清扫"
+  ]
+ },
+ {
+  "name": "W05_候选结束前不结算",
+  "file": "broker-rs/src/runs/mod.rs",
+  "before": "self.settle_ending_event_log(run, actions);",
+  "after": "/* 留待过期 */",
+  "filters": [
+   "gap_wu_候选运行定案并淘汰前保存"
+  ]
+ },
+ {
+  "name": "W06_去掉独立最长暂存时长",
+  "file": "broker-rs/src/runs/event_log.rs",
+  "before": "if evidence_wait && self.clock.mono_ms < event.deadline {",
+  "after": "if evidence_wait {",
+  "filters": [
+   "gap_wu_在途配对续期有独立上限"
+  ]
+ },
+ {
+  "name": "W07_未确认正文混入普通运行日志",
+  "file": "src/cxb/ledger.ts",
+  "before": "line.source?.attribution !== \"unconfirmed\"\n    && line.source?.sourceRole !== \"subagent\" && !line.source?.coverageIssue",
+  "after": "line.source?.attribution === \"unconfirmed\" || (line.source?.sourceRole !== \"subagent\" && !line.source?.coverageIssue)",
+  "filters": [
+   "归属未确认按运行线程和轮折叠，完整文本和机器输出可逐条取回"
+  ]
+ },
+ {
+  "name": "W08_历史候选仍被排除",
+  "file": "broker-rs/src/runs/event_log.rs",
+  "before": "            // 历史子代理同样按归属未确认保存；归属排除已移除，结算只负责落盘。\n            self.write_child_summary(",
+  "after": "            // 历史子代理同样按归属未确认保存；归属排除已移除，结算只负责落盘。\n            if self.historical_subagent_for_run(run, &event.thread) {\n                return true;\n            }\n            self.write_child_summary(",
+  "filters": [
+   "gap_wu_历史线程无论证据状态都按未确认保存",
+   "gap_wu_同一摘要逐个判断历史候选"
+  ]
+ },
+ {
+  "name": "W09_默认树日志滤掉未确认条目",
+  "file": "src/cxb/tree-log.ts",
+  "before": "item.attribution === \"unconfirmed\" || ctx.parsed.options.full || !itemKinds.has(item.kind)",
+  "after": "ctx.parsed.options.full || !itemKinds.has(item.kind)",
+  "filters": [
+   "归属未确认按运行线程和轮折叠，完整文本和机器输出可逐条取回"
+  ]
+ },
+ {
+  "name": "W10_先按子文件失败回退留言",
+  "file": "broker-rs/src/relations/rollout_pairing.rs",
+  "before": "return Some(Decision::Strict(message.clone()));",
+  "after": "if let Some(reason) = self.rollout_file_failed(&wait.child) { return Some(Decision::Fallback(reason)); } return Some(Decision::Strict(message.clone()));",
+  "filters": [
+   "gap_wu_子文件冷却与能力未知均先判父调用类型"
+  ],
+  "killed_by": [
+   "test claim::converge::tests::rollout_pairing::gap_wu_子文件冷却与能力未知均先判父调用类型 ... FAILED",
+   "thread 'claim::converge::tests::rollout_pairing::gap_wu_子文件冷却与能力未知均先判父调用类型' (7848) panicked at src\\claim\\converge\\tests\\rollout_pairing.rs:2433:13:",
+   "assertion `left == right` failed",
+   "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1659 filtered out; finished in 0.02s"
+  ]
+ },
+ {
+  "name": "W11_结束一个候选同时清空其余候选",
+  "file": "broker-rs/src/runs/event_log.rs",
+  "before": "Settlement::Ending(ending) if ending != run => return true,",
+  "after": "Settlement::Ending(ending) if ending != run => return false,",
+  "filters": [
+   "gap_wu_一份摘要分别在两个候选的结束和关闭时保存"
+  ]
+ },
+ {
+  "name": "W13_第一轮绑定后抢先清扫其他轮",
+  "file": "broker-rs/src/runs/event_log.rs",
+  "before": "    }\n\n    /// 已绑定的轮只写给实际运行。",
+  "after": "        self.expire_event_log(actions);\n    }\n\n    /// 已绑定的轮只写给实际运行。",
+  "filters": [
+   "gap_wu_截止时同一文件回包确认两轮后才清扫"
+  ],
+  "killed_by": [
+   "test claim::converge::tests::rollout_pairing::gap_wu_截止时同一文件回包确认两轮后才清扫 ... FAILED",
+   "thread 'claim::converge::tests::rollout_pairing::gap_wu_截止时同一文件回包确认两轮后才清扫' (5028) panicked at src\\claim\\converge\\tests\\rollout_pairing.rs:2505:25:",
+   "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1660 filtered out; finished in 0.03s"
+  ]
+ },
+ {
+  "name": "W14_等待键忽略候选运行",
+  "file": "broker-rs/src/runs/event_log.rs",
+  "before": "op.outcome == EvidenceOutcome::Pending\n                && (op.run_id == run || op.run_id.is_empty())\n                && !op.rejected_receivers.contains_key(thread)",
+  "after": "op.outcome == EvidenceOutcome::Pending\n                && true\n                && !op.rejected_receivers.contains_key(thread)",
+  "filters": [
+   "gap_wu_文件和派生等待只保护对应运行的历史候选"
+  ]
+ },
+ {
+  "name": "W15_未决归属的等待不能续期",
+  "file": "broker-rs/src/runs/event_log.rs",
+  "before": "op.outcome == EvidenceOutcome::Pending\n                && (op.run_id == run || op.run_id.is_empty())\n                && !op.rejected_receivers.contains_key(thread)",
+  "after": "op.outcome == EvidenceOutcome::Pending\n                && op.run_id == run\n                && !op.rejected_receivers.contains_key(thread)",
+  "filters": [
+   "gap_wu_文件和派生等待只保护对应运行的历史候选"
+  ]
+ },
+ {
+  "name": "W16_命中缓存时提前结束父文件冷却",
+  "file": "broker-rs/src/relations/rollout_pairing.rs",
+  "before": "f.epoch == epoch && matches!(f.path, RolloutPathState::Ready(_))",
+  "after": "f.epoch == epoch",
+  "filters": [
+   "gap_wu_父缓存命中不提前结束失败冷却"
+  ],
+  "killed_by": [
+   "test claim::converge::tests::rollout_pairing::gap_wu_父缓存命中不提前结束失败冷却 ... FAILED",
+   "thread 'claim::converge::tests::rollout_pairing::gap_wu_父缓存命中不提前结束失败冷却' (5752) panicked at src\\claim\\converge\\tests\\rollout_pairing.rs:2538:45:",
+   "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1659 filtered out; finished in 0.02s"
+  ]
+ },
+ {
+  "name": "W17_留言仍要求开始记录有空位",
+  "file": "broker-rs/src/relations/rollout_pairing.rs",
+  "before": "Decision::Strict(call) if !call.trigger => Decision::Strict(call),",
+  "after": "Decision::Strict(call) if false && !call.trigger => Decision::Strict(call),",
+  "filters": [
+   "gap_wu_开始记录满时文件留言零绑定而跟进按证据回退"
+  ],
+  "killed_by": [
+   "test claim::converge::tests::rollout_pairing::gap_wu_开始记录满时文件留言零绑定而跟进按证据回退 ... FAILED",
+   "thread 'claim::converge::tests::rollout_pairing::gap_wu_开始记录满时文件留言零绑定而跟进按证据回退' (3264) panicked at src\\claim\\converge\\tests\\rollout_pairing.rs:2585:13:",
+   "assertion failed: operation.v2_queue_only && operation.v2_strict",
+   "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1659 filtered out; finished in 0.02s"
+  ]
+ },
+ {
+  "name": "W18_路径未知时遮蔽已知子证据",
+  "file": "broker-rs/src/relations/rollout_pairing.rs",
+  "before": "if let Some(reason) = unavailable {",
+  "after": "if let Some(reason) = unavailable.filter(|_| self.v2_sender_path(op).is_some()) {",
+  "filters": [
+   "gap_wu_发起路径未知时先按子证据决定是否等待"
+  ],
+  "killed_by": [
+   "test claim::converge::tests::rollout_pairing::gap_wu_发起路径未知时先按子证据决定是否等待 ... FAILED",
+   "thread 'claim::converge::tests::rollout_pairing::gap_wu_发起路径未知时先按子证据决定是否等待' (3000) panicked at src\\claim\\converge\\tests\\rollout_pairing.rs:2631:9:",
+   "assertion failed: !awaiting(&m, \"等路径\")",
+   "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1659 filtered out; finished in 0.02s"
+  ]
+ },
+ {
+  "name": "W19_停止跟随仍挂住旧读取编号",
+  "file": "broker-rs/src/relations/rollout_pairing.rs",
+  "before": "if needed.contains(thread) {\n                return true;",
+  "after": "if needed.contains(thread) || file.reading.is_some() {\n                return true;",
+  "filters": [
+   "gap_wu_停止再跟随隔离旧读取的成功和失败"
+  ],
+  "killed_by": [
+   "test claim::converge::tests::rollout_pairing::gap_wu_停止再跟随隔离旧读取的成功和失败 ... FAILED",
+   "thread 'claim::converge::tests::rollout_pairing::gap_wu_停止再跟随隔离旧读取的成功和失败' (3636) panicked at src\\claim\\converge\\tests\\rollout_pairing.rs:2659:13:",
+   "assertion `left == right` failed",
+   "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1659 filtered out; finished in 0.02s"
+  ]
+ },
+ {
+  "name": "W20_失去需求时失败仍进冷却",
+  "file": "broker-rs/src/relations/rollout_pairing.rs",
+  "before": "file.reading = None;\n        if !followed {",
+  "after": "file.reading = None;\n        if !followed && result.is_ok() {",
+  "filters": [
+   "gap_wu_操作刚失去需求时错误回包不能留下冷却"
+  ],
+  "killed_by": [
+   "test claim::converge::tests::rollout_pairing::gap_wu_操作刚失去需求时错误回包不能留下冷却 ... FAILED",
+   "thread 'claim::converge::tests::rollout_pairing::gap_wu_操作刚失去需求时错误回包不能留下冷却' (420) panicked at src\\claim\\converge\\tests\\rollout_pairing.rs:2751:9:",
+   "assertion `left == right` failed",
+   "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1659 filtered out; finished in 0.02s"
+  ]
+ },
+ {
+  "name": "W21_根能力回查跳过卸载观察",
+  "file": "broker-rs/src/relations/discovery.rs",
+  "before": "if method == \"thread/read\" {\n                self.discovery_observe_metadata",
+  "after": "if method == \"thread/read\" && thread != self.relations.discoveries[&op_id].root {\n                self.discovery_observe_metadata",
+  "filters": [
+   "gap_wu_根能力回查只凭当前同线程卸载退休读取"
+  ]
+ },
+ {
+  "name": "W22_定向回查忽略卸载",
+  "file": "broker-rs/src/relations/discovery.rs",
+  "before": "self.discovery_observe_metadata(op_id, &thread, &result);",
+  "after": "/* 仅收集血缘 */",
+  "filters": [
+   "gap_wu_已加载列表定向回查只凭当前同线程卸载退休读取"
+  ]
+ },
+ {
+  "name": "W23_卸载回包忽略活动版本",
+  "file": "broker-rs/src/relations/discovery.rs",
+  "before": "stamp.0 == self.relations.conn_epoch\n            && version == Some(stamp.1)",
+  "after": "stamp.0 == self.relations.conn_epoch\n            && { let _ = version; true }",
+  "filters": [
+   "gap_wu_根能力回查只凭当前同线程卸载退休读取",
+   "gap_wu_已加载列表定向回查只凭当前同线程卸载退休读取",
+   "gap_wu_血缘回查的新鲜卸载退休旧票据"
+  ],
+  "reason": "cargo fmt 后条件折成两行；before 按格式化后的原文改写（唯一命中），after 同步换行。"
+ },
+ {
+  "name": "W24_普通增长也报轮转",
+  "file": "src/cxb/ledger.ts",
+  "before": "stamp?.revision !== after[i]?.revision)) continue;",
+  "after": "stamp?.revision !== after[i]?.revision)) { rotation = true; continue; }",
+  "filters": [
+   "无备份时同文件追加只重试，活动文件身份更换才提示窗口"
+  ]
+ },
+ {
+  "name": "W25_机器输出也清理分隔符",
+  "file": "src/cxb/tree-log.ts",
+  "before": "summary: line.content, truncated:",
+  "after": "summary: clean(line.content), truncated:",
+  "filters": [
+   "树日志机器输出逐字保留段落分隔符，完整文本仍单行"
+  ]
+ },
+ {
+  "name": "W26_新摘要绕过线程容量上限",
+  "file": "broker-rs/src/runs/event_log.rs",
+  "before": "pending.bytes + thread_bytes > PER_THREAD_BYTES",
+  "after": "false && pending.bytes + thread_bytes > PER_THREAD_BYTES",
+  "filters": [
+   "gap_wu_超限直接保存新摘要且不挤掉旧暂存"
+  ],
+  "killed_by": [
+   "test runs::event_log::tests::gap_wu_超限直接保存新摘要且不挤掉旧暂存 ... FAILED",
+   "thread 'runs::event_log::tests::gap_wu_超限直接保存新摘要且不挤掉旧暂存' (1672) panicked at src\\runs\\event_log\\tests.rs:720:5:",
+   "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1660 filtered out; finished in 0.24s"
+  ]
+ },
+ {
+  "name": "W27_绑定时先取走暂存队列",
+  "file": "broker-rs/src/runs/event_log.rs",
+  "before": "        for event in std::mem::take(&mut self.runs.event_log.pending) {",
+  "after": "        for event in self.runs.event_log.pending.clone() {",
+  "filters": [
+   "gap_wu_同刻绑定先补写目标轮再清扫"
+  ]
+ },
+ {
+  "name": "W28_最长暂存改为三分钟",
+  "file": "broker-rs/src/runs/event_log.rs",
+  "before": "MAX_PENDING_MS: u64 = 120_000",
+  "after": "MAX_PENDING_MS: u64 = 180_000",
+  "filters": [
+   "gap_wu_在途配对续期有独立上限"
+  ]
+ },
+ {
+  "name": "W29_树停止提交跳过候选结算",
+  "file": "broker-rs/src/runs/mod.rs",
+  "before": "self.settle_ending_event_log(&run, actions);",
+  "after": "/* 跳过树停止结算 */",
+  "filters": [
+   "gap_wu_树停止提交当步结算未到期候选"
+  ]
+ },
+ {
+  "name": "W30_实时发送端漏登记原始调用",
+  "file": "broker-rs/src/relations/v2_pairing.rs",
+  "before": "self.v2_record_start(key, run, generation, call, EvidenceSource::Raw, wall_ms);",
+  "after": "let _ = (key, run, generation, call, wall_ms);",
+  "filters": [
+   "gap_wu_兄弟双唤醒上一轮快照在开始后到达"
+  ]
+ },
+ {
+  "name": "W31_未预读父调用就按子失败回退",
+  "file": "broker-rs/src/relations/rollout_pairing.rs",
+  "before": "if self.rollout_call(key).is_none() {",
+  "after": "if self.rollout_call(key).is_none() {\n            if let Some(reason) = self.rollout_file_failed(child) { return Err(reason); }",
+  "filters": [
+   "gap_wu_子文件冷却与能力未知均先判父调用类型"
+  ],
+  "killed_by": [
+   "test claim::converge::tests::rollout_pairing::gap_wu_子文件冷却与能力未知均先判父调用类型 ... FAILED",
+   "thread 'claim::converge::tests::rollout_pairing::gap_wu_子文件冷却与能力未知均先判父调用类型' (9084) panicked at src\\claim\\converge\\tests\\rollout_pairing.rs:2428:13:",
+   "assertion `left == right` failed",
+   "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1659 filtered out; finished in 0.01s"
+  ]
+ },
+ {
+  "name": "W32_未补齐的半行也推进游标",
+  "file": "broker-rs/src/rollout.rs",
+  "before": "let Some(last) = buf.iter().rposition(|&b| b == b'\\n') else {\n        return 0;",
+  "after": "let Some(last) = buf.iter().rposition(|&b| b == b'\\n') else {\n        return buf.len();",
+  "filters": [
+   "gap_wu_末尾半行保留轮定位补齐后只读取一次"
+  ]
+ },
+ {
+  "name": "W33_血缘回查漏掉卸载",
+  "file": "broker-rs/src/relations/routing.rs",
+  "before": "self.observe_metadata_unload(thread, &info, lookup.read_stamp);",
+  "after": "let _ = lookup;",
+  "filters": [
+   "gap_wu_血缘回查的新鲜卸载退休旧票据"
+  ]
+ },
+ {
+  "name": "W34_探针认错线程的卸载",
+  "file": "broker-rs/src/relations/release.rs",
+  "before": "value[\"thread\"][\"id\"].as_str() == Some(thread)\n                        && value[\"thread\"][\"status\"][\"type\"] == \"notLoaded\"",
+  "after": "value[\"thread\"][\"status\"][\"type\"] == \"notLoaded\"",
+  "filters": [
+   "gap_wu_卸载探针必须对应原线程才解除订阅责任"
+  ],
+  "reason": "cargo fmt 后 && 行缩进为 24 格；before 按格式化后的原文改写（唯一命中）。"
+ },
+ {
+  "name": "W35_预读缓存满时吞掉当前等待的调用",
+  "file": "broker-rs/src/relations/rollout_pairing.rs",
+  "before": "wait.call.get_or_insert_with(|| observed.clone());",
+  "after": "let _ = wait;",
+  "filters": [
+   "gap_wu_开始记录满时文件留言零绑定而跟进按证据回退"
+  ],
+  "killed_by": [
+   "test claim::converge::tests::rollout_pairing::gap_wu_开始记录满时文件留言零绑定而跟进按证据回退 ... FAILED",
+   "thread 'claim::converge::tests::rollout_pairing::gap_wu_开始记录满时文件留言零绑定而跟进按证据回退' (6432) panicked at src\\claim\\converge\\tests\\rollout_pairing.rs:2585:13:",
+   "assertion failed: operation.v2_queue_only && operation.v2_strict",
+   "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1659 filtered out; finished in 0.26s"
+  ]
+ },
+ {
+  "name": "W36_父线程转实时后遗忘已识别的文件留言",
+  "file": "broker-rs/src/relations/facts.rs",
+  "before": "v2_fallback == Some(V2FallbackReason::StartMissing)\n                    && self.rollout_call",
+  "after": "false && v2_fallback == Some(V2FallbackReason::StartMissing)\n                    && self.rollout_call",
+  "filters": [
+   "gap_wu_缓存确认的文件留言在父线程转实时后仍只入队"
+  ]
+ },
+ {
+  "name": "W37_跟随停止仍保存旧路径请求",
+  "file": "broker-rs/src/relations/rollout_pairing.rs",
+  "before": "!matches!(file.path, RolloutPathState::Requested(_))",
+  "after": "true",
+  "filters": [
+   "gap_wu_重新跟随时不沿用旧路径请求的成功或失败"
+  ],
+  "killed_by": [
+   "test claim::converge::tests::rollout_pairing::gap_wu_重新跟随时不沿用旧路径请求的成功或失败 ... FAILED",
+   "thread 'claim::converge::tests::rollout_pairing::gap_wu_重新跟随时不沿用旧路径请求的成功或失败' (9104) panicked at src\\claim\\converge\\tests\\rollout_pairing.rs:2789:18:",
+   "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1659 filtered out; finished in 0.02s"
+  ]
+ },
+ {
+  "name": "W38_路径回包忽略需求已消失",
+  "file": "broker-rs/src/relations/rollout_pairing.rs",
+  "before": "if !self.rollout_needed().contains(thread) {\n            self.relations.aux.rollout.files.remove(thread);",
+  "after": "if false && !self.rollout_needed().contains(thread) {\n            self.relations.aux.rollout.files.remove(thread);",
+  "filters": [
+   "gap_wu_重新跟随时不沿用旧路径请求的成功或失败"
+  ],
+  "killed_by": [
+   "test claim::converge::tests::rollout_pairing::gap_wu_重新跟随时不沿用旧路径请求的成功或失败 ... FAILED",
+   "thread 'claim::converge::tests::rollout_pairing::gap_wu_重新跟随时不沿用旧路径请求的成功或失败' (2924) panicked at src\\claim\\converge\\tests\\rollout_pairing.rs:2802:13:",
+   "assertion failed: !m.relations.aux.rollout.files.contains_key(C)",
+   "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1659 filtered out; finished in 0.03s"
+  ]
+ },
+ {
+  "name": "W39_实时留言丢失满表时的身份",
+  "file": "broker-rs/src/relations/v2_pairing.rs",
+  "before": "aux.raw_queue_receipts.insert(key, (epoch, until));",
+  "after": "let _ = (key, epoch, until);",
+  "filters": [
+   "gap_wu_实时开始表满仍区分留言与跟进"
+  ]
+ },
+ {
+  "name": "W40_身份也失记时按缺失开始记录宽松绑定",
+  "file": "broker-rs/src/relations/facts.rs",
+  "before": "outcome: if unresolved_kind {\n                        EvidenceOutcome::Unproven\n                    } else {\n                        outcome\n                    },",
+  "after": "outcome: { let _ = unresolved_kind; outcome },",
+  "filters": [
+   "gap_wu_实时开始表满仍区分留言与跟进"
+  ]
+ },
+ {
+  "name": "W41_新摘要入队前抢先清扫",
+  "file": "broker-rs/src/runs/event_log.rs",
+  "before": "if candidates.is_empty() {\n            return;\n        }",
+  "after": "if candidates.is_empty() {\n            return;\n        }\n        self.expire_event_log(actions);",
+  "filters": [
+   "gap_wu_接纳和计时器让同一步的绑定优先"
+  ]
+ },
+ {
+  "name": "W42_计时器在步骤尾之前裁决",
+  "file": "broker-rs/src/runs/mod.rs",
+  "before": "RunTimer::EventLogSweep { generation } => self.sweep_event_log(generation),",
+  "after": "RunTimer::EventLogSweep { generation } => { self.sweep_event_log(generation); self.settle_event_log_step(actions); }",
+  "filters": [
+   "gap_wu_接纳和计时器让同一步的绑定优先"
+  ]
+ },
+ {
+  "name": "W43_迟到确认不再补写确认版",
+  "file": "broker-rs/src/runs/event_log.rs",
+  "before": "            if memo.thread == thread && memo.turn == turn {\n                settled_bytes -= memo.bytes;\n                hits.push((memo.seq, memo.now, memo.summary.clone()));\n                return false;\n            }",
+  "after": "            if memo.thread == thread && memo.turn == turn {\n                settled_bytes -= memo.bytes;\n                return false;\n            }",
+  "filters": [
+   "gap_wu_迟到确认沿用同一身份补写确认版"
+  ],
+  "killed_by": "tests.rs:1399 assertion `left == right` failed（补写丢失后行数不符）"
+ },
+ {
+  "name": "W44_补写换发新身份",
+  "file": "broker-rs/src/runs/event_log.rs",
+  "before": "                &summary,\n                true,\n                None,\n                Some(seq),",
+  "after": "                &summary,\n                true,\n                None,\n                None,",
+  "filters": [
+   "gap_wu_迟到确认沿用同一身份补写确认版"
+  ],
+  "killed_by": "tests.rs:1411 assertion `left == right` failed（summaryId 不符）"
+ },
+ {
+  "name": "W45_未确认行仍带迟到标记",
+  "file": "broker-rs/src/runs/event_log.rs",
+  "before": "        if note != Some(LogNote::Unconfirmed) && (late || now < self.event_log.last_timestamp) {",
+  "after": "        if late || note == Some(LogNote::Unconfirmed) || now < self.event_log.last_timestamp {",
+  "filters": [
+   "gap_wu_迟到确认沿用同一身份补写确认版",
+   "gap_wu_历史线程无论证据状态都按未确认保存"
+  ],
+  "killed_by": "tests.rs:1384 assertion failed: unconfirmed.iter().all(|l| l.3.get(\"late\").is_none())"
+ },
+ {
+  "name": "W46_已结算备忘不设字节上限",
+  "file": "broker-rs/src/runs/event_log.rs",
+  "before": "                while memo.bytes + self.runs.event_log.settled_bytes > GLOBAL_BYTES {",
+  "after": "                while false && memo.bytes + self.runs.event_log.settled_bytes > GLOBAL_BYTES {",
+  "filters": [
+   "gap_wu_已结算备忘有界超限淘汰最旧且超期不补写"
+  ],
+  "killed_by": "tests.rs:1455 assertion failed: n < 8_192（「备忘-0 未被淘汰且条数超理论上限二倍：已结算备忘疑似无界增长」），0.52s 干净杀死"
+ },
+ {
+  "name": "W47_超期备忘仍补写",
+  "file": "broker-rs/src/runs/event_log.rs",
+  "before": "            if memo.expires <= self.clock.mono_ms {\n                settled_bytes -= memo.bytes;\n                return false;\n            }",
+  "after": "            if false && memo.expires <= self.clock.mono_ms {\n                settled_bytes -= memo.bytes;\n                return false;\n            }",
+  "filters": [
+   "gap_wu_已结算备忘有界超限淘汰最旧且超期不补写"
+  ],
+  "killed_by": "tests.rs:1483 assertion failed（超期备忘不再补写）"
+ },
+ {
+  "name": "W48_全局暂存上限失效",
+  "file": "broker-rs/src/runs/event_log.rs",
+  "before": "pending.bytes + self.runs.event_log.bytes > GLOBAL_BYTES",
+  "after": "false && pending.bytes + self.runs.event_log.bytes > GLOBAL_BYTES",
+  "filters": [
+   "tree_log_全局暂存上限与未知线程不暂存"
+  ],
+  "killed_by": "tests.rs:398 assertion failed: n < 33（「线程数超过全局上限理论值的二倍仍未饱和：全局上限疑似失效」），1.18s 干净杀死"
+ },
+ {
+  "name": "W51_不按摘要身份合并",
+  "file": "src/cxb/tree-log.ts",
+  "before": "const merged = drop.size ? items.filter((_, i) => !drop.has(i)) : items;",
+  "after": "const merged = items;",
+  "filters": [
+   "同一运行先未确认后确认时只显示确认版，其他运行的副本保留",
+   "轮转备份的未确认版与活动文件的确认版同样合并",
+   "同一运行全是未确认版时保留第一条，没有 summaryId 的行照旧"
+  ]
+ },
+ {
+  "name": "W52_未确认版优先",
+  "file": "src/cxb/tree-log.ts",
+  "before": "if (!items[kept]!.attribution || items[i]!.attribution !== undefined) { drop.add(i); continue; }",
+  "after": "if (items[kept]!.attribution !== undefined || items[i]!.attribution !== undefined) { drop.add(i); continue; }",
+  "filters": [
+   "同一运行先未确认后确认时只显示确认版，其他运行的副本保留"
+  ]
+ },
+ {
+  "name": "W53_跨运行也合并",
+  "file": "src/cxb/tree-log.ts",
+  "before": "const key = `${items[i]!.runId}\\0${sid}`;",
+  "after": "const key = sid;",
+  "filters": [
+   "同一运行先未确认后确认时只显示确认版，其他运行的副本保留"
+  ]
+ },
+ {
+  "name": "W54_摘要身份坏值放行",
+  "file": "src/cxb/ledger.ts",
+  "before": "|| (value.summaryId !== undefined && (typeof value.summaryId !== \"string\" || value.summaryId === \"\"))",
+  "after": "",
+  "filters": [
+   "新标志的损坏 JSON 或缺失字段严格报错，不能回退成正文"
+  ]
+ },
+ {
+  "name": "W55_到期不移出pending",
+  "file": "broker-rs/src/relations/convergence.rs",
+  "before": "if ledger.pending.remove(&key) {",
+  "after": "if ledger.pending.contains(&key) {",
+  "filters": [
+   "gap_wu_身份失记的跟进按证据期限结算"
+  ]
+ },
+ {
+  "name": "W56_登记即移出不等期限",
+  "file": "broker-rs/src/relations/facts.rs",
+  "before": "let at = self.relations.operations[&key].expires_at_ms;",
+  "after": "let at = self.clock.mono_ms;",
+  "filters": [
+   "gap_wu_身份失记的跟进按证据期限结算"
+  ]
+ },
+ {
+  "name": "W57_扫描计时不含该期限",
+  "file": "broker-rs/src/relations/mod.rs",
+  "before": "for ledger in self.convergences.ledgers.values() {\n            for (key, at) in &ledger.unproven_deadlines {\n                if ledger.pending.contains(key) {\n                    consider(*at);\n                }\n            }\n        }",
+  "after": "let _ = self.convergences.ledgers.values();",
+  "filters": [
+   "gap_wu_身份失记的跟进按证据期限结算"
+  ]
+ },
+ {
+  "name": "W58_登记后不记结算期限",
+  "file": "broker-rs/src/relations/facts.rs",
+  "before": "            if let Some(run) = unproven_run {\n                let at = self.relations.operations[&key].expires_at_ms;\n                self.convergences\n                    .ledgers\n                    .entry(run)\n                    .or_default()\n                    .unproven_deadlines\n                    .insert(key.clone(), at);\n            }",
+  "after": "            if let Some(run) = unproven_run {\n                let at = self.relations.operations[&key].expires_at_ms;\n                let _ = (&run, at, &key);\n            }",
+  "filters": [
+   "gap_wu_身份失记的跟进按证据期限结算"
+  ]
+ },
+ {
+  "name": "W59_写满不留失记标志",
+  "file": "broker-rs/src/relations/rollout_pairing.rs",
+  "before": "state.lost_calls.len() < MAX_ROLLOUT_FILES",
+  "after": "false && state.lost_calls.len() < MAX_ROLLOUT_FILES",
+  "filters": [
+   "gap_wu_预读满丢下的留言等到期判未证明而不宽松绑定"
+  ],
+  "killed_by": [
+   "test claim::converge::tests::rollout_pairing::gap_wu_预读满丢下的留言等到期判未证明而不宽松绑定 ... FAILED",
+   "thread 'claim::converge::tests::rollout_pairing::gap_wu_预读满丢下的留言等到期判未证明而不宽松绑定' (2476) panicked at src\\claim\\converge\\tests\\rollout_pairing.rs:2959:5:",
+   "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1659 filtered out; finished in 0.02s"
+  ]
+ },
+ {
+  "name": "W60_失记仍按宽松回退",
+  "file": "broker-rs/src/relations/rollout_pairing.rs",
+  "before": "if expired && (wait.lost_at_arrival || self.rollout_lost_marked(&key.parent_thread_id)) {",
+  "after": "if expired && false && (wait.lost_at_arrival || self.rollout_lost_marked(&key.parent_thread_id)) {",
+  "filters": [
+   "gap_wu_预读满丢下的留言等到期判未证明而不宽松绑定",
+   "gap_pe_失记标志临到期前建的等待仍判未证明",
+   "gap_pe_等待先建标志后到到期仍判未证明",
+   "gap_pe_失记表满时已有父线程刷新期限",
+   "gap_pe_失记表满时新父线程按全表标志判未证明"
+  ],
+  "killed_by": [
+   "test claim::converge::tests::pe_floor_lost::gap_pe_等待先建标志后到到期仍判未证明 ... FAILED",
+   "test claim::converge::tests::rollout_pairing::gap_wu_预读满丢下的留言等到期判未证明而不宽松绑定 ... FAILED",
+   "test claim::converge::tests::pe_floor_lost::gap_pe_失记表满时新父线程按全表标志判未证明 ... FAILED",
+   "test claim::converge::tests::pe_floor_lost::gap_pe_失记表满时已有父线程刷新期限 ... FAILED",
+   "test claim::converge::tests::pe_floor_lost::gap_pe_失记标志临到期前建的等待仍判未证明 ... FAILED",
+   "thread 'claim::converge::tests::pe_floor_lost::gap_pe_等待先建标志后到到期仍判未证明' (8468) panicked at src\\claim\\converge\\tests\\pe_floor_lost.rs:199:5:",
+   "assertion `left == right` failed",
+   "thread 'claim::converge::tests::rollout_pairing::gap_wu_预读满丢下的留言等到期判未证明而不宽松绑定' (1424) panicked at src\\claim\\converge\\tests\\rollout_pairing.rs:2970:5:",
+   "assertion `left == right` failed",
+   "thread 'claim::converge::tests::pe_floor_lost::gap_pe_失记表满时新父线程按全表标志判未证明' (6096) panicked at src\\claim\\converge\\tests\\pe_floor_lost.rs:303:5:",
+   "assertion `left == right` failed",
+   "thread 'claim::converge::tests::pe_floor_lost::gap_pe_失记表满时已有父线程刷新期限' (3084) panicked at src\\claim\\converge\\tests\\pe_floor_lost.rs:265:5:",
+   "assertion `left == right` failed",
+   "thread 'claim::converge::tests::pe_floor_lost::gap_pe_失记标志临到期前建的等待仍判未证明' (7968) panicked at src\\claim\\converge\\tests\\pe_floor_lost.rs:113:5:",
+   "assertion `left == right` failed",
+   "test result: FAILED. 0 passed; 5 failed; 0 ignored; 0 measured; 1655 filtered out; finished in 0.04s"
+  ]
+ },
+ {
+  "name": "W61_留言仍先走归属拒绝",
+  "file": "broker-rs/src/relations/rollout_pairing.rs",
+  "before": "if cached.is_none() && self.followup_rejection(key, child, &op.run_id).is_some() {",
+  "after": "if self.followup_rejection(key, child, &op.run_id).is_some() {",
+  "filters": [
+   "gap_wu_缓存留言给独立认领的接收方不产生归属冲突",
+   "gap_wu_缓存留言给他运行绑定的接收方不产生归属冲突"
+  ],
+  "killed_by": [
+   "test claim::converge::tests::rollout_pairing::gap_wu_缓存留言给他运行绑定的接收方不产生归属冲突 ... FAILED",
+   "test claim::converge::tests::rollout_pairing::gap_wu_缓存留言给独立认领的接收方不产生归属冲突 ... FAILED",
+   "thread 'claim::converge::tests::rollout_pairing::gap_wu_缓存留言给他运行绑定的接收方不产生归属冲突' (5748) panicked at src\\claim\\converge\\tests\\rollout_pairing.rs:3096:5:",
+   "assertion failed: operation.v2_queue_only && operation.v2_strict",
+   "thread 'claim::converge::tests::rollout_pairing::gap_wu_缓存留言给独立认领的接收方不产生归属冲突' (2736) panicked at src\\claim\\converge\\tests\\rollout_pairing.rs:3054:5:",
+   "assertion failed: operation.v2_queue_only && operation.v2_strict",
+   "test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 1658 filtered out; finished in 0.02s"
+  ]
+ },
+ {
+  "name": "W62_缺正文仍先报缺调用",
+  "file": "broker-rs/src/relations/rollout_pairing.rs",
+  "before": "            if let Some(reason) = unavailable {\n                return Some(Decision::Fallback(reason));\n            }\n            // 没有可比的正文摘要：严格配对只会等到收敛期限，不如照原样宽松。\n            if call.message.is_none() {",
+  "after": "            if call.message.is_none() {\n                return Some(Decision::Fallback(V2FallbackReason::RolloutCallMissing));\n            }\n            if let Some(reason) = unavailable {\n                return Some(Decision::Fallback(reason));\n            }\n            // 没有可比的正文摘要：严格配对只会等到收敛期限，不如照原样宽松。\n            if call.message.is_none() {",
+  "filters": [
+   "gap_wu_缺可比正文的跟进先取子侧原因"
+  ],
+  "killed_by": [
+   "test claim::converge::tests::rollout_pairing::gap_wu_缺可比正文的跟进先取子侧原因 ... FAILED",
+   "thread 'claim::converge::tests::rollout_pairing::gap_wu_缺可比正文的跟进先取子侧原因' (5060) panicked at src\\claim\\converge\\tests\\rollout_pairing.rs:3156:9:",
+   "assertion `left == right` failed",
+   "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1659 filtered out; finished in 0.02s"
+  ]
+ },
+ {
+  "name": "W63_留言被当跟进仍先走归属拒绝",
+  "file": "broker-rs/src/relations/rollout_pairing.rs",
+  "before": "let cached = self.rollout_call(key).filter(|c| !c.trigger).cloned();",
+  "after": "let cached = self.rollout_call(key).filter(|c| c.trigger).cloned();",
+  "filters": [
+   "gap_wu_缓存留言给独立认领的接收方不产生归属冲突",
+   "gap_wu_缓存留言给他运行绑定的接收方不产生归属冲突"
+  ],
+  "killed_by": [
+   "test claim::converge::tests::rollout_pairing::gap_wu_缓存留言给独立认领的接收方不产生归属冲突 ... FAILED",
+   "test claim::converge::tests::rollout_pairing::gap_wu_缓存留言给他运行绑定的接收方不产生归属冲突 ... FAILED",
+   "thread 'claim::converge::tests::rollout_pairing::gap_wu_缓存留言给独立认领的接收方不产生归属冲突' (6316) panicked at src\\claim\\converge\\tests\\rollout_pairing.rs:3054:5:",
+   "assertion failed: operation.v2_queue_only && operation.v2_strict",
+   "thread 'claim::converge::tests::rollout_pairing::gap_wu_缓存留言给他运行绑定的接收方不产生归属冲突' (2012) panicked at src\\claim\\converge\\tests\\rollout_pairing.rs:3096:5:",
+   "assertion failed: operation.v2_queue_only && operation.v2_strict",
+   "test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 1658 filtered out; finished in 0.02s"
+  ]
+ },
+ {
+  "name": "W64_失记标志立刻到期",
+  "file": "broker-rs/src/relations/rollout_pairing.rs",
+  "before": "(epoch, now.saturating_add(EVIDENCE_TTL_MS))",
+  "after": "(epoch, now)",
+  "filters": [
+   "gap_wu_预读满丢下的留言等到期判未证明而不宽松绑定"
+  ],
+  "killed_by": [
+   "test claim::converge::tests::rollout_pairing::gap_wu_预读满丢下的留言等到期判未证明而不宽松绑定 ... FAILED",
+   "thread 'claim::converge::tests::rollout_pairing::gap_wu_预读满丢下的留言等到期判未证明而不宽松绑定' (1888) panicked at src\\claim\\converge\\tests\\rollout_pairing.rs:2959:5:",
+   "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1659 filtered out; finished in 0.02s"
+  ]
+ },
+ {
+  "name": "W65_卸载观察忽略在线活动",
+  "file": "broker-rs/src/relations/discovery.rs",
+  "before": "            && !self.online_activity_since(thread, stamp.2)\n            && info[\"id\"].as_str() == Some(thread)",
+  "after": "            && info[\"id\"].as_str() == Some(thread)",
+  "filters": [
+   "gap_wu_发现回查发出后的在线活动作废旧卸载",
+   "gap_wu_血缘回查发出后的在线活动作废旧卸载"
+  ]
+ },
+ {
+  "name": "W66_探针忽略在线活动",
+  "file": "broker-rs/src/relations/release.rs",
+  "before": "            let stale = released.probe_stamp.is_none_or(|(epoch, seq)| {\n                epoch != self.relations.conn_epoch || self.online_activity_since(thread, seq)\n            });",
+  "after": "            let stale = false;",
+  "filters": [
+   "gap_wu_卸载探针发出后的在线活动作废旧卸载"
+  ]
+ },
+ {
+  "name": "W67_线程开始不算在线活动",
+  "file": "broker-rs/src/relations/facts.rs",
+  "before": "                    self.online_activity_noted(id);",
+  "after": "                    let _ = id;",
+  "filters": [
+   "gap_wu_发现回查发出后的在线活动作废旧卸载",
+   "gap_wu_血缘回查发出后的在线活动作废旧卸载",
+   "gap_wu_卸载探针发出后的在线活动作废旧卸载"
+  ]
+ },
+ {
+  "name": "W68_命令开始不算在线活动",
+  "file": "broker-rs/src/relations/facts.rs",
+  "before": "                        == Some(\"commandExecution\")",
+  "after": "                        == Some(\"fileChange\")",
+  "filters": [
+   "gap_wu_发现回查发出后的在线活动作废旧卸载",
+   "gap_wu_血缘回查发出后的在线活动作废旧卸载",
+   "gap_wu_卸载探针发出后的在线活动作废旧卸载"
+  ]
+ },
+ {
+  "name": "W69_序号核对恒判新鲜",
+  "file": "broker-rs/src/relations/classification.rs",
+  "before": "        self.relations.aux.online_activity.get(thread) != Some(&stamp)",
+  "after": "        false",
+  "filters": [
+   "gap_wu_发现回查发出后的在线活动作废旧卸载",
+   "gap_wu_血缘回查发出后的在线活动作废旧卸载",
+   "gap_wu_卸载探针发出后的在线活动作废旧卸载"
+  ]
+ },
+ {
+  "name": "W70_轮开始不算在线活动",
+  "file": "broker-rs/src/relations/facts.rs",
+  "before": "            \"turn/started\" => {\n                self.online_activity_noted(&thread);",
+  "after": "            \"turn/started\" => {",
+  "filters": [
+   "gap_wu_发现回查发出后的在线活动作废旧卸载",
+   "gap_wu_卸载探针发出后的在线活动作废旧卸载"
+  ]
+ },
+ {
+  "name": "W71_只入队留言又查父文件冷却",
+  "file": "broker-rs/src/relations/rollout_pairing.rs",
+  "before": "        if let Some(message) = call.filter(|c| !c.trigger) {\n            return Some(Decision::Strict(message.clone()));\n        }",
+  "after": "        if let Some(call) = call.filter(|c| !c.trigger) {\n            if let Some(reason) = self.rollout_file_failed(&key.parent_thread_id) {\n                return Some(Decision::Fallback(reason));\n            }\n            return Some(Decision::Strict(call.clone()));\n        }",
+  "filters": [
+   "gap_pe_父文件冷却不降级已缓存的只入队留言"
+  ],
+  "killed_by": [
+   "test claim::converge::tests::pe_files::gap_pe_父文件冷却不降级已缓存的只入队留言 ... FAILED",
+   "thread 'claim::converge::tests::pe_files::gap_pe_父文件冷却不降级已缓存的只入队留言' (4064) panicked at src\\claim\\converge\\tests\\pe_files.rs:309:5:",
+   "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1660 filtered out; finished in 0.02s"
+  ]
+ },
+ {
+  "name": "W72_失记不登记结算期限",
+  "file": "broker-rs/src/relations/rollout_pairing.rs",
+  "before": "                    if !op.run_id.is_empty() {\n                        self.convergences\n                            .ledgers\n                            .entry(op.run_id.clone())\n                            .or_default()\n                            .unproven_deadlines\n                            .insert(key.clone(), op.expires_at_ms);\n                    }",
+  "after": "",
+  "filters": [
+   "gap_wu_预读满丢下的留言等到期判未证明而不宽松绑定"
+  ],
+  "killed_by": [
+   "test claim::converge::tests::rollout_pairing::gap_wu_预读满丢下的留言等到期判未证明而不宽松绑定 ... FAILED",
+   "thread 'claim::converge::tests::rollout_pairing::gap_wu_预读满丢下的留言等到期判未证明而不宽松绑定' (1596) panicked at src\\claim\\converge\\tests\\rollout_pairing.rs:2991:5:",
+   "assertion `left == right` failed: 结算期限登记为证据期限",
+   "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1659 filtered out; finished in 0.03s"
+  ]
+ },
+ {
+  "name": "W73_分批结算备忘只记最后一批候选",
+  "file": "broker-rs/src/runs/event_log.rs",
+  "before": "let live: Vec<String> = event\n                .unconfirmed\n                .iter()",
+  "after": "let live: Vec<String> = written\n                .iter()",
+  "filters": [
+   "gap_wu_分批结算先写未确认的运行确认后仍补写"
+  ],
+  "killed_by": [
+   "test runs::event_log::tests::gap_wu_分批结算先写未确认的运行确认后仍补写 ... FAILED",
+   "thread 'runs::event_log::tests::gap_wu_分批结算先写未确认的运行确认后仍补写' (4380) panicked at src\\runs\\event_log\\tests.rs:1478:9:",
+   "assertion `left == right` failed: 分批结清后仍建备忘，第二批=结束"
+  ]
+ },
+ {
+  "name": "W74_淘汰冷却文件时不登记保留表",
+  "file": "broker-rs/src/relations/rollout_pairing.rs",
+  "before": "                                        self.relations\n                                            .aux\n                                            .rollout\n                                            .evicted_cooldowns\n                                            .insert(t.clone(), (epoch, f.next_at, reason));",
+  "after": "                                        self.relations\n                                            .aux\n                                            .rollout\n                                            .evicted_cooldowns\n                                            .insert(t.clone(), (epoch, 0, reason));",
+  "filters": [
+   "gap_pe_淘汰冷却文件后截止前不重取路径"
+  ],
+  "killed_by": [
+   "test claim::converge::tests::pe_files::gap_pe_淘汰冷却文件后截止前不重取路径 ... FAILED",
+   "thread 'claim::converge::tests::pe_files::gap_pe_淘汰冷却文件后截止前不重取路径' (3544) panicked at src\\claim\\converge\\tests\\pe_files.rs:98:5:",
+   "assertion `left == right` failed: 冷却截止前不重取路径",
+   "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1659 filtered out; finished in 0.03s"
+  ]
+ },
+ {
+  "name": "W75_保留表满了仍淘汰冷却文件",
+  "file": "broker-rs/src/relations/rollout_pairing.rs",
+  "before": "                                if self.relations.aux.rollout.evicted_cooldowns.len()\n                                    >= MAX_ROLLOUT_FILES\n                                {\n                                    None\n                                } else {",
+  "after": "                                if self.relations.aux.rollout.evicted_cooldowns.len()\n                                    >= usize::MAX\n                                {\n                                    None\n                                } else {",
+  "filters": [
+   "gap_pe_冷却保留表满时不淘汰冷却文件"
+  ],
+  "killed_by": [
+   "test claim::converge::tests::pe_files::gap_pe_冷却保留表满时不淘汰冷却文件 ... FAILED",
+   "thread 'claim::converge::tests::pe_files::gap_pe_冷却保留表满时不淘汰冷却文件' (4576) panicked at src\\claim\\converge\\tests\\pe_files.rs:134:5:",
+   "assertion `left == right` failed: 保留表满：不淘汰冷却文件，新线程本步拿不到位置",
+   "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1659 filtered out; finished in 0.03s"
+  ]
+ },
+ {
+  "name": "W76_断档时不移除Requested的文件登记",
+  "file": "broker-rs/src/relations/rollout_pairing.rs",
+  "before": "        self.relations.aux.rollout.files.retain(|t, f| {\n            !(thread.is_none_or(|x| x == t) && matches!(f.path, RolloutPathState::Requested(_)))\n        });",
+  "after": "        self.relations.aux.rollout.files.retain(|t, f| {\n            !(thread.is_none_or(|x| x == t) && matches!(f.path, RolloutPathState::Ready(_)))\n        });",
+  "filters": [
+   "gap_pe_断档后旧路径成功回包不启动读取",
+   "gap_pe_断档后旧路径失败回包不留冷却",
+   "gap_pe_传输断档退休全部在途路径请求"
+  ],
+  "killed_by": [
+   "test claim::converge::tests::pe_files::gap_pe_传输断档退休全部在途路径请求 ... FAILED",
+   "test claim::converge::tests::pe_files::gap_pe_断档后旧路径失败回包不留冷却 ... FAILED",
+   "test claim::converge::tests::pe_files::gap_pe_断档后旧路径成功回包不启动读取 ... FAILED",
+   "thread 'claim::converge::tests::pe_files::gap_pe_传输断档退休全部在途路径请求' (8888) panicked at src\\claim\\converge\\tests\\pe_files.rs:259:9:",
+   "thread 'claim::converge::tests::pe_files::gap_pe_断档后旧路径失败回包不留冷却' (6228) panicked at src\\claim\\converge\\tests\\pe_files.rs:200:5:",
+   "thread 'claim::converge::tests::pe_files::gap_pe_断档后旧路径成功回包不启动读取' (2608) panicked at src\\claim\\converge\\tests\\pe_files.rs:160:5:",
+   "test result: FAILED. 0 passed; 3 failed; 0 ignored; 0 measured; 1657 filtered out; finished in 0.03s"
+  ]
+ },
+ {
+  "name": "W77_断档移除时不看线程",
+  "file": "broker-rs/src/relations/rollout_pairing.rs",
+  "before": "        self.relations.aux.rollout.files.retain(|t, f| {\n            !(thread.is_none_or(|x| x == t) && matches!(f.path, RolloutPathState::Requested(_)))\n        });",
+  "after": "        self.relations.aux.rollout.files.retain(|_t, f| {\n            !matches!(f.path, RolloutPathState::Requested(_))\n        });",
+  "filters": [
+   "gap_pe_断档只退休受影响线程的路径请求"
+  ],
+  "killed_by": [
+   "test claim::converge::tests::pe_files::gap_pe_断档只退休受影响线程的路径请求 ... FAILED",
+   "thread 'claim::converge::tests::pe_files::gap_pe_断档只退休受影响线程的路径请求' (5364) panicked at src\\claim\\converge\\tests\\pe_files.rs:228:5:",
+   "assertion `left == right` failed",
+   "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1659 filtered out; finished in 0.02s"
+  ]
+ },
+ {
+  "name": "W78_挡掉消息不记下限挡掉时间",
+  "file": "broker-rs/src/relations/rollout_pairing.rs",
+  "before": "                    if entry.wall_ms < floor {\n                        if let Some(file) = self.relations.aux.rollout.files.get_mut(thread) {\n                            file.floor_dropped = file.floor_dropped.max(Some(entry.wall_ms));\n                        }\n                        continue;\n                    }",
+  "after": "                    if entry.wall_ms < floor {\n                        continue;\n                    }",
+  "filters": [
+   "gap_pe_到达下限错锚仍核销真实消费记录"
+  ],
+  "killed_by": [
+   "test claim::converge::tests::pe_floor_lost::gap_pe_到达下限错锚仍核销真实消费记录 ... FAILED",
+   "thread 'claim::converge::tests::pe_floor_lost::gap_pe_到达下限错锚仍核销真实消费记录' (2944) panicked at src\\claim\\converge\\tests\\causal_pairing.rs:45:5:",
+   "assertion `left == right` failed: 尚未证明消费本次跟进，必须保留 pending",
+   "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1659 filtered out; finished in 0.02s"
+  ]
+ },
+ {
+  "name": "W79_重读条件改成恒真",
+  "file": "broker-rs/src/relations/rollout_pairing.rs",
+  "before": "let reread = f.floor_dropped.is_some_and(|at| at >= floor);",
+  "after": "let reread = true;",
+  "filters": [
+   "gap_pe_下限未下移时不重读末尾窗口"
+  ],
+  "killed_by": [
+   "test claim::converge::tests::pe_floor_lost::gap_pe_下限未下移时不重读末尾窗口 ... FAILED",
+   "thread 'claim::converge::tests::pe_floor_lost::gap_pe_下限未下移时不重读末尾窗口' (764) panicked at src\\claim\\converge\\tests\\pe_floor_lost.rs:60:5:",
+   "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1659 filtered out; finished in 0.02s"
+  ]
+ },
+ {
+  "name": "W80_未证明条件去掉到达时登记",
+  "file": "broker-rs/src/relations/rollout_pairing.rs",
+  "before": "(wait.lost_at_arrival || self.rollout_lost_marked(&key.parent_thread_id))",
+  "after": "(self.rollout_lost_marked(&key.parent_thread_id))",
+  "filters": [
+   "gap_pe_失记标志临到期前建的等待仍判未证明"
+  ],
+  "killed_by": [
+   "test claim::converge::tests::pe_floor_lost::gap_pe_失记标志临到期前建的等待仍判未证明 ... FAILED",
+   "thread 'claim::converge::tests::pe_floor_lost::gap_pe_失记标志临到期前建的等待仍判未证明' (3336) panicked at src\\claim\\converge\\tests\\pe_floor_lost.rs:113:5:",
+   "assertion `left == right` failed",
+   "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1659 filtered out; finished in 0.02s"
+  ]
+ },
+ {
+  "name": "W81_表满时已有父线程不刷新期限",
+  "file": "broker-rs/src/relations/rollout_pairing.rs",
+  "before": "                            if let Some(flag) = state.lost_calls.get_mut(&key.0) {\n                                flag.1 = now.saturating_add(EVIDENCE_TTL_MS);\n                            } else if state.lost_calls.len() < MAX_ROLLOUT_FILES {",
+  "after": "                            if state.lost_calls.contains_key(&key.0) {\n                            } else if state.lost_calls.len() < MAX_ROLLOUT_FILES {",
+  "filters": [
+   "gap_pe_失记表满时已有父线程刷新期限"
+  ],
+  "killed_by": [
+   "test claim::converge::tests::pe_floor_lost::gap_pe_失记表满时已有父线程刷新期限 ... FAILED",
+   "thread 'claim::converge::tests::pe_floor_lost::gap_pe_失记表满时已有父线程刷新期限' (3596) panicked at src\\claim\\converge\\tests\\pe_floor_lost.rs:251:5:",
+   "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1659 filtered out; finished in 0.03s"
+  ]
+ },
+ {
+  "name": "W82_表满时新父线程不置全表标志",
+  "file": "broker-rs/src/relations/rollout_pairing.rs",
+  "before": "                            } else {\n                                state.lost_overflow = Some((epoch, now + EVIDENCE_TTL_MS));\n                            }",
+  "after": "                            }",
+  "filters": [
+   "gap_pe_失记表满时新父线程按全表标志判未证明"
+  ],
+  "killed_by": [
+   "test claim::converge::tests::pe_floor_lost::gap_pe_失记表满时新父线程按全表标志判未证明 ... FAILED",
+   "thread 'claim::converge::tests::pe_floor_lost::gap_pe_失记表满时新父线程按全表标志判未证明' (4956) panicked at src\\claim\\converge\\tests\\pe_floor_lost.rs:303:5:",
+   "assertion `left == right` failed",
+   "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1659 filtered out; finished in 0.03s"
+  ]
+ },
+ {
+  "name": "W83_文件一侧去掉超长判断",
+  "file": "broker-rs/src/relations/rollout_pairing.rs",
+  "before": ".is_some_and(|s| s.len() > MAX_AGENT_PATH_BYTES)",
+  "after": ".is_some_and(|s| s.len() < MAX_AGENT_PATH_BYTES)",
+  "filters": [
+   "gap_pe_超长接收方路径的文件跟进按宽松配对",
+   "gap_pe_接收方路径恰到上限仍按严格配对"
+  ],
+  "killed_by": [
+   "test claim::converge::tests::pe_agent_path::gap_pe_超长接收方路径的文件跟进按宽松配对 ... FAILED",
+   "thread 'claim::converge::tests::pe_agent_path::gap_pe_超长接收方路径的文件跟进按宽松配对' (2072) panicked at src\\claim\\converge\\tests\\pe_agent_path.rs:45:5:",
+   "test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 1658 filtered out; finished in 0.03s"
+  ]
+ },
+ {
+  "name": "W84_raw一侧去掉超长判断",
+  "file": "broker-rs/src/relations/facts.rs",
+  "before": ".is_some_and(|s| s.len() > MAX_AGENT_PATH_BYTES)",
+  "after": ".is_some_and(|s| s.len() < MAX_AGENT_PATH_BYTES)",
+  "filters": [
+   "gap_pe_超长接收方路径的raw跟进按宽松配对"
+  ],
+  "killed_by": [
+   "test claim::converge::tests::pe_agent_path::gap_pe_超长接收方路径的raw跟进按宽松配对 ... FAILED",
+   "thread 'claim::converge::tests::pe_agent_path::gap_pe_超长接收方路径的raw跟进按宽松配对' (8332) panicked at src\\claim\\converge\\tests\\pe_agent_path.rs:66:5:",
+   "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1659 filtered out; finished in 0.02s"
+  ]
+ },
+ {
+  "name": "W85_未证明条件去掉实时判断",
+  "file": "broker-rs/src/relations/rollout_pairing.rs",
+  "before": "(wait.lost_at_arrival || self.rollout_lost_marked(&key.parent_thread_id))",
+  "after": "wait.lost_at_arrival",
+  "filters": [
+   "gap_pe_等待先建标志后到到期仍判未证明"
+  ],
+  "killed_by": [
+   "test claim::converge::tests::pe_floor_lost::gap_pe_等待先建标志后到到期仍判未证明 ... FAILED",
+   "thread 'claim::converge::tests::pe_floor_lost::gap_pe_等待先建标志后到到期仍判未证明' (5216) panicked at src\\claim\\converge\\tests\\pe_floor_lost.rs:199:5:",
+   "assertion `left == right` failed",
+   "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1659 filtered out; finished in 0.02s"
+  ]
+ },
+ {
+  "name": "W92_表未满时新父线程也置全表标志",
+  "file": "broker-rs/src/relations/rollout_pairing.rs",
+  "before": "                            } else if state.lost_calls.len() < MAX_ROLLOUT_FILES {\n                                state.lost_calls.insert(\n                                    key.0.clone(),\n                                    (epoch, now.saturating_add(EVIDENCE_TTL_MS)),\n                                );\n                            } else {",
+  "after": "                            } else if state.lost_calls.len() < MAX_ROLLOUT_FILES {\n                                state.lost_calls.insert(\n                                    key.0.clone(),\n                                    (epoch, now.saturating_add(EVIDENCE_TTL_MS)),\n                                );\n                                state.lost_overflow = Some((epoch, now + EVIDENCE_TTL_MS));\n                            } else {",
+  "filters": [
+   "gap_pe_失记标志过期后建的等待照原样宽松回退"
+  ],
+  "killed_by": [
+   "test claim::converge::tests::pe_floor_lost::gap_pe_失记标志过期后建的等待照原样宽松回退 ... FAILED",
+   "thread 'claim::converge::tests::pe_floor_lost::gap_pe_失记标志过期后建的等待照原样宽松回退' (2784) panicked at src\\claim\\converge\\tests\\pe_floor_lost.rs:146:5:",
+   "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1660 filtered out; finished in 0.02s"
+  ]
+ }
+]

@@ -1,0 +1,98 @@
+[
+  {
+    "name": "W86_删能力不支持的code比对",
+    "file": "broker-rs/src/runs/upstream_error.rs",
+    "before": "\"subscription_sharing_unsupported_capability\" => {\n            Some(UpstreamErrorCategory::SubscriptionSharingUnsupported)\n        }",
+    "after": "\"subscription_sharing_unsupported_capability\" => None,",
+    "filters": [
+      "ss_"
+    ],
+    "killed_by": [
+      "runs::upstream_error::tests::ss_正文来自_additional_details同样归类",
+      "runs::upstream_error::tests::ss_能力不支持正文按code归类且截断不影响识别",
+      "claim::tests::upstream_error::ss_错误通知归类为订阅共享类别"
+    ],
+    "seconds": 24.2,
+    "reason": "删除 unsupported 的 code 匹配臂，该 code 归 Unknown",
+    "hung": false
+  },
+  {
+    "name": "W87_删额度用完的code比对",
+    "file": "broker-rs/src/runs/upstream_error.rs",
+    "before": "\"subscription_sharing_usage_limit_exceeded\" => {\n            Some(UpstreamErrorCategory::SubscriptionSharingUsageLimit)\n        }",
+    "after": "\"subscription_sharing_usage_limit_exceeded\" => None,",
+    "filters": [
+      "ss_"
+    ],
+    "killed_by": [
+      "claim::tests::ue2_stall::ss_额度用完触发即停_能力不支持不触发",
+      "runs::upstream_error::tests::ss_额度用完正文按code归类且其余字段不变",
+      "claim::tests::upstream_error::ss_错误通知归类为订阅共享类别",
+      "claim::tests::ue2_child::ss_子线程报错进_child_upstream_errors按code归类"
+    ],
+    "seconds": 13.5,
+    "reason": "删除 usage_limit 的 code 匹配臂，该 code 归 Unknown",
+    "hung": false
+  },
+  {
+    "name": "W88_stop_access删额度用完类别",
+    "file": "broker-rs/src/runs/stall.rs",
+    "before": "| UpstreamErrorCategory::PermissionDenied\n                    | UpstreamErrorCategory::SubscriptionSharingUsageLimit",
+    "after": "| UpstreamErrorCategory::PermissionDenied",
+    "filters": [
+      "ss_"
+    ],
+    "killed_by": [
+      "claim::tests::ue2_stall::ss_额度用完触发即停_能力不支持不触发"
+    ],
+    "seconds": 13.8,
+    "reason": "stop-access 匹配集删 SubscriptionSharingUsageLimit",
+    "hung": false
+  },
+  {
+    "name": "W89_精确匹配改正文子串包含",
+    "file": "broker-rs/src/runs/upstream_error.rs",
+    "before": "let parsed = serde_json::from_str::<Value>(raw?.trim()).ok()?;\n    let code = parsed.get(\"error\")?.as_object()?.get(\"code\")?.as_str()?;\n    match code {\n        \"subscription_sharing_unsupported_capability\" => {\n            Some(UpstreamErrorCategory::SubscriptionSharingUnsupported)\n        }\n        \"subscription_sharing_usage_limit_exceeded\" => {\n            Some(UpstreamErrorCategory::SubscriptionSharingUsageLimit)\n        }\n        _ => None,\n    }",
+    "after": "let code = raw?.trim();\n    match code {\n        code if code.contains(\"subscription_sharing_unsupported_capability\") => {\n            Some(UpstreamErrorCategory::SubscriptionSharingUnsupported)\n        }\n        code if code.contains(\"subscription_sharing_usage_limit_exceeded\") => {\n            Some(UpstreamErrorCategory::SubscriptionSharingUsageLimit)\n        }\n        _ => None,\n    }",
+    "filters": [
+      "ss_"
+    ],
+    "killed_by": [
+      "runs::upstream_error::tests::ss_不认的code与畸形正文保持unknown"
+    ],
+    "seconds": 14.1,
+    "reason": "error.code 精确匹配改为正文子串包含",
+    "hung": false
+  },
+  {
+    "name": "W90_删只在Unknown时判读正文前置",
+    "file": "broker-rs/src/runs/upstream_error.rs",
+    "before": "let category = match classify(info) {\n            UpstreamErrorCategory::Unknown => {",
+    "after": "let category = match classify(info) {\n            _ => {",
+    "filters": [
+      "ss_"
+    ],
+    "killed_by": [
+      "runs::upstream_error::tests::ss_已有类别不被正文code覆盖",
+      "claim::tests::ue2_child::ss_子线程报错进_child_upstream_errors按code归类"
+    ],
+    "seconds": 15.3,
+    "reason": "删除仅在 classify 为 Unknown 时才按正文归类的条件",
+    "hung": false
+  },
+  {
+    "name": "W91_stop_access也停能力不支持",
+    "file": "broker-rs/src/runs/stall.rs",
+    "before": "| UpstreamErrorCategory::PermissionDenied\n                    | UpstreamErrorCategory::SubscriptionSharingUsageLimit",
+    "after": "| UpstreamErrorCategory::PermissionDenied\n                    | UpstreamErrorCategory::SubscriptionSharingUnsupported\n                    | UpstreamErrorCategory::SubscriptionSharingUsageLimit",
+    "filters": [
+      "ss_"
+    ],
+    "killed_by": [
+      "claim::tests::ue2_stall::ss_额度用完触发即停_能力不支持不触发"
+    ],
+    "seconds": 15.2,
+    "reason": "stop-access 匹配集加 SubscriptionSharingUnsupported",
+    "hung": false
+  }
+]
